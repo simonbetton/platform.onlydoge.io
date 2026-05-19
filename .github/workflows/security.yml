@@ -99,6 +99,19 @@ jobs:
           tags: onlydoge-security:${{ github.sha }}
           target: production
 
+      - name: Print image vulnerability table
+        uses: aquasecurity/trivy-action@v0.36.0
+        with:
+          format: table
+          ignore-unfixed: true
+          image-ref: onlydoge-security:${{ github.sha }}
+          scanners: vuln
+          severity: CRITICAL,HIGH
+          vuln-type: os,library
+          exit-code: '0'
+        env:
+          TRIVY_DISABLE_VEX_NOTICE: true
+
       - name: Scan production image
         uses: aquasecurity/trivy-action@v0.36.0
         with:
@@ -106,6 +119,7 @@ jobs:
           ignore-unfixed: true
           image-ref: onlydoge-security:${{ github.sha }}
           output: trivy-image.sarif
+          scanners: vuln
           severity: CRITICAL,HIGH
           vuln-type: os,library
           exit-code: '1'
