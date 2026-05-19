@@ -15,6 +15,7 @@ COPY packages/modules/indexing-pipeline/package.json packages/modules/indexing-p
 COPY packages/modules/investigation-query/package.json packages/modules/investigation-query/package.json
 COPY packages/modules/network-catalog/package.json packages/modules/network-catalog/package.json
 RUN bun install --frozen-lockfile
+RUN find node_modules -name bun.lock -delete
 
 FROM deps AS development
 COPY . .
