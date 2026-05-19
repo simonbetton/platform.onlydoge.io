@@ -99,7 +99,7 @@ jobs:
           tags: onlydoge-security:${{ github.sha }}
           target: production
 
-      - name: Print image vulnerability table
+      - name: Scan production image gate
         uses: aquasecurity/trivy-action@v0.36.0
         with:
           format: table
@@ -108,21 +108,23 @@ jobs:
           scanners: vuln
           severity: CRITICAL,HIGH
           vuln-type: os,library
-          exit-code: '0'
+          exit-code: '1'
         env:
           TRIVY_DISABLE_VEX_NOTICE: true
 
-      - name: Scan production image
+      - name: Generate Trivy SARIF
+        if: always()
         uses: aquasecurity/trivy-action@v0.36.0
         with:
           format: sarif
           ignore-unfixed: true
           image-ref: onlydoge-security:${{ github.sha }}
+          limit-severities-for-sarif: true
           output: trivy-image.sarif
           scanners: vuln
           severity: CRITICAL,HIGH
           vuln-type: os,library
-          exit-code: '1'
+          exit-code: '0'
         env:
           TRIVY_DISABLE_VEX_NOTICE: true
 
