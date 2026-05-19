@@ -1068,10 +1068,14 @@ export class ClickHouseWarehouseAdapter
     asOfBlockHeight: number,
     context?: CoreDogecoinApplyContext,
   ): Promise<void> {
-    await this.executeCommand({ query: `TRUNCATE TABLE ${utxoCurrentStateTable}` });
-    await this.executeCommand({ query: `TRUNCATE TABLE ${utxoCurrentStateByAddressTable}` });
-    await this.executeCommand({ query: `TRUNCATE TABLE ${balancesTable}` });
-    await this.executeCommand({ query: `TRUNCATE TABLE ${appliedBlocksTable}` });
+    await this.clearCoreDogecoinCurrentStateForNetwork({
+      networkId,
+      currentUtxosTable: utxoCurrentStateTable,
+      currentUtxosByAddressTable: utxoCurrentStateByAddressTable,
+      balancesTable,
+      appliedBlocksTable,
+      ...(context ? { context } : {}),
+    });
     await this.insertCoreCurrentStateMaterialization({
       networkId,
       asOfBlockHeight,
@@ -1084,6 +1088,33 @@ export class ClickHouseWarehouseAdapter
       processedBlocksTable: coreProcessedBlocksTable,
       ...(context ? { context } : {}),
     });
+  }
+
+  private async clearCoreDogecoinCurrentStateForNetwork(input: {
+    appliedBlocksTable: string;
+    balancesTable: string;
+    context?: CoreDogecoinApplyContext;
+    currentUtxosByAddressTable: string;
+    currentUtxosTable: string;
+    networkId: PrimaryId;
+  }): Promise<void> {
+    const materializationSettings = clickHouseCoreMaterializationSettings(input.context);
+    const mutationSettings = {
+      ...materializationSettings,
+      mutations_sync: '2',
+    };
+    for (const table of [
+      input.currentUtxosTable,
+      input.currentUtxosByAddressTable,
+      input.balancesTable,
+      input.appliedBlocksTable,
+    ]) {
+      await this.executeCommand({
+        query: `ALTER TABLE ${table} DELETE WHERE network_id = {networkId:UInt64}`,
+        query_params: { networkId: input.networkId },
+        clickhouse_settings: mutationSettings,
+      });
+    }
   }
 
   public async resetCoreDogecoinStorage(): Promise<void> {
@@ -1222,6 +1253,7 @@ export class ClickHouseWarehouseAdapter
             FROM ${input.createsTable}
             WHERE
               network_id = {networkId:UInt64}
+              AND version <= {asOfBlockHeight:UInt64}
               ${clickHouseStringRangeClause('output_key', range)}
             ORDER BY output_key ASC, version DESC
             LIMIT 1 BY output_key
@@ -1231,6 +1263,7 @@ export class ClickHouseWarehouseAdapter
             FROM ${input.spendsTable}
             WHERE
               network_id = {networkId:UInt64}
+              AND version <= {asOfBlockHeight:UInt64}
               ${clickHouseStringRangeClause('spent_output_key', range)}
             ORDER BY spent_output_key ASC, version DESC
             LIMIT 1 BY spent_output_key

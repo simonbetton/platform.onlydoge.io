@@ -991,7 +991,7 @@ describe('clickhouse warehouse adapter', () => {
     expect(insert).not.toHaveBeenCalled();
   });
 
-  it('materializes core Dogecoin current state in bounded output-key ranges', async () => {
+  it('materializes core Dogecoin current state per network and in bounded output-key ranges', async () => {
     const { adapter, command } = installEmptyClickHouseClient();
 
     await adapter.materializeCoreDogecoinCurrentState(7, 25, { statementTimeoutMs: 30000 });
@@ -1009,14 +1009,25 @@ describe('clickhouse warehouse adapter', () => {
     );
 
     expect(statements.slice(0, 4)).toEqual([
-      'TRUNCATE TABLE utxo_outputs_current_v2',
-      'TRUNCATE TABLE utxo_outputs_current_by_address_v2',
-      'TRUNCATE TABLE balances_v2',
-      'TRUNCATE TABLE applied_blocks_v2',
+      'ALTER TABLE utxo_outputs_current_v2 DELETE WHERE network_id = {networkId:UInt64}',
+      'ALTER TABLE utxo_outputs_current_by_address_v2 DELETE WHERE network_id = {networkId:UInt64}',
+      'ALTER TABLE balances_v2 DELETE WHERE network_id = {networkId:UInt64}',
+      'ALTER TABLE applied_blocks_v2 DELETE WHERE network_id = {networkId:UInt64}',
     ]);
+    expect(
+      commands.slice(0, 4).every((parameters) => parameters.query_params?.networkId === 7),
+    ).toBe(true);
+    expect(
+      commands
+        .slice(0, 4)
+        .every((parameters) => parameters.clickhouse_settings?.mutations_sync === '2'),
+    ).toBe(true);
     expect(currentStateInserts).toHaveLength(258);
     expect(rangeParams).toHaveLength(1);
     expect(currentStateInserts[0]?.query).toContain('output_key < {rangeEnd:String}');
+    expect(
+      currentStateInserts[0]?.query.match(/AND version <= \{asOfBlockHeight:UInt64\}/gu),
+    ).toHaveLength(2);
     expect(currentStateInserts.at(-1)?.query).toContain('output_key >= {rangeStart:String}');
     expect(balanceInsert?.query).toContain('FROM utxo_outputs_current_by_address_v2');
     expect(balanceInsert?.clickhouse_settings).toMatchObject({
