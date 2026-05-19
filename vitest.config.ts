@@ -1,23 +1,40 @@
+import { resolve } from 'node:path';
 import { defineConfig } from 'vitest/config';
 
 export default defineConfig({
   resolve: {
     alias: {
-      '@onlydoge/shared-kernel':
-        '/Users/simonbetton/dev/sb/indexer/packages/shared-kernel/src/index.ts',
-      '@onlydoge/api': '/Users/simonbetton/dev/sb/indexer/apps/api/src/index.ts',
-      '@onlydoge/indexer-app': '/Users/simonbetton/dev/sb/indexer/apps/indexer/src/index.ts',
-      '@onlydoge/platform': '/Users/simonbetton/dev/sb/indexer/packages/platform/src/index.ts',
-      '@onlydoge/access-control':
-        '/Users/simonbetton/dev/sb/indexer/packages/modules/access-control/src/index.ts',
-      '@onlydoge/network-catalog':
-        '/Users/simonbetton/dev/sb/indexer/packages/modules/network-catalog/src/index.ts',
-      '@onlydoge/entity-labeling':
-        '/Users/simonbetton/dev/sb/indexer/packages/modules/entity-labeling/src/index.ts',
-      '@onlydoge/investigation-query':
-        '/Users/simonbetton/dev/sb/indexer/packages/modules/investigation-query/src/index.ts',
-      '@onlydoge/indexing-pipeline':
-        '/Users/simonbetton/dev/sb/indexer/packages/modules/indexing-pipeline/src/index.ts',
+      '@onlydoge/shared-kernel': resolve(
+        import.meta.dirname,
+        'packages/shared-kernel/src/index.ts',
+      ),
+      '@onlydoge/api': resolve(import.meta.dirname, 'apps/api/src/index.ts'),
+      '@onlydoge/indexer-app': resolve(import.meta.dirname, 'apps/indexer/src/index.ts'),
+      '@onlydoge/platform': resolve(import.meta.dirname, 'packages/platform/src/index.ts'),
+      '@onlydoge/access-control': resolve(
+        import.meta.dirname,
+        'packages/modules/access-control/src/index.ts',
+      ),
+      '@onlydoge/network-catalog': resolve(
+        import.meta.dirname,
+        'packages/modules/network-catalog/src/index.ts',
+      ),
+      '@onlydoge/entity-labeling': resolve(
+        import.meta.dirname,
+        'packages/modules/entity-labeling/src/index.ts',
+      ),
+      '@onlydoge/explorer-query': resolve(
+        import.meta.dirname,
+        'packages/modules/explorer-query/src/index.ts',
+      ),
+      '@onlydoge/investigation-query': resolve(
+        import.meta.dirname,
+        'packages/modules/investigation-query/src/index.ts',
+      ),
+      '@onlydoge/indexing-pipeline': resolve(
+        import.meta.dirname,
+        'packages/modules/indexing-pipeline/src/index.ts',
+      ),
     },
   },
   test: {
