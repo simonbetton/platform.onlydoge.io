@@ -22,12 +22,16 @@ COPY . .
 EXPOSE 2277
 CMD ["bun", "run", "--watch", "apps/onlydoge/src/index.ts", "--mode=both", "--ip=0.0.0.0", "--port=2277"]
 
+FROM deps AS prod-deps
+RUN rm -rf node_modules && bun install --frozen-lockfile --production
+RUN find node_modules -name bun.lock -delete
+
 FROM base AS production
 ENV NODE_ENV=production
 LABEL org.opencontainers.image.source="https://github.com/simonbetton/onlydoge-indexer"
 LABEL org.opencontainers.image.title="OnlyDoge"
 LABEL org.opencontainers.image.description="Dogecoin-first blockchain investigation backend and indexer"
-COPY --from=deps /app/node_modules /app/node_modules
+COPY --from=prod-deps /app/node_modules /app/node_modules
 COPY . .
 EXPOSE 80
 ENTRYPOINT ["bun", "run", "apps/onlydoge/src/index.ts"]
