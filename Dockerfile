@@ -1,5 +1,6 @@
 FROM oven/bun:1.3.6-alpine AS base
 WORKDIR /app
+RUN apk upgrade --no-cache
 
 FROM base AS deps
 COPY package.json bun.lock tsconfig.base.json biome.json vitest.config.ts drizzle.config.ts ./
