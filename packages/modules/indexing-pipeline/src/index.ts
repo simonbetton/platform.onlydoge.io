@@ -1,6 +1,6 @@
+export * from './application/concurrency';
 export * from './application/core-dogecoin-indexer-service';
 export * from './application/dogecoin-block-projector';
-export * from './application/evm-block-projector';
 export * from './application/indexing-pipeline-service';
 export * from './application/source-link-projector';
 export * from './contracts/ports';

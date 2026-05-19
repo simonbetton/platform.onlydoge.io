@@ -1,5 +1,6 @@
 import { URL } from 'node:url';
 
+import type { IndexingPipelineSettings } from '@onlydoge/indexing-pipeline';
 import {
   type ChainFamily,
   expandHomePath,
@@ -33,41 +34,7 @@ export interface WarehouseSettings {
   password?: string;
 }
 
-export interface IndexerSettings {
-  bootstrapTimeoutMs: number;
-  coreBlockTimeoutMs: number;
-  coreDbStatementTimeoutMs: number;
-  coreOnlineTipDistance: number;
-  coreProcessWindow: number;
-  coreProgressWatchdogMs: number;
-  coreRawStorageTimeoutMs: number;
-  coreSyncCompleteDistance: number;
-  dogecoinTransferMaxEdges: number;
-  dogecoinTransferMaxInputAddresses: number;
-  factTimeoutMs: number;
-  factWindow: number;
-  leaseHeartbeatIntervalMs: number;
-  projectTargetMs: number;
-  projectWindowMax: number;
-  projectWindowMin: number;
-  projectTimeoutMs: number;
-  networkConcurrency: number;
-  projectWindow: number;
-  relinkBacklogThreshold: number;
-  relinkBatchSize: number;
-  relinkConcurrency: number;
-  relinkFrontierBatch: number;
-  relinkTipDistance: number;
-  relinkTimeoutMs: number;
-  syncBacklogHighWatermark: number;
-  syncBacklogLowWatermark: number;
-  syncConcurrency: number;
-  syncTargetMs: number;
-  syncTimeoutMs: number;
-  syncWindowMax: number;
-  syncWindowMin: number;
-  syncWindow: number;
-}
+export interface IndexerSettings extends IndexingPipelineSettings {}
 
 export interface AppSettings {
   mode: Mode;
@@ -377,7 +344,8 @@ function parseIndexerSettings(env: NodeJS.ProcessEnv): IndexerSettings {
       30_000,
     ),
     coreOnlineTipDistance: parsePositiveInteger(env.ONLYDOGE_CORE_ONLINE_TIP_DISTANCE, 6),
-    coreProcessWindow: parsePositiveInteger(env.ONLYDOGE_CORE_PROCESS_WINDOW, 128),
+    coreProcessLoadConcurrency: parsePositiveInteger(env.ONLYDOGE_CORE_PROCESS_LOAD_CONCURRENCY, 8),
+    coreProcessWindow: parsePositiveInteger(env.ONLYDOGE_CORE_PROCESS_WINDOW, 100),
     coreProgressWatchdogMs: parsePositiveInteger(env.ONLYDOGE_CORE_PROGRESS_WATCHDOG_MS, 180_000),
     coreRawStorageTimeoutMs: parsePositiveInteger(env.ONLYDOGE_CORE_RAW_STORAGE_TIMEOUT_MS, 30_000),
     coreSyncCompleteDistance: parsePositiveInteger(env.ONLYDOGE_CORE_SYNC_COMPLETE_DISTANCE, 6),

@@ -8,7 +8,7 @@ interface CreatedApiKey {
 }
 
 interface NetworkResponse {
-  architecture: 'dogecoin' | 'evm';
+  architecture: 'dogecoin';
   blockTime: number;
   chainId: number;
   createdAt: string;

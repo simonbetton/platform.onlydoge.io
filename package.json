@@ -1,6 +1,7 @@
 {
   "name": "onlydoge",
   "private": true,
+  "license": "MIT",
   "type": "module",
   "packageManager": "bun@1.3.6",
   "workspaces": [
@@ -16,8 +17,13 @@
     "dev:indexer": "bun run apps/onlydoge/src/index.ts --mode=indexer",
     "runsheet:dogecoin": "bun run scripts/dogecoin-runsheet.ts",
     "health:indexer": "bun run scripts/indexer-health.ts",
+    "rebuild:clickhouse-core": "bun run scripts/rebuild-clickhouse-core-state.ts",
+    "materialize:clickhouse-core": "bun run scripts/materialize-clickhouse-core-current-state.ts",
+    "benchmark:clickhouse-core": "bun run scripts/benchmark-clickhouse-core-backfill.ts",
     "test": "vitest run",
     "test:watch": "vitest",
+    "e2e:production": "env ONLYDOGE_RUN_PRODUCTION_E2E=1 vitest run tests/e2e/production.test.ts --testTimeout=180000",
+    "e2e:production:deploy": "bun run lint && bun run typecheck && bun run test && bun run deploy:docker && bun run e2e:production",
     "lint": "biome check .",
     "typecheck": "bunx tsc --noEmit -p tsconfig.json",
     "format": "biome format --write .",

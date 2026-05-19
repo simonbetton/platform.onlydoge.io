@@ -13,6 +13,7 @@ import type {
 } from '../contracts/ports';
 import {
   configKeyBlockHeight,
+  configKeyDogecoinCurrentStateReady,
   configKeyIndexerFactProgress,
   configKeyIndexerFactTail,
   configKeyIndexerProcessProgress,
@@ -51,8 +52,8 @@ import {
   projectionDirectLinkSnapshotKey,
   toProjectionAppliedBlocks,
 } from '../domain/projection-models';
+import { mapWithConcurrency, range } from './concurrency';
 import { DogecoinBlockProjector } from './dogecoin-block-projector';
-import { EvmBlockProjector } from './evm-block-projector';
 import {
   type AppliedSnapshotRecovery,
   adaptiveWindowLogLine,
@@ -95,6 +96,7 @@ export interface IndexingPipelineSettings {
   coreBlockTimeoutMs: number;
   coreDbStatementTimeoutMs: number;
   coreOnlineTipDistance: number;
+  coreProcessLoadConcurrency: number;
   coreProcessWindow: number;
   coreProgressWatchdogMs: number;
   coreRawStorageTimeoutMs: number;
@@ -199,7 +201,8 @@ const defaultSettings: IndexingPipelineSettings = {
   coreBlockTimeoutMs: 120_000,
   coreDbStatementTimeoutMs: 30_000,
   coreOnlineTipDistance: 6,
-  coreProcessWindow: 128,
+  coreProcessLoadConcurrency: 8,
+  coreProcessWindow: 100,
   coreProgressWatchdogMs: 180_000,
   coreRawStorageTimeoutMs: 30_000,
   coreSyncCompleteDistance: 6,
@@ -269,7 +272,6 @@ class IndexingPipelineServiceEngine {
   private readonly instanceId = randomUUID();
   private readonly dogecoinFactProjector: DogecoinBlockProjector;
   private readonly dogecoinStateProjector: DogecoinBlockProjector;
-  private readonly evmProjector = new EvmBlockProjector();
   private readonly sourceLinkProjector: SourceLinkProjector;
   private readonly latestHeights = new Map<number, number>();
   private readonly bootstrapRetryMarkers = new Map<number, string>();
@@ -611,6 +613,10 @@ class IndexingPipelineServiceEngine {
     network: IndexedNetwork,
     latestBlockHeight: number,
   ): Promise<boolean> {
+    if (await this.shouldSkipLegacyDogecoinProjection(network)) {
+      return false;
+    }
+
     const backlog = await this.readBacklogState(network.networkId, latestBlockHeight);
     const status = await this.getBootstrapStatus(network.networkId, backlog.processTail);
     if (!status.required) {
@@ -668,6 +674,10 @@ class IndexingPipelineServiceEngine {
     network: IndexedNetwork,
     latestBlockHeight: number,
   ): Promise<boolean> {
+    if (await this.shouldSkipLegacyDogecoinProjection(network)) {
+      return false;
+    }
+
     const backlog = await this.readBacklogState(network.networkId, latestBlockHeight);
     const bootstrapStatus = await this.getBootstrapStatus(network.networkId, backlog.processTail);
     if (this.isProjectBlockedByBootstrap(network.networkId, bootstrapStatus)) {
@@ -714,6 +724,10 @@ class IndexingPipelineServiceEngine {
     network: IndexedNetwork,
     latestBlockHeight: number,
   ): Promise<boolean> {
+    if (await this.shouldSkipLegacyDogecoinProjection(network)) {
+      return false;
+    }
+
     const backlog = await this.readBacklogState(network.networkId, latestBlockHeight);
     const result = await this.runNetworkPhase(
       network,
@@ -732,6 +746,10 @@ class IndexingPipelineServiceEngine {
     network: IndexedNetwork,
     latestBlockHeight: number,
   ): Promise<boolean> {
+    if (await this.shouldSkipLegacyDogecoinProjection(network)) {
+      return false;
+    }
+
     const backlog = await this.readBacklogState(network.networkId, latestBlockHeight);
     const result = await this.runNetworkPhase(
       network,
@@ -764,6 +782,15 @@ class IndexingPipelineServiceEngine {
     }
 
     return false;
+  }
+
+  private async shouldSkipLegacyDogecoinProjection(network: IndexedNetwork): Promise<boolean> {
+    return (
+      network.architecture === 'dogecoin' &&
+      (await this.configs.getJsonValue<boolean>(
+        configKeyDogecoinCurrentStateReady(network.networkId),
+      )) === true
+    );
   }
 
   private async claimPrimaryLease(
@@ -1118,7 +1145,7 @@ class IndexingPipelineServiceEngine {
     );
     const appliedBlocks = await appliedBlockReader.listAppliedBlockSet(
       network.networkId,
-      this.snapshotBlockIdentities(network, heights, orderedSnapshots),
+      this.snapshotBlockIdentities(heights, orderedSnapshots),
     );
 
     return {
@@ -1131,13 +1158,12 @@ class IndexingPipelineServiceEngine {
   }
 
   private snapshotBlockIdentities(
-    network: IndexedNetwork,
     heights: number[],
     orderedSnapshots: Record<string, unknown>[],
   ): Array<{ blockHash: string; blockHeight: number }> {
     return orderedSnapshots.map((snapshot, index) => ({
       blockHeight: heights[index] ?? -1,
-      blockHash: this.readSnapshotBlockHash(snapshot, network.architecture),
+      blockHash: this.readSnapshotBlockHash(snapshot),
     }));
   }
 
@@ -1184,7 +1210,7 @@ class IndexingPipelineServiceEngine {
     let recoveryIndex = 0;
     for (const [index, snapshot] of orderedSnapshots.entries()) {
       const blockHeight = heights[index] ?? currentTail;
-      const blockHash = this.readSnapshotBlockHash(snapshot, network.architecture);
+      const blockHash = this.readSnapshotBlockHash(snapshot);
       if (!appliedBlocks.has(projectionBlockIdentity(network.networkId, blockHeight, blockHash))) {
         return { recoveredTail, recoveryIndex: index };
       }
@@ -1490,10 +1516,6 @@ class IndexingPipelineServiceEngine {
     mode: ProjectionMode,
     expectedBootstrapTail = -1,
   ): Promise<BlockProjectionBatch[]> {
-    if (network.architecture === 'evm') {
-      return this.projectEvmWindow(network, snapshots, mode);
-    }
-
     return this.projectDogecoinWindow(network, snapshots, mode, expectedBootstrapTail);
   }
 
@@ -1555,19 +1577,6 @@ class IndexingPipelineServiceEngine {
     }
 
     return projections;
-  }
-
-  private projectEvmWindow(
-    network: IndexedNetwork,
-    snapshots: Record<string, unknown>[],
-    mode: ProjectionMode,
-  ): BlockProjectionBatch[] {
-    return snapshots.map((snapshot) =>
-      this.evmProjector.project(network.networkId, snapshot, {
-        includeDirectLinkDeltas: mode === 'facts',
-        includeTransfers: mode === 'facts',
-      }),
-    );
   }
 
   private collectDogecoinExternalOutputKeys(snapshots: Record<string, unknown>[]): Set<string> {
@@ -2261,44 +2270,10 @@ class IndexingPipelineServiceEngine {
     return null;
   }
 
-  private readSnapshotBlockHash(
-    snapshot: Record<string, unknown>,
-    architecture: 'dogecoin' | 'evm',
-  ): string {
+  private readSnapshotBlockHash(snapshot: Record<string, unknown>): string {
     const hash = requireSnapshotHash(requireSnapshotBlock(snapshot));
-    return normalizeSnapshotHash(hash, architecture);
+    return normalizeSnapshotHash(hash);
   }
-}
-
-async function mapWithConcurrency<T, R>(
-  values: T[],
-  concurrency: number,
-  worker: (value: T, index: number) => Promise<R>,
-): Promise<R[]> {
-  const results = new Array<R>(values.length);
-  let nextIndex = 0;
-  const workerCount = Math.max(1, Math.min(concurrency, values.length || 1));
-
-  await Promise.all(
-    Array.from({ length: workerCount }, async () => {
-      while (true) {
-        const currentIndex = nextIndex;
-        nextIndex += 1;
-        if (currentIndex >= values.length) {
-          return;
-        }
-
-        const value = values[currentIndex];
-        if (value === undefined) {
-          return;
-        }
-
-        results[currentIndex] = await worker(value, currentIndex);
-      }
-    }),
-  );
-
-  return results;
 }
 
 function clamp(value: number, min: number, max: number): number {
@@ -2351,8 +2326,8 @@ function requireSnapshotHash(block: Record<string, unknown>): string {
   return hash;
 }
 
-function normalizeSnapshotHash(hash: string, architecture: 'dogecoin' | 'evm'): string {
-  return architecture === 'evm' ? hash.trim().toLowerCase() : hash.trim();
+function normalizeSnapshotHash(hash: string): string {
+  return hash.trim();
 }
 
 class BootstrapRequiredError extends Error {}
@@ -2391,12 +2366,4 @@ async function withTimeout<T>(promise: Promise<T>, timeoutMs: number, message: s
       clearTimeout(timer);
     }
   }
-}
-
-function range(start: number, end: number): number[] {
-  if (end < start) {
-    return [];
-  }
-
-  return Array.from({ length: end - start + 1 }, (_, index) => start + index);
 }

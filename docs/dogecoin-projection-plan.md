@@ -54,7 +54,7 @@ Why it exists:
 
 #### `address_movements`
 
-Generic cross-chain debit and credit facts. Dogecoin emits these from UTXO consumes and creates. EVM can later emit the same model for native and token transfers.
+Dogecoin debit and credit facts emitted from UTXO consumes and creates.
 
 - `movement_id`
   - deterministic string, for example `${txid}:vin:${index}` or `${txid}:vout:${index}`
@@ -80,7 +80,7 @@ Why it exists:
 
 - balances become a pure aggregation problem,
 - investigation APIs can later expose timelines without re-decoding blocks,
-- the same fact model works for EVM.
+- each movement keeps deterministic provenance for idempotent rebuilds.
 
 #### `transfers`
 
@@ -112,7 +112,7 @@ Why it exists:
 
 - direct graph edges should not be rebuilt from raw UTXO every time,
 - Dogecoin transfer derivation is heuristic and needs an explicit provenance field,
-- EVM native and token transfers can append to the same table later.
+- graph traversal can read direct value legs without re-decoding raw blocks.
 
 ### 2. Mutable read models
 
@@ -388,4 +388,3 @@ Short term, the contract can keep the same field name and map it from `hop_count
 4. Materialize `balances` and `direct_links`.
 5. Implement labeled `source_links` replay for newly added addresses.
 6. Switch `InvestigationQueryService` to consume real path links.
-7. Use the same `address_movements` and `transfers` model for EVM native and token derivation.

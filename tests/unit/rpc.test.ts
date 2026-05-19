@@ -17,15 +17,18 @@ describe('http blockchain rpc gateway', () => {
     const gateway = new HttpBlockchainRpcGateway();
 
     await expect(
-      gateway.assertHealthy('dogecoin', 'http://user:pass=@110.124.0.2:22555/'),
+      gateway.assertHealthy(
+        'dogecoin',
+        'http://rpc-user:rpc-password@dogecoin-rpc.example.com:22555/',
+      ),
     ).resolves.toBeUndefined();
 
     expect(fetchMock).toHaveBeenCalledWith(
-      'http://110.124.0.2:22555/',
+      'http://dogecoin-rpc.example.com:22555/',
       expect.objectContaining({
         method: 'POST',
         headers: expect.objectContaining({
-          authorization: 'Basic dXNlcjpwYXNzPQ==',
+          authorization: 'Basic cnBjLXVzZXI6cnBjLXBhc3N3b3Jk',
           'content-type': 'application/json',
         }),
       }),
@@ -46,9 +49,13 @@ describe('http blockchain rpc gateway', () => {
     const gateway = new HttpBlockchainRpcGateway(5);
 
     await expect(
-      gateway.assertHealthy('dogecoin', 'http://user:pass=@110.124.0.2:22555/'),
+      gateway.assertHealthy(
+        'dogecoin',
+        'http://rpc-user:rpc-password@dogecoin-rpc.example.com:22555/',
+      ),
     ).rejects.toMatchObject({
-      message: 'could not connect to `http://user:pass=@110.124.0.2:22555/`',
+      message:
+        'could not connect to `http://rpc-user:rpc-password@dogecoin-rpc.example.com:22555/`',
     });
   });
 
@@ -66,12 +73,12 @@ describe('http blockchain rpc gateway', () => {
 
     const first = gateway.getBlockHeight({
       architecture: 'dogecoin',
-      rpcEndpoint: 'http://user:pass=@110.124.0.2:22555/',
+      rpcEndpoint: 'http://rpc-user:rpc-password@dogecoin-rpc.example.com:22555/',
       rps: 1,
     });
     const second = gateway.getBlockHeight({
       architecture: 'dogecoin',
-      rpcEndpoint: 'http://user:pass=@110.124.0.2:22555/',
+      rpcEndpoint: 'http://rpc-user:rpc-password@dogecoin-rpc.example.com:22555/',
       rps: 1,
     });
     const pending = Promise.all([first, second]);

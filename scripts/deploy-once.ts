@@ -6,9 +6,9 @@ import { parse as parseDotenv } from 'dotenv';
 
 const DEFAULT_IMAGE = 'ghcr.io/simonbetton/onlydoge-indexer:latest';
 const DEFAULT_ENV_FILE = '.env.once';
-const DEFAULT_HOST = 'platform.onlydoge.io';
-const DEFAULT_SSH_JUMP = 'root@164.90.159.127';
-const DEFAULT_SSH_TARGET = 'root@10.124.0.3';
+const DEFAULT_HOST = 'api.example.com';
+const DEFAULT_SSH_JUMP = 'root@203.0.113.10';
+const DEFAULT_SSH_TARGET = 'root@10.0.0.10';
 
 const FORWARDED_ENV_KEYS = new Set(['SECRET_KEY_BASE', 'VAPID_PRIVATE_KEY', 'VAPID_PUBLIC_KEY']);
 
@@ -38,6 +38,7 @@ const REQUIRED_ENV_KEYS = [
   'ONLYDOGE_CORE_BLOCK_TIMEOUT_MS',
   'ONLYDOGE_CORE_DB_STATEMENT_TIMEOUT_MS',
   'ONLYDOGE_CORE_SYNC_COMPLETE_DISTANCE',
+  'ONLYDOGE_CORE_PROCESS_LOAD_CONCURRENCY',
   'ONLYDOGE_CORE_PROCESS_WINDOW',
   'ONLYDOGE_CORE_PROGRESS_WATCHDOG_MS',
   'ONLYDOGE_CORE_RAW_STORAGE_TIMEOUT_MS',

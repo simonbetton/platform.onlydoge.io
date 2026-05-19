@@ -18,16 +18,6 @@ export class HttpBlockchainRpcGateway implements NetworkRpcGateway, BlockchainRp
     rpcEndpoint: string;
     rps: number;
   }): Promise<number> {
-    if (network.architecture === 'evm') {
-      const result = await this.callEvm<string>(
-        network.rpcEndpoint,
-        network.rps,
-        'eth_blockNumber',
-        [],
-      );
-      return Number.parseInt(result, 16);
-    }
-
     return this.callDogecoin<number>(network.rpcEndpoint, network.rps, 'getblockcount', []);
   }
 
@@ -39,38 +29,6 @@ export class HttpBlockchainRpcGateway implements NetworkRpcGateway, BlockchainRp
     },
     blockHeight: number,
   ): Promise<Record<string, unknown>> {
-    if (network.architecture === 'evm') {
-      const hexHeight = `0x${blockHeight.toString(16)}`;
-      const block = await this.callEvm<Record<string, unknown>>(
-        network.rpcEndpoint,
-        network.rps,
-        'eth_getBlockByNumber',
-        [hexHeight, true],
-      );
-      const transactions = Array.isArray(block.transactions)
-        ? block.transactions.filter((transaction): transaction is { hash: string } =>
-            Boolean(
-              transaction &&
-                typeof transaction === 'object' &&
-                'hash' in transaction &&
-                typeof transaction.hash === 'string',
-            ),
-          )
-        : [];
-      const receipts = await Promise.all(
-        transactions.map((transaction) =>
-          this.callEvm<Record<string, unknown>>(
-            network.rpcEndpoint,
-            network.rps,
-            'eth_getTransactionReceipt',
-            [transaction.hash],
-          ),
-        ),
-      );
-
-      return { block, receipts };
-    }
-
     const hash = await this.callDogecoin<string>(network.rpcEndpoint, network.rps, 'getblockhash', [
       blockHeight,
     ]);
@@ -90,22 +48,12 @@ export class HttpBlockchainRpcGateway implements NetworkRpcGateway, BlockchainRp
     method: string,
     params: unknown[],
   ): Promise<T> {
-    return this.callJsonRpc(rpcEndpoint, rps, '1.0', method, params);
-  }
-
-  private async callEvm<T>(
-    rpcEndpoint: string,
-    rps: number,
-    method: string,
-    params: unknown[],
-  ): Promise<T> {
-    return this.callJsonRpc(rpcEndpoint, rps, '2.0', method, params);
+    return this.callJsonRpc(rpcEndpoint, rps, method, params);
   }
 
   private async callJsonRpc<T>(
     rpcEndpoint: string,
     rps: number,
-    jsonrpc: '1.0' | '2.0',
     method: string,
     params: unknown[],
   ): Promise<T> {
@@ -117,7 +65,7 @@ export class HttpBlockchainRpcGateway implements NetworkRpcGateway, BlockchainRp
         headers: request.headers,
         signal: AbortSignal.timeout(this.timeoutMs),
         body: JSON.stringify({
-          jsonrpc,
+          jsonrpc: '1.0',
           id: 'onlydoge',
           method,
           params,

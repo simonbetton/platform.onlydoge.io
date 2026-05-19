@@ -15,7 +15,7 @@ export function readSnapshotItems<T>(value: unknown, predicate: (item: unknown) 
 export function requireSnapshotRecord(
   value: unknown,
   field: string,
-  source: 'dogecoin' | 'evm',
+  source: 'dogecoin',
 ): Record<string, unknown> {
   if (!value || typeof value !== 'object') {
     throw new InfrastructureError(`invalid ${source} field: ${field}`);

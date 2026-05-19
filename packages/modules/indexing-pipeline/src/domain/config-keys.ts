@@ -44,6 +44,18 @@ export function configKeyIndexerFactProgress(networkId: PrimaryId): string {
   return `indexer_fact_progress_n${networkId}`;
 }
 
+export function configKeyDogecoinCurrentStateReady(networkId: PrimaryId): string {
+  return `dogecoin_current_state_ready_n${networkId}`;
+}
+
+export function configKeyDogecoinHistoryReady(networkId: PrimaryId): string {
+  return `dogecoin_history_ready_n${networkId}`;
+}
+
+export function configKeyDogecoinCurrentStateMaterialization(networkId: PrimaryId): string {
+  return `dogecoin_current_state_materialization_n${networkId}`;
+}
+
 export function configKeyProjectionBootstrapTail(networkId: PrimaryId): string {
   return `projection_bootstrap_tail_n${networkId}`;
 }

@@ -13,7 +13,7 @@ export function buildNetworkCatalogHttp(service: NetworkCatalogService) {
           body: t.Object({
             id: t.Optional(t.String()),
             name: t.String(),
-            architecture: t.Union([t.Literal('dogecoin'), t.Literal('evm')]),
+            architecture: t.Literal('dogecoin'),
             blockTime: t.Number(),
             rpcEndpoint: t.String(),
             chainId: t.Optional(t.Number()),
@@ -45,7 +45,7 @@ export function buildNetworkCatalogHttp(service: NetworkCatalogService) {
             detail: protectedOperationDetail,
             body: t.Object({
               name: t.Optional(t.String()),
-              architecture: t.Optional(t.Union([t.Literal('dogecoin'), t.Literal('evm')])),
+              architecture: t.Optional(t.Literal('dogecoin')),
               blockTime: t.Optional(t.Number()),
               rpcEndpoint: t.Optional(t.String()),
               chainId: t.Optional(t.Number()),

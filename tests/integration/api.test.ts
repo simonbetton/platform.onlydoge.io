@@ -1,4 +1,4 @@
-import { configKeyIndexerProcessTail } from '@onlydoge/indexing-pipeline';
+import { configKeyDogecoinHistoryReady } from '@onlydoge/indexing-pipeline';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import { dogecoinFixture } from '../fixtures/dogecoin';
@@ -13,6 +13,7 @@ import {
   requireNumber as requireNumberField,
   requireObject,
   requireString as requireStringField,
+  runIndexerUntilProcessed,
 } from '../helpers';
 
 describe('api integration', () => {
@@ -246,6 +247,49 @@ describe('api integration', () => {
     }
   });
 
+  it('returns history-not-ready responses while current UTXO reads remain available', async () => {
+    const scenario = await createExplorerScenario();
+
+    try {
+      const internalNetwork =
+        await scenario.ctx.runtime.metadata.getNetworkByName('Dogecoin Mainnet');
+      const networkId = internalNetwork?.networkId ?? 0;
+      await scenario.ctx.runtime.metadata.setJsonValue(
+        configKeyDogecoinHistoryReady(networkId),
+        false,
+      );
+
+      const search = await request(scenario.ctx.app, '/v1/explorer/search?q=2', {
+        headers: scenario.headers,
+      });
+      expect(search.status).toBe(425);
+      expect(await search.json()).toEqual({ error: 'dogecoin history index is not ready' });
+
+      const block = await request(scenario.ctx.app, '/v1/explorer/blocks/2', {
+        headers: scenario.headers,
+      });
+      expect(block.status).toBe(425);
+
+      const history = await request(
+        scenario.ctx.app,
+        `/v1/explorer/addresses/${dogecoinFixture.targetAddress}/transactions`,
+        { headers: scenario.headers },
+      );
+      expect(history.status).toBe(425);
+
+      const utxos = await request(
+        scenario.ctx.app,
+        `/v1/explorer/addresses/${dogecoinFixture.targetAddress}/utxos`,
+        { headers: scenario.headers },
+      );
+      expect(utxos.status).toBe(200);
+      const [utxo] = readObjectArrayField(await readJsonObject(utxos), 'utxos');
+      expect(requireStringField(utxo ?? {}, 'outputKey')).toBe('doge-tx-2:0');
+    } finally {
+      await scenario.ctx.cleanup();
+    }
+  });
+
   it('returns a clean validation error when info is requested without q', async () => {
     const { ctx, headers } = await createAuthenticatedTestApp();
 
@@ -309,27 +353,9 @@ async function createExplorerScenario() {
   const internalNetwork = await ctx.runtime.metadata.getNetworkByName('Dogecoin Mainnet');
 
   expect(targetAddressRecord?.address).toBe(dogecoinFixture.targetAddress);
-  await runUntilProcessed(ctx, internalNetwork?.networkId ?? 0, 2);
+  await runIndexerUntilProcessed(ctx, internalNetwork?.networkId ?? 0, 2);
 
   return { ctx, headers, network };
-}
-
-async function runUntilProcessed(
-  ctx: Awaited<ReturnType<typeof createAuthenticatedTestApp>>['ctx'],
-  networkId: number,
-  targetTail: number,
-): Promise<void> {
-  for (let attempt = 0; attempt < 8; attempt += 1) {
-    await ctx.runtime.indexingPipeline.runOnce();
-    const processTail =
-      (await ctx.runtime.metadata.getJsonValue<number>(configKeyIndexerProcessTail(networkId))) ??
-      -1;
-    if (processTail >= targetTail) {
-      return;
-    }
-  }
-
-  throw new Error(`core process tail did not reach ${targetTail}`);
 }
 
 async function expectExplorerNetworks({ ctx, headers, network }: ExplorerScenario): Promise<void> {

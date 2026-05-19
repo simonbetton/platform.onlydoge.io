@@ -1,6 +1,6 @@
 # OnlyDoge
 
-OnlyDoge is a Bun-based blockchain investigation backend focused on Dogecoin-first analysis with EVM support. It ingests chain data, labels entities and addresses, exposes investigation APIs, and runs an indexing pipeline behind a single modular-monolith codebase.
+OnlyDoge is a Bun-based blockchain investigation backend focused on Dogecoin analysis. It ingests chain data, labels entities and addresses, exposes investigation APIs, and runs an indexing pipeline behind a single modular-monolith codebase.
 
 This repository is organized around business modules with Clean/Hexagonal boundaries:
 
@@ -17,20 +17,21 @@ The runtime stack uses TypeScript, Bun, Elysia, OpenAPI, Biome, and Vitest.
 
 - Provide a programmable investigation API for entities, tags, addresses, networks, tokens, stats, and heartbeat checks.
 - Provide a Dogecoin explorer API for networks, search, blocks, transactions, addresses, address history, and UTXOs.
-- Support Dogecoin as the UTXO family and EVM as the account-based family.
+- Support Dogecoin's UTXO model.
 - Separate domain logic from transport, storage, and RPC concerns.
 - Run the system as a modular monolith while preserving clear domain boundaries and testability.
 - Support three runtime modes from one entrypoint: `http`, `indexer`, and `both`.
 
 ## Current Status
 
-The repository is production-shaped, but not full upstream feature parity yet.
+The repository is production-shaped for the Dogecoin-first explorer and investigation API.
 
 - The HTTP contract, modular architecture, metadata storage, raw block snapshotting, and auth flows are implemented.
 - OpenAPI is enabled at `/openapi` and `/openapi/json`.
-- The current indexer persists raw snapshots and coordinator progress.
-- The current warehouse layer is still scaffold-level. The DuckDB path is JSON-backed and the ClickHouse adapter is intentionally minimal.
-- Full transfer, balance, token, and link materialization logic still needs to be completed for complete feature parity.
+- Dogecoin current-state indexing uses ClickHouse append-only core tables plus materialized current UTXO and balance read state.
+- Dogecoin transaction and address history reads are core-table-backed to avoid duplicating the full chain history into separate large fact tables.
+- Full transfer/direct-link graph materialization is still incomplete compared with the long-term investigation product target.
+- Operational runbooks are checked into `docs/production-runbook.md` and `docs/dogecoin-rebuild-runbook.md`.
 
 ## Architecture
 
@@ -86,7 +87,7 @@ flowchart LR
   IDX["onlydoge-indexer container"] --> PG
   IDX --> CH
   IDX --> S3
-  IDX --> RPC["Dogecoin / EVM RPC Endpoints"]
+  IDX --> RPC["Dogecoin RPC Endpoint"]
 ```
 
 ## Repository Layout
@@ -109,6 +110,7 @@ packages/
     indexing-pipeline/
 
 tests/
+  e2e/        opt-in production E2E checks with teardown
   unit/
   integration/
 ```
@@ -121,10 +123,13 @@ tests/
 bun install
 bun run typecheck
 bun run ci
+bun run e2e:production
 bun run dev:both
 bun run dev:http
 bun run dev:indexer
 ```
+
+`bun run e2e:production` is opt-in and requires production environment variables; normal `bun run test` does not contact production.
 
 ### Docker Local
 
@@ -185,12 +190,15 @@ The app reads the following configuration surface:
 - `ONLYDOGE_DATABASE_NAME`
 - `ONLYDOGE_DATABASE_USER`
 - `ONLYDOGE_DATABASE_PASSWORD`
+- `ONLYDOGE_DATABASE_SSLROOTCERT_PEM`
+- `ONLYDOGE_DATABASE_SSLROOTCERT_BASE64`
 - `ONLYDOGE_STORAGE`
 - `ONLYDOGE_WAREHOUSE`
 - `ONLYDOGE_S3_ACCESS_KEY_ID`
 - `ONLYDOGE_S3_SECRET_ACCESS_KEY`
 - `ONLYDOGE_WAREHOUSE_USER`
 - `ONLYDOGE_WAREHOUSE_PASSWORD`
+- `ONLYDOGE_WAREHOUSE_REQUEST_TIMEOUT_MS`
 - `ONLYDOGE_INDEXER_LEASE_HEARTBEAT_INTERVAL_MS`
 - `ONLYDOGE_INDEXER_NETWORK_CONCURRENCY`
 - `ONLYDOGE_INDEXER_DOGECOIN_TRANSFER_MAX_INPUT_ADDRESSES`
@@ -209,6 +217,7 @@ The app reads the following configuration surface:
 - `ONLYDOGE_CORE_BLOCK_TIMEOUT_MS`
 - `ONLYDOGE_CORE_DB_STATEMENT_TIMEOUT_MS`
 - `ONLYDOGE_CORE_SYNC_COMPLETE_DISTANCE`
+- `ONLYDOGE_CORE_PROCESS_LOAD_CONCURRENCY`
 - `ONLYDOGE_CORE_PROCESS_WINDOW`
 - `ONLYDOGE_CORE_PROGRESS_WATCHDOG_MS`
 - `ONLYDOGE_CORE_RAW_STORAGE_TIMEOUT_MS`
@@ -262,12 +271,20 @@ The local setup intentionally favors developer feedback over immutability.
 If you change dependency manifests, restart the local app container or rerun `bun run docker:local:up`.
 If you change ClickHouse credentials, run `bun run docker:local:reset` before bringing the stack up again so the ClickHouse volume is recreated with the new user setup.
 
-The local and production Compose stacks now mount the checked-in ClickHouse tuning files:
+The local and bundled production Compose stacks mount the checked-in ClickHouse schema and memory tuning files:
 
+- `docker/clickhouse/init/001_schema.sql`
 - `docker/clickhouse/config.d/onlydoge-memory.xml`
 - `docker/clickhouse/users.d/onlydoge-memory.xml`
 
-Those files codify the current memory profile used to keep projection queries off the old implicit limits.
+The repository also includes ClickHouse host log-retention files for self-hosted ClickHouse operations:
+
+- `docker/clickhouse/config.d/onlydoge-log-retention.xml`
+- `docker/clickhouse/logrotate.d/clickhouse-server`
+- `docker/clickhouse/logrotate.d/rsyslog`
+- `docker/clickhouse/journald.conf.d/onlydoge-retention.conf`
+
+Those files codify the current memory and 3-day log-retention profile used for heavy Dogecoin backfills. The retention files are installed on the ClickHouse host with the commands in the production runbook; they are not mounted by `docker-compose.local.yml` or `docker-compose.prod.yml`.
 
 ## Dogecoin Runsheet
 
@@ -276,7 +293,7 @@ Use the built-in runsheet helper to create the first API key if needed, register
 ```bash
 bun run runsheet:dogecoin -- \
   --base-url http://127.0.0.1:2277 \
-  --rpc-endpoint 'http://USER:PASS=@110.124.0.2:22555/' \
+  --rpc-endpoint 'http://rpc-user:rpc-password@dogecoin-rpc.example.com:22555/' \
   --name 'Dogecoin Mainnet' \
   --chain-id 0 \
   --block-time 60 \
@@ -289,7 +306,7 @@ If the API already has keys configured, pass an existing token:
 bun run runsheet:dogecoin -- \
   --base-url http://127.0.0.1:2277 \
   --api-token 'sk_...' \
-  --rpc-endpoint 'http://USER:PASS=@110.124.0.2:22555/'
+  --rpc-endpoint 'http://rpc-user:rpc-password@dogecoin-rpc.example.com:22555/'
 ```
 
 What this does:
@@ -347,7 +364,7 @@ Production images are published to GitHub Container Registry:
 To push a fresh multi-arch `latest` image from this repo:
 
 ```bash
-npm run image:push
+bun run image:push
 ```
 
 The script bootstraps and uses a `docker-container` Buildx builder named `onlydoge-multiarch`, which avoids the multi-platform limitation of the default Docker driver on tools like OrbStack.
@@ -355,7 +372,7 @@ The script bootstraps and uses a `docker-container` Buildx builder named `onlydo
 If you only want to initialize that builder first:
 
 ```bash
-npm run image:builder:init
+bun run image:builder:init
 ```
 
 You still need to be authenticated to `ghcr.io` before pushing.
@@ -379,7 +396,7 @@ Deploy this project as containers on a platform that supports long-running proce
 - PostgreSQL
 - S3-compatible object storage
 - ClickHouse
-- Dogecoin and EVM RPC providers
+- Dogecoin RPC provider
 
 ### Docker + Caddy Deployment
 
@@ -403,7 +420,7 @@ The deploy script uploads `docker-compose.managed.yml`, `docker/caddy/Caddyfile`
 
 The managed Compose stack runs:
 
-- `caddy` on ports `80` and `443`, terminating TLS for `platform.onlydoge.io`.
+- `caddy` on ports `80` and `443`, terminating TLS for your configured public host.
 - `onlydoge-api` with `--mode=http --ip=0.0.0.0 --port=2277`.
 - `onlydoge-indexer` with `--mode=indexer` and an indexer-specific health check.
 
@@ -447,7 +464,8 @@ ghcr.io/simonbetton/onlydoge-indexer:latest
 - `ONLYDOGE_CORE_BLOCK_TIMEOUT_MS=120000`
 - `ONLYDOGE_CORE_DB_STATEMENT_TIMEOUT_MS=30000`
 - `ONLYDOGE_CORE_SYNC_COMPLETE_DISTANCE=6`
-- `ONLYDOGE_CORE_PROCESS_WINDOW=128`
+- `ONLYDOGE_CORE_PROCESS_LOAD_CONCURRENCY=8`
+- `ONLYDOGE_CORE_PROCESS_WINDOW=100`
 - `ONLYDOGE_CORE_PROGRESS_WATCHDOG_MS=180000`
 - `ONLYDOGE_CORE_RAW_STORAGE_TIMEOUT_MS=30000`
 - `ONLYDOGE_CORE_ONLINE_TIP_DISTANCE=6`
@@ -479,12 +497,18 @@ ghcr.io/simonbetton/onlydoge-indexer:latest
 - `https://<your-hostname>/v1/heartbeat`
 - `https://<your-hostname>/openapi`
 
-If your ClickHouse instance is self-hosted rather than managed, also install the checked-in memory tuning files on that host before starting OnlyDoge:
+If your ClickHouse instance is self-hosted rather than managed, also install the checked-in memory tuning and log-retention files on that host before starting OnlyDoge:
 
 ```bash
 scp docker/clickhouse/config.d/onlydoge-memory.xml root@<clickhouse-host>:/etc/clickhouse-server/config.d/onlydoge-memory.xml
+scp docker/clickhouse/config.d/onlydoge-log-retention.xml root@<clickhouse-host>:/etc/clickhouse-server/config.d/onlydoge-log-retention.xml
 scp docker/clickhouse/users.d/onlydoge-memory.xml root@<clickhouse-host>:/etc/clickhouse-server/users.d/onlydoge-memory.xml
+scp docker/clickhouse/logrotate.d/clickhouse-server root@<clickhouse-host>:/etc/logrotate.d/clickhouse-server
+scp docker/clickhouse/logrotate.d/rsyslog root@<clickhouse-host>:/etc/logrotate.d/rsyslog
+ssh root@<clickhouse-host> 'mkdir -p /etc/systemd/journald.conf.d'
+scp docker/clickhouse/journald.conf.d/onlydoge-retention.conf root@<clickhouse-host>:/etc/systemd/journald.conf.d/onlydoge-retention.conf
 ssh root@<clickhouse-host> 'systemctl restart clickhouse-server'
+ssh root@<clickhouse-host> 'systemctl restart systemd-journald && journalctl --vacuum-time=3d --vacuum-size=512M'
 ```
 
 The ONCE-specific assumptions come from ONCE's compatibility model: Docker image, HTTP on port `80`, a successful `/up` healthcheck, and persistent storage mounted at `/storage` if your app uses local disk state. OnlyDoge can run on ONCE without local state when you provide external production services.
@@ -546,16 +570,16 @@ Useful overrides:
 ```bash
 bun run deploy:once -- --envFile .env.once --image ghcr.io/simonbetton/onlydoge-indexer:latest
 bun run deploy:once -- --dryRun
-bun run deploy:once -- --host platform.onlydoge.io --sshJump root@164.90.159.127 --sshTarget root@10.124.0.3
+bun run deploy:once -- --host api.example.com --sshJump root@203.0.113.10 --sshTarget root@10.0.0.10
 ```
 
 By default the script expects:
 
-- `ONCE_APP_HOST=platform.onlydoge.io`
-- `ONCE_SSH_JUMP=root@164.90.159.127`
-- `ONCE_SSH_TARGET=root@10.124.0.3`
+- `ONCE_APP_HOST=api.example.com`
+- `ONCE_SSH_JUMP=root@203.0.113.10`
+- `ONCE_SSH_TARGET=root@10.0.0.10`
 
-If your Postgres DSN uses `sslrootcert=/storage/do-ca.pem`, make sure that CA file already exists in the ONCE app volume before the first deploy. For the current production host that file is already present.
+If your Postgres DSN uses `sslrootcert=/storage/do-ca.pem`, make sure that CA file exists in the app volume before the first deploy or provide `ONLYDOGE_DATABASE_SSLROOTCERT_PEM` in the env file.
 
 ### Deployment Steps
 
@@ -586,7 +610,8 @@ For the bundled Compose production stack, ClickHouse and the indexer tuning are 
 - `ONLYDOGE_CORE_BLOCK_TIMEOUT_MS=120000`
 - `ONLYDOGE_CORE_DB_STATEMENT_TIMEOUT_MS=30000`
 - `ONLYDOGE_CORE_SYNC_COMPLETE_DISTANCE=6`
-- `ONLYDOGE_CORE_PROCESS_WINDOW=128`
+- `ONLYDOGE_CORE_PROCESS_LOAD_CONCURRENCY=8`
+- `ONLYDOGE_CORE_PROCESS_WINDOW=100`
 - `ONLYDOGE_CORE_PROGRESS_WATCHDOG_MS=180000`
 - `ONLYDOGE_CORE_RAW_STORAGE_TIMEOUT_MS=30000`
 - `ONLYDOGE_CORE_ONLINE_TIP_DISTANCE=6`
@@ -643,7 +668,7 @@ Error payload shape:
 {"error":"..."}
 ```
 
-Public explorer reads:
+Explorer read endpoints:
 
 - `GET /v1/explorer/networks`
 - `GET /v1/explorer/search?q=...`
@@ -654,7 +679,7 @@ Public explorer reads:
 - `GET /v1/explorer/addresses/:address/transactions`
 - `GET /v1/explorer/addresses/:address/utxos`
 
-Explorer routes are public and read only indexed data plus stored raw block snapshots. Analyst and admin routes stay behind `x-api-token`.
+Explorer routes are read-only and use indexed data plus stored raw block snapshots. They still require `x-api-token` like the rest of `/v1`, except `/up`, `/v1/heartbeat`, and `/openapi`.
 
 ## Quality Gates
 
@@ -664,6 +689,13 @@ bun run typecheck
 bun run test
 bun run ci
 ```
+
+GitHub Actions mirrors these gates:
+
+- `CI`: lint, typecheck, Vitest, and a production Docker build on pull requests and `main`.
+- `Security`: CodeQL, dependency review, secret scanning, and production image vulnerability scanning.
+- `Publish Image`: quality gates plus multi-arch GHCR publish with SBOM and provenance on `v*` tags or manual dispatch.
+- `Deploy Production`: manual, environment-protected production deploy followed by the production E2E teardown suite.
 
 Vitest covers:
 
@@ -675,8 +707,9 @@ Vitest covers:
 ## Notes for Operators
 
 - Keep passwords URL-safe if you inject them directly into `ONLYDOGE_DATABASE`. If you need special characters, URL-encode them.
-- The current ClickHouse schema is intentionally minimal and exists to keep the current query surface bootable.
+- The current ClickHouse schema supports Dogecoin current-state reads and core-backed history reads without duplicating full history into separate fact tables.
 - The local and production Compose stacks assume the warehouse database name is `onlydoge`.
 - Raw block storage is written to S3-compatible object storage in Dockerized environments.
 - The current checked-in ClickHouse memory profile assumes a warehouse node in roughly the `16 GB RAM` class. If you run a materially smaller box, lower the profile values before deployment.
-- The current checked-in indexer defaults are intentionally conservative for production backfill: `ONLYDOGE_CORE_BLOCK_TIMEOUT_MS=120000`, `ONLYDOGE_CORE_DB_STATEMENT_TIMEOUT_MS=30000`, `ONLYDOGE_CORE_SYNC_COMPLETE_DISTANCE=6`, `ONLYDOGE_CORE_PROCESS_WINDOW=128`, `ONLYDOGE_CORE_PROGRESS_WATCHDOG_MS=180000`, `ONLYDOGE_CORE_RAW_STORAGE_TIMEOUT_MS=30000`, `ONLYDOGE_CORE_ONLINE_TIP_DISTANCE=6`, `ONLYDOGE_INDEXER_BOOTSTRAP_TIMEOUT_MS=60000`, `ONLYDOGE_INDEXER_FACT_WINDOW=64`, `ONLYDOGE_INDEXER_FACT_TIMEOUT_MS=300000`, `ONLYDOGE_INDEXER_PROJECT_WINDOW=4`, `ONLYDOGE_INDEXER_PROJECT_TIMEOUT_MS=300000`, `ONLYDOGE_INDEXER_DOGECOIN_TRANSFER_MAX_INPUT_ADDRESSES=64`, `ONLYDOGE_INDEXER_DOGECOIN_TRANSFER_MAX_EDGES=1024`, `ONLYDOGE_INDEXER_SYNC_BACKLOG_HIGH_WATERMARK=2048`, `ONLYDOGE_INDEXER_SYNC_BACKLOG_LOW_WATERMARK=512`, `ONLYDOGE_WAREHOUSE_REQUEST_TIMEOUT_MS=30000`, and relink deferral near the values in `.env.production.example`.
+- The checked-in ClickHouse log-retention profile caps system log tables, host syslog, ClickHouse file logs, and journald at 3 days to prevent diagnostic logs from filling the warehouse disk during heavy backfills.
+- The current checked-in indexer defaults are intentionally conservative for production backfill: `ONLYDOGE_CORE_BLOCK_TIMEOUT_MS=120000`, `ONLYDOGE_CORE_DB_STATEMENT_TIMEOUT_MS=30000`, `ONLYDOGE_CORE_SYNC_COMPLETE_DISTANCE=6`, `ONLYDOGE_CORE_PROCESS_LOAD_CONCURRENCY=8`, `ONLYDOGE_CORE_PROCESS_WINDOW=100`, `ONLYDOGE_CORE_PROGRESS_WATCHDOG_MS=180000`, `ONLYDOGE_CORE_RAW_STORAGE_TIMEOUT_MS=30000`, `ONLYDOGE_CORE_ONLINE_TIP_DISTANCE=6`, `ONLYDOGE_INDEXER_BOOTSTRAP_TIMEOUT_MS=60000`, `ONLYDOGE_INDEXER_FACT_WINDOW=64`, `ONLYDOGE_INDEXER_FACT_TIMEOUT_MS=300000`, `ONLYDOGE_INDEXER_PROJECT_WINDOW=4`, `ONLYDOGE_INDEXER_PROJECT_TIMEOUT_MS=300000`, `ONLYDOGE_INDEXER_DOGECOIN_TRANSFER_MAX_INPUT_ADDRESSES=64`, `ONLYDOGE_INDEXER_DOGECOIN_TRANSFER_MAX_EDGES=1024`, `ONLYDOGE_INDEXER_SYNC_BACKLOG_HIGH_WATERMARK=2048`, `ONLYDOGE_INDEXER_SYNC_BACKLOG_LOW_WATERMARK=512`, `ONLYDOGE_WAREHOUSE_REQUEST_TIMEOUT_MS=30000`, and relink deferral near the values in `.env.production.example`.

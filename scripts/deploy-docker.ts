@@ -9,10 +9,10 @@ import { parse as parseDotenv } from 'dotenv';
 const DEFAULT_IMAGE = 'ghcr.io/simonbetton/onlydoge-indexer:latest';
 const DEFAULT_ENV_FILE = '.env.managed';
 const DEFAULT_FALLBACK_ENV_FILE = '.env.once';
-const DEFAULT_HOST = 'platform.onlydoge.io';
+const DEFAULT_HOST = 'api.example.com';
 const DEFAULT_REMOTE_DIR = '/opt/onlydoge';
-const DEFAULT_SSH_JUMP = 'root@164.90.159.127';
-const DEFAULT_SSH_TARGET = 'root@10.124.0.3';
+const DEFAULT_SSH_JUMP = 'root@203.0.113.10';
+const DEFAULT_SSH_TARGET = 'root@10.0.0.10';
 
 const FORWARDED_ENV_KEYS = new Set(['SECRET_KEY_BASE', 'VAPID_PRIVATE_KEY', 'VAPID_PUBLIC_KEY']);
 
@@ -43,6 +43,7 @@ const REQUIRED_ENV_KEYS = [
   'ONLYDOGE_CORE_BLOCK_TIMEOUT_MS',
   'ONLYDOGE_CORE_DB_STATEMENT_TIMEOUT_MS',
   'ONLYDOGE_CORE_SYNC_COMPLETE_DISTANCE',
+  'ONLYDOGE_CORE_PROCESS_LOAD_CONCURRENCY',
   'ONLYDOGE_CORE_PROCESS_WINDOW',
   'ONLYDOGE_CORE_PROGRESS_WATCHDOG_MS',
   'ONLYDOGE_CORE_RAW_STORAGE_TIMEOUT_MS',
@@ -195,14 +196,14 @@ async function runDeployPlan(plan: DeployPlan): Promise<void> {
 async function readRunningDatabaseCa(plan: DeployPlan): Promise<string> {
   return runSsh(
     plan,
-    "name=$(docker ps --format '{{.Names}}' | grep '^once-app-onlydoge-indexer' | head -n1); if [ -n \"$name\" ]; then docker exec \"$name\" sh -lc 'if [ -f /storage/do-ca.pem ]; then cat /storage/do-ca.pem; fi'; fi",
+    `${runningIndexerContainerCommand()}; if [ -n "$name" ]; then docker exec "$name" sh -lc 'if [ -f /storage/do-ca.pem ]; then cat /storage/do-ca.pem; fi'; fi`,
   );
 }
 
 async function readRunningOnlyDogeEnv(plan: DeployPlan): Promise<Record<string, string>> {
   const output = await runSsh(
     plan,
-    'name=$(docker ps --format \'{{.Names}}\' | grep \'^once-app-onlydoge-indexer\' | head -n1); if [ -n "$name" ]; then docker exec "$name" env -0; fi',
+    `${runningIndexerContainerCommand()}; if [ -n "$name" ]; then docker exec "$name" env -0; fi`,
   );
   const env: Record<string, string> = {};
   for (const line of output.split('\0')) {
@@ -217,6 +218,10 @@ async function readRunningOnlyDogeEnv(plan: DeployPlan): Promise<Record<string, 
     env[key] = line.slice(separator + 1);
   }
   return env;
+}
+
+function runningIndexerContainerCommand(): string {
+  return "name=$(docker ps --format '{{.Names}}' | grep -E '^(onlydoge-onlydoge-indexer-1|onlydoge-onlydoge-api-1|once-app-onlydoge-indexer|once-app-onlydoge-api)' | head -n1)";
 }
 
 function buildRemoteDeployCommand(plan: DeployPlan): string {

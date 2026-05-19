@@ -3,6 +3,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
 import { buildApiApp } from '@onlydoge/api';
+import { configKeyIndexerProcessTail } from '@onlydoge/indexing-pipeline';
 import { createRuntime } from '@onlydoge/platform';
 import { expect, vi } from 'vitest';
 
@@ -54,6 +55,24 @@ export async function createTestApp(mode: 'both' | 'http' | 'indexer' = 'both') 
 }
 
 type TestRuntime = Awaited<ReturnType<typeof createRuntime>>;
+
+export async function runIndexerUntilProcessed(
+  ctx: { runtime: TestRuntime },
+  networkId: number,
+  targetTail: number,
+): Promise<void> {
+  for (let attempt = 0; attempt < 8; attempt += 1) {
+    await ctx.runtime.indexingPipeline.runOnce();
+    const processTail =
+      (await ctx.runtime.metadata.getJsonValue<number>(configKeyIndexerProcessTail(networkId))) ??
+      -1;
+    if (processTail >= targetTail) {
+      return;
+    }
+  }
+
+  throw new Error(`core process tail did not reach ${targetTail}`);
+}
 
 export async function createAuthenticatedTestApp(mode: 'both' | 'http' | 'indexer' = 'both') {
   const ctx = await createTestApp(mode);
@@ -215,23 +234,6 @@ const rpcMockHandlers: Record<string, RpcMockHandler> = {
     Response.json({
       result: dogecoinBlocksByHash.get(String(body.params?.[0] ?? '')) ?? null,
       error: null,
-    }),
-  eth_blockNumber: () => Response.json({ result: '0x3' }),
-  eth_getBlockByNumber: () =>
-    Response.json({
-      result: {
-        number: '0x1',
-        hash: '0xabc',
-        timestamp: '0x1',
-        transactions: [],
-      },
-    }),
-  eth_getTransactionReceipt: (body) =>
-    Response.json({
-      result: {
-        transactionHash: String(body.params?.[0] ?? '0x0'),
-        logs: [],
-      },
     }),
 };
 
