@@ -91,6 +91,26 @@ describe('api integration', () => {
     const apiToken = requireStringField(key, 'key');
     expect(apiToken).toMatch(/^sk_/u);
 
+    const fetchedBeforeUse = await request(ctx.app, `/v1/keys/${keyId}`, {
+      headers: {
+        'x-api-token': apiToken,
+      },
+    });
+    const fetchedBeforeUseBody = await readJsonObject(fetchedBeforeUse);
+    const fetchedBeforeUseKey = readObjectField(fetchedBeforeUseBody, 'key');
+    expect(requireStringField(fetchedBeforeUseKey, 'id')).toBe(keyId);
+    expect(fetchedBeforeUseKey.key).toBeUndefined();
+
+    const listedBeforeUse = await request(ctx.app, '/v1/keys', {
+      headers: {
+        'x-api-token': apiToken,
+      },
+    });
+    const listedBeforeUseBody = await readJsonObject(listedBeforeUse);
+    const listedBeforeUseKeys = readObjectArrayField(listedBeforeUseBody, 'keys');
+    expect(listedBeforeUseKeys).toHaveLength(1);
+    expect(listedBeforeUseKeys[0]?.key).toBeUndefined();
+
     const denied = await request(ctx.app, '/v1/networks');
     expect(denied.status).toBe(401);
 

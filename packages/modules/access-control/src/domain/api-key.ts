@@ -60,12 +60,17 @@ export function setApiKeyIsActive(record: ApiKeyRecord, isActive: boolean): ApiK
   };
 }
 
-export function apiKeyToResponse(record: ApiKeyRecord): ApiKeyResponse {
+export function apiKeyToResponse(
+  record: ApiKeyRecord,
+  options: { includeSecret?: boolean } = {},
+): ApiKeyResponse {
   return {
     id: record.id,
     isActive: record.isActive,
     createdAt: record.createdAt,
-    ...(record.secretKeyPlaintext ? { key: record.secretKeyPlaintext } : {}),
+    ...(options.includeSecret && record.secretKeyPlaintext
+      ? { key: record.secretKeyPlaintext }
+      : {}),
   };
 }
 
