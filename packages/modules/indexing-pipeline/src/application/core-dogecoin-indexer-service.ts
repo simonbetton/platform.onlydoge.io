@@ -12,6 +12,10 @@ import type {
 import { fromDecimalUnits } from '../domain/amounts';
 import {
   configKeyBlockHeight,
+  configKeyDogecoinCurrentStateReady,
+  configKeyDogecoinHistoryReady,
+  configKeyIndexerFactProgress,
+  configKeyIndexerFactTail,
   configKeyIndexerProcessProgress,
   configKeyIndexerProcessTail,
   configKeyIndexerStage,
@@ -29,14 +33,15 @@ import type {
   CoreIndexerState,
   ProjectionUtxoOutput,
 } from '../domain/projection-models';
-import type { IndexingPipelineSettings } from './indexing-pipeline-service';
+import { mapWithConcurrency, range } from './concurrency';
+import type { CoreDogecoinIndexerSettings } from './core-dogecoin-indexer-settings';
 
 interface PrimaryLease {
   heartbeatAt: string;
   instanceId: string;
 }
 
-interface CoreDogecoinIndexerServiceOptions {
+export interface CoreDogecoinIndexerServiceOptions {
   exitProcess?: (code: number) => never;
 }
 
@@ -80,6 +85,12 @@ interface CoreBlockMetrics {
   totalMs: number;
 }
 
+interface CoreWindowMetrics extends CoreBlockMetrics {
+  blocks: number;
+  end: number;
+  start: number;
+}
+
 type CoreBlockStep = 'load_raw' | 'build_application' | 'apply_state' | 'publish_progress';
 
 class CoreBlockTimeoutError extends Error {
@@ -103,10 +114,11 @@ export class CoreDogecoinIndexerService {
     private readonly rawBlocks: RawBlockStoragePort,
     private readonly rpc: BlockchainRpcPort,
     private readonly stateStore: CoreDogecoinStateStorePort,
-    private readonly settings: IndexingPipelineSettings,
+    private readonly settings: CoreDogecoinIndexerSettings,
     private readonly options: CoreDogecoinIndexerServiceOptions = {},
   ) {}
 
+  // fallow-ignore-next-line unused-class-member
   public async start(signal?: AbortSignal): Promise<void> {
     console.info('[onlydoge] core dogecoin indexer loop started');
     while (!signal?.aborted) {
@@ -157,14 +169,14 @@ export class CoreDogecoinIndexerService {
 
     try {
       if (state.stage === 'sync_backfill') {
-        return this.syncBackfill(network, latest, state);
+        return await this.syncBackfill(network, latest, state);
       }
 
       if (state.stage === 'process_backfill') {
-        return this.processBackfill(network, latest, state);
+        return await this.processBackfill(network, latest, state);
       }
 
-      return this.online(network, latest, state);
+      return await this.online(network, latest, state);
     } catch (error) {
       await this.stateStore.setCoreIndexerError(network.networkId, formatError(error));
       throw error;
@@ -180,9 +192,9 @@ export class CoreDogecoinIndexerService {
       return current;
     }
 
-    const legacySyncTail =
+    const storedSyncTail =
       (await this.configs.getJsonValue<number>(configKeyIndexerSyncTail(network.networkId))) ?? -1;
-    const syncTail = Math.min(legacySyncTail, latest);
+    const syncTail = Math.min(storedSyncTail, latest);
     const state = await this.stateStore.upsertCoreIndexerState({
       networkId: network.networkId,
       stage: 'sync_backfill',
@@ -255,12 +267,27 @@ export class CoreDogecoinIndexerService {
     latest: number,
     state: CoreIndexerState,
   ): Promise<boolean> {
+    const currentStateReady =
+      (await this.configs.getJsonValue<boolean>(
+        configKeyDogecoinCurrentStateReady(network.networkId),
+      )) === true;
+
     if (state.processTail >= state.syncTail) {
       if (state.processTail >= latest - this.settings.coreOnlineTipDistance) {
+        if (!currentStateReady) {
+          await this.stateStore.materializeCoreDogecoinCurrentState(
+            network.networkId,
+            state.processTail,
+            {
+              statementTimeoutMs: this.settings.coreDbStatementTimeoutMs,
+            },
+          );
+        }
         await this.stateStore.upsertCoreIndexerState({
           networkId: network.networkId,
           stage: 'online',
           onlineTip: latest,
+          lastError: null,
         });
         await this.configs.setJsonValue(configKeyIndexerStage(network.networkId), 'online');
         console.info(
@@ -268,21 +295,173 @@ export class CoreDogecoinIndexerService {
         );
         return true;
       }
-      return false;
+      await this.stateStore.upsertCoreIndexerState({
+        networkId: network.networkId,
+        stage: 'sync_backfill',
+        onlineTip: latest,
+      });
+      await this.configs.setJsonValue(configKeyIndexerStage(network.networkId), 'sync_backfill');
+      console.info(
+        `[onlydoge] core stage changed network=${network.id} stage=sync_backfill reason=tip-advanced process_tail=${state.processTail} latest=${latest}`,
+      );
+      return true;
     }
 
     const end = Math.min(state.syncTail, state.processTail + this.settings.coreProcessWindow);
-    let tail = state.processTail;
-    for (const height of range(state.processTail + 1, end)) {
-      const metrics = await this.processBlock(network, height);
-      tail = height;
-      await this.publishBlockProgress(network, latest, tail, metrics);
+    const heights = range(state.processTail + 1, end);
+    const metrics = await this.processWindow(network, latest, heights, currentStateReady);
+    await this.publishWindowProgress(network, latest, metrics);
+
+    console.info(
+      `[onlydoge] core processed network=${network.id} blocks=${metrics.start}-${metrics.end} sync_tail=${state.syncTail} latest=${latest}`,
+    );
+    return true;
+  }
+
+  private async processWindow(
+    network: CoreDogecoinNetwork,
+    _latest: number,
+    heights: number[],
+    updateCurrentState: boolean,
+  ): Promise<CoreWindowMetrics> {
+    if (heights.length === 0) {
+      throw new Error('empty core process window');
+    }
+    const firstHeight = heights[0];
+    if (firstHeight === undefined) {
+      throw new Error('empty core process window');
+    }
+    const lastHeight = heights.at(-1) ?? firstHeight;
+
+    const attempt: CoreBlockAttempt = {
+      activeStep: 'load_raw',
+      height: lastHeight,
+      networkId: network.networkId,
+      startedAtMs: Date.now(),
+    };
+    this.activeBlockAttempts.set(network.networkId, attempt);
+    const totalStartedAt = Date.now();
+
+    try {
+      const { result: snapshots, elapsedMs: loadRawMs } = await this.runCoreBlockStep(
+        attempt,
+        'load_raw',
+        () =>
+          mapWithConcurrency(heights, this.settings.coreProcessLoadConcurrency, async (height) => {
+            const snapshot = await this.rawBlocks.getPart<Record<string, unknown>>(
+              network.networkId,
+              height,
+              rawBlockPart,
+              {
+                timeoutMs: this.settings.coreRawStorageTimeoutMs,
+              },
+            );
+            if (!snapshot) {
+              throw new Error(
+                `missing raw dogecoin block snapshot network=${network.id} height=${height}`,
+              );
+            }
+            return snapshot;
+          }),
+      );
+      const { result: applications, elapsedMs: buildMs } = await this.runCoreBlockStep(
+        attempt,
+        'build_application',
+        () => Promise.resolve(this.buildFastBlockApplications(network.networkId, snapshots)),
+      );
+      const { result: applyResult, elapsedMs: applyMs } = await this.runCoreBlockStep(
+        attempt,
+        'apply_state',
+        (abortSignal) =>
+          this.stateStore.applyCoreDogecoinWindow(applications, {
+            abortSignal,
+            statementTimeoutMs: this.settings.coreDbStatementTimeoutMs,
+            updateCurrentState,
+            validatePrevouts: false,
+          }),
+      );
+
+      return {
+        applied: applyResult.applied,
+        applyMs,
+        blocks: applications.length,
+        buildMs,
+        creates: applications.reduce((sum, application) => sum + application.utxoCreates.length, 0),
+        end: applyResult.processTail,
+        loadRawMs,
+        spends: applications.reduce((sum, application) => sum + application.utxoSpends.length, 0),
+        start: applications[0]?.blockHeight ?? firstHeight,
+        totalMs: Date.now() - totalStartedAt,
+      };
+    } catch (error) {
+      if (error instanceof CoreBlockTimeoutError) {
+        const message = `core block timed out network=${network.id} height=${attempt.height} active_step=${error.step} timeout_ms=${error.timeoutMs}`;
+        await this.stateStore.setCoreIndexerError(network.networkId, message);
+        console.error(
+          `[onlydoge] phase=core-process error=timeout network=${network.id} height=${attempt.height} active_step=${error.step} timeout_ms=${error.timeoutMs}`,
+        );
+        this.exitProcess(1);
+      }
+      throw error;
+    } finally {
+      if (this.activeBlockAttempts.get(network.networkId) === attempt) {
+        this.activeBlockAttempts.delete(network.networkId);
+      }
+    }
+  }
+
+  private buildFastBlockApplications(
+    networkId: PrimaryId,
+    snapshots: Record<string, unknown>[],
+  ): CoreDogecoinBlockApplication[] {
+    return buildFastCoreDogecoinBlockApplications(networkId, snapshots);
+  }
+
+  private async publishWindowProgress(
+    network: CoreDogecoinNetwork,
+    latest: number,
+    metrics: CoreWindowMetrics,
+  ): Promise<void> {
+    let nextState: CoreIndexerState;
+    let publishMs: number;
+    try {
+      const published = await this.runCoreBlockStep(
+        {
+          activeStep: 'publish_progress',
+          height: metrics.end,
+          networkId: network.networkId,
+          startedAtMs: Date.now(),
+        },
+        'publish_progress',
+        async () => {
+          const state = await this.stateStore.upsertCoreIndexerState({
+            networkId: network.networkId,
+            stage: 'process_backfill',
+            processTail: metrics.end,
+            onlineTip: latest,
+            lastError: null,
+          });
+          await this.publishProgress(network.networkId, latest, state);
+          return state;
+        },
+      );
+      nextState = published.result;
+      publishMs = published.elapsedMs;
+    } catch (error) {
+      if (error instanceof CoreBlockTimeoutError) {
+        const message = `core block timed out network=${network.id} height=${metrics.end} active_step=${error.step} timeout_ms=${error.timeoutMs}`;
+        await this.stateStore.setCoreIndexerError(network.networkId, message);
+        console.error(
+          `[onlydoge] phase=core-process error=timeout network=${network.id} height=${metrics.end} active_step=${error.step} timeout_ms=${error.timeoutMs}`,
+        );
+        this.exitProcess(1);
+      }
+      throw error;
     }
 
     console.info(
-      `[onlydoge] core processed network=${network.id} blocks=${state.processTail + 1}-${tail} sync_tail=${state.syncTail} latest=${latest}`,
+      `[onlydoge] phase=core-process-window network=${network.id} blocks=${metrics.start}-${metrics.end} applied=${metrics.applied} load_raw_ms=${metrics.loadRawMs} build_ms=${metrics.buildMs} apply_ms=${metrics.applyMs} publish_progress_ms=${publishMs} total_ms=${metrics.totalMs + publishMs} creates=${metrics.creates} spends=${metrics.spends} process_tail=${nextState.processTail}`,
     );
-    return true;
   }
 
   private async online(
@@ -290,6 +469,26 @@ export class CoreDogecoinIndexerService {
     latest: number,
     state: CoreIndexerState,
   ): Promise<boolean> {
+    const currentStateReady =
+      (await this.configs.getJsonValue<boolean>(
+        configKeyDogecoinCurrentStateReady(network.networkId),
+      )) === true;
+    if (currentStateReady) {
+      if (state.processTail >= latest - this.settings.coreOnlineTipDistance) {
+        const nextState =
+          state.stage === 'online' && state.onlineTip === latest && state.lastError === null
+            ? state
+            : await this.stateStore.upsertCoreIndexerState({
+                networkId: network.networkId,
+                stage: 'online',
+                onlineTip: latest,
+                lastError: null,
+              });
+        await this.publishProgress(network.networkId, latest, nextState);
+        return false;
+      }
+    }
+
     if (state.syncTail >= latest && state.processTail >= latest) {
       await this.publishProgress(network.networkId, latest, state);
       return false;
@@ -311,151 +510,14 @@ export class CoreDogecoinIndexerService {
     return true;
   }
 
-  private async processBlock(
-    network: CoreDogecoinNetwork,
-    height: number,
-  ): Promise<CoreBlockMetrics> {
-    const attempt: CoreBlockAttempt = {
-      activeStep: 'load_raw',
-      height,
-      networkId: network.networkId,
-      startedAtMs: Date.now(),
-    };
-    this.activeBlockAttempts.set(network.networkId, attempt);
-    const totalStartedAt = Date.now();
-
-    try {
-      const { result: snapshot, elapsedMs: loadRawMs } = await this.runCoreBlockStep(
-        attempt,
-        'load_raw',
-        () =>
-          this.rawBlocks.getPart<Record<string, unknown>>(network.networkId, height, rawBlockPart, {
-            timeoutMs: this.settings.coreRawStorageTimeoutMs,
-          }),
-      );
-      if (!snapshot) {
-        throw new Error(
-          `missing raw dogecoin block snapshot network=${network.id} height=${height}`,
-        );
-      }
-
-      const { result: application, elapsedMs: buildMs } = await this.runCoreBlockStep(
-        attempt,
-        'build_application',
-        () => this.buildBlockApplication(network.networkId, snapshot),
-      );
-      const { result: applyResult, elapsedMs: applyMs } = await this.runCoreBlockStep(
-        attempt,
-        'apply_state',
-        () =>
-          this.stateStore.applyCoreDogecoinBlock(application, {
-            statementTimeoutMs: this.settings.coreDbStatementTimeoutMs,
-          }),
-      );
-
-      return {
-        applyMs,
-        applied: applyResult.applied,
-        buildMs,
-        creates: application.utxoCreates.length,
-        loadRawMs,
-        spends: application.utxoSpends.length,
-        totalMs: Date.now() - totalStartedAt,
-      };
-    } catch (error) {
-      if (error instanceof CoreBlockTimeoutError) {
-        const message = `core block timed out network=${network.id} height=${height} active_step=${error.step} timeout_ms=${error.timeoutMs}`;
-        await this.stateStore.setCoreIndexerError(network.networkId, message);
-        console.error(
-          `[onlydoge] phase=core-process error=timeout network=${network.id} height=${height} active_step=${error.step} timeout_ms=${error.timeoutMs}`,
-        );
-        this.exitProcess(1);
-      }
-      throw error;
-    } finally {
-      if (this.activeBlockAttempts.get(network.networkId) === attempt) {
-        this.activeBlockAttempts.delete(network.networkId);
-      }
-    }
-  }
-
-  private async buildBlockApplication(
-    networkId: PrimaryId,
-    snapshot: Record<string, unknown>,
-  ): Promise<CoreDogecoinBlockApplication> {
-    const block = parseDogecoinBlockSnapshot(snapshot);
-    const externalKeys = collectExternalOutputKeys(block);
-    const persistedOutputs = await this.stateStore.getCoreUtxoOutputs(networkId, externalKeys);
-    const localOutputs = new Map<string, ProjectionUtxoOutput>();
-    const utxoCreates: ProjectionUtxoOutput[] = [];
-    const utxoSpends: CoreDogecoinBlockApplication['utxoSpends'] = [];
-
-    for (const [txIndex, tx] of block.tx.entries()) {
-      const txid = requireString(tx.txid, 'tx.txid');
-      for (const [inputIndex, input] of (tx.vin ?? []).entries()) {
-        if (input.coinbase) {
-          continue;
-        }
-        const outputKey = `${requireString(input.txid, 'vin.txid')}:${requireNumber(input.vout, 'vin.vout')}`;
-        const prevout = localOutputs.get(outputKey) ?? persistedOutputs.get(outputKey);
-        if (!prevout) {
-          throw new Error(`missing core utxo output: ${outputKey}`);
-        }
-        markSpent(prevout, txid, block.height, inputIndex);
-        utxoSpends.push({
-          outputKey,
-          spentByTxid: txid,
-          spentInBlock: block.height,
-          spentInputIndex: inputIndex,
-          address: prevout.address,
-          valueBase: prevout.valueBase,
-        });
-      }
-
-      for (const [outputIndex, output] of (tx.vout ?? []).entries()) {
-        const address = extractDogecoinOutputAddress(output);
-        const created: ProjectionUtxoOutput = {
-          networkId,
-          blockHeight: block.height,
-          blockHash: block.hash,
-          blockTime: block.time,
-          txid,
-          txIndex,
-          vout: requireNumber(output.n ?? outputIndex, 'vout.n'),
-          outputKey: `${txid}:${outputIndex}`,
-          address,
-          scriptType: output.scriptPubKey?.type?.trim() ?? '',
-          valueBase: fromDecimalUnits(requireAmount(output.value), 8),
-          isCoinbase: Boolean((tx.vin ?? []).some((input) => input.coinbase)),
-          isSpendable: Boolean(address),
-          spentByTxid: null,
-          spentInBlock: null,
-          spentInputIndex: null,
-        };
-        localOutputs.set(created.outputKey, created);
-        utxoCreates.push(created);
-      }
-    }
-
-    return {
-      networkId,
-      blockHeight: block.height,
-      blockHash: block.hash,
-      previousBlockHash: block.previousHash,
-      blockTime: block.time,
-      txCount: block.tx.length,
-      rawStorageKey: rawBlockPart,
-      utxoCreates,
-      utxoSpends,
-    };
-  }
-
   private async publishProgress(
     networkId: PrimaryId,
     latest: number,
     state: CoreIndexerState,
   ): Promise<void> {
-    await Promise.all([
+    const historyReady =
+      (await this.configs.getJsonValue<boolean>(configKeyDogecoinHistoryReady(networkId))) === true;
+    const writes = [
       this.configs.setJsonValue(configKeyPrimary(), createLease(this.instanceId)),
       this.configs.setJsonValue(configKeyIndexerStage(networkId), state.stage),
       this.configs.setJsonValue(configKeyIndexerSyncTail(networkId), state.syncTail),
@@ -468,69 +530,37 @@ export class CoreDogecoinIndexerService {
         configKeyIndexerProcessProgress(networkId),
         toProgress(state.processTail, latest),
       ),
-    ]);
-    this.observeProgress(networkId, state);
-  }
-
-  private async publishBlockProgress(
-    network: CoreDogecoinNetwork,
-    latest: number,
-    tail: number,
-    metrics: CoreBlockMetrics,
-  ): Promise<void> {
-    let nextState: CoreIndexerState;
-    let publishMs: number;
-    try {
-      const published = await this.runCoreBlockStep(
-        {
-          activeStep: 'publish_progress',
-          height: tail,
-          networkId: network.networkId,
-          startedAtMs: Date.now(),
-        },
-        'publish_progress',
-        async () => {
-          const state = await this.stateStore.upsertCoreIndexerState({
-            networkId: network.networkId,
-            stage: 'process_backfill',
-            processTail: tail,
-            onlineTip: latest,
-            lastError: null,
-          });
-          await this.publishProgress(network.networkId, latest, state);
-          return state;
-        },
+    ];
+    if (historyReady) {
+      writes.push(
+        this.configs.setJsonValue(configKeyIndexerFactTail(networkId), state.processTail),
+        this.configs.setJsonValue(
+          configKeyIndexerFactProgress(networkId),
+          toProgress(state.processTail, latest),
+        ),
       );
-      nextState = published.result;
-      publishMs = published.elapsedMs;
-    } catch (error) {
-      if (error instanceof CoreBlockTimeoutError) {
-        const message = `core block timed out network=${network.id} height=${tail} active_step=${error.step} timeout_ms=${error.timeoutMs}`;
-        await this.stateStore.setCoreIndexerError(network.networkId, message);
-        console.error(
-          `[onlydoge] phase=core-process error=timeout network=${network.id} height=${tail} active_step=${error.step} timeout_ms=${error.timeoutMs}`,
-        );
-        this.exitProcess(1);
-      }
-      throw error;
     }
 
-    console.info(
-      `[onlydoge] phase=core-process network=${network.id} height=${tail} applied=${metrics.applied} load_raw_ms=${metrics.loadRawMs} build_ms=${metrics.buildMs} apply_ms=${metrics.applyMs} publish_progress_ms=${publishMs} total_ms=${metrics.totalMs + publishMs} creates=${metrics.creates} spends=${metrics.spends} process_tail=${nextState.processTail}`,
-    );
+    await Promise.all(writes);
+    this.observeProgress(networkId, state);
   }
 
   private async runCoreBlockStep<T>(
     attempt: CoreBlockAttempt,
     step: CoreBlockStep,
-    work: () => Promise<T>,
+    work: (abortSignal: AbortSignal) => Promise<T>,
   ): Promise<{ elapsedMs: number; result: T }> {
     attempt.activeStep = step;
     const startedAt = Date.now();
+    const controller = new AbortController();
     const result = await withTimeout(
-      work(),
+      work(controller.signal),
       this.settings.coreBlockTimeoutMs,
-      () => new CoreBlockTimeoutError(step, this.settings.coreBlockTimeoutMs),
+      () => {
+        const error = new CoreBlockTimeoutError(step, this.settings.coreBlockTimeoutMs);
+        controller.abort(error);
+        return error;
+      },
     );
     return {
       elapsedMs: Date.now() - startedAt,
@@ -543,6 +573,15 @@ export class CoreDogecoinIndexerService {
     latest: number,
     state: CoreIndexerState,
   ): Promise<void> {
+    if (
+      state.stage === 'online' &&
+      (await this.configs.getJsonValue<boolean>(
+        configKeyDogecoinCurrentStateReady(network.networkId),
+      )) === true
+    ) {
+      return;
+    }
+
     const observation = this.observeProgress(network.networkId, state);
     if (!hasCoreWorkBacklog(state, latest, this.settings.coreSyncCompleteDistance)) {
       return;
@@ -703,62 +742,80 @@ async function withTimeout<T>(
   }
 }
 
-function range(start: number, end: number): number[] {
-  if (end < start) {
-    return [];
-  }
+export function buildFastCoreDogecoinBlockApplications(
+  networkId: PrimaryId,
+  snapshots: Record<string, unknown>[],
+): CoreDogecoinBlockApplication[] {
+  const createdOutputKeys = new Set<string>();
+  const spentOutputKeys = new Set<string>();
+  const applications: CoreDogecoinBlockApplication[] = [];
 
-  return Array.from({ length: end - start + 1 }, (_, index) => start + index);
-}
+  for (const snapshot of snapshots) {
+    const block = parseDogecoinBlockSnapshot(snapshot);
+    const utxoCreates: ProjectionUtxoOutput[] = [];
+    const utxoSpends: CoreDogecoinBlockApplication['utxoSpends'] = [];
 
-async function mapWithConcurrency<T, R>(
-  values: T[],
-  concurrency: number,
-  worker: (value: T, index: number) => Promise<R>,
-): Promise<R[]> {
-  const results = new Array<R>(values.length);
-  let nextIndex = 0;
-  const workerCount = Math.max(1, Math.min(concurrency, values.length || 1));
-
-  await Promise.all(
-    Array.from({ length: workerCount }, async () => {
-      while (true) {
-        const index = nextIndex;
-        nextIndex += 1;
-        if (index >= values.length) {
-          return;
+    for (const [txIndex, tx] of block.tx.entries()) {
+      const txid = requireString(tx.txid, 'tx.txid');
+      for (const [inputIndex, input] of (tx.vin ?? []).entries()) {
+        if (input.coinbase) {
+          continue;
         }
-        const value = values[index];
-        if (value === undefined) {
-          return;
+        const outputKey = `${requireString(input.txid, 'vin.txid')}:${requireNumber(input.vout, 'vin.vout')}`;
+        if (spentOutputKeys.has(outputKey)) {
+          throw new Error(`duplicate dogecoin spend in core window: ${outputKey}`);
         }
-        results[index] = await worker(value, index);
+        spentOutputKeys.add(outputKey);
+        utxoSpends.push({
+          outputKey,
+          spentByTxid: txid,
+          spentInBlock: block.height,
+          spentInputIndex: inputIndex,
+        });
       }
-    }),
-  );
 
-  return results;
-}
-
-function collectExternalOutputKeys(block: ParsedDogecoinBlock): string[] {
-  const known = new Set<string>();
-  const external = new Set<string>();
-  for (const tx of block.tx) {
-    const txid = requireString(tx.txid, 'tx.txid');
-    for (const input of tx.vin ?? []) {
-      if (input.coinbase) {
-        continue;
-      }
-      const outputKey = `${requireString(input.txid, 'vin.txid')}:${requireNumber(input.vout, 'vin.vout')}`;
-      if (!known.has(outputKey)) {
-        external.add(outputKey);
+      for (const [outputIndex, output] of (tx.vout ?? []).entries()) {
+        const outputKey = `${txid}:${outputIndex}`;
+        if (createdOutputKeys.has(outputKey)) {
+          throw new Error(`duplicate dogecoin output in core window: ${outputKey}`);
+        }
+        createdOutputKeys.add(outputKey);
+        const address = extractDogecoinOutputAddress(output);
+        utxoCreates.push({
+          networkId,
+          blockHeight: block.height,
+          blockHash: block.hash,
+          blockTime: block.time,
+          txid,
+          txIndex,
+          vout: requireNumber(output.n ?? outputIndex, 'vout.n'),
+          outputKey,
+          address,
+          scriptType: output.scriptPubKey?.type?.trim() ?? '',
+          valueBase: fromDecimalUnits(requireAmount(output.value), 8),
+          isCoinbase: Boolean((tx.vin ?? []).some((input) => input.coinbase)),
+          isSpendable: Boolean(address),
+          spentByTxid: null,
+          spentInBlock: null,
+          spentInputIndex: null,
+        });
       }
     }
-    for (const [index] of (tx.vout ?? []).entries()) {
-      known.add(`${txid}:${index}`);
-    }
+
+    applications.push({
+      networkId,
+      blockHeight: block.height,
+      blockHash: block.hash,
+      previousBlockHash: block.previousHash,
+      blockTime: block.time,
+      txCount: block.tx.length,
+      rawStorageKey: rawBlockPart,
+      utxoCreates,
+      utxoSpends,
+    });
   }
-  return [...external];
+
+  return applications;
 }
 
 function parseDogecoinBlockSnapshot(snapshot: Record<string, unknown>): ParsedDogecoinBlock & {
@@ -807,17 +864,6 @@ function requireAmount(value: unknown): string {
     return value.trim();
   }
   throw new Error(`invalid dogecoin amount: ${String(value)}`);
-}
-
-function markSpent(
-  output: ProjectionUtxoOutput,
-  spentByTxid: string,
-  spentInBlock: number,
-  spentInputIndex: number,
-): void {
-  output.spentByTxid = spentByTxid;
-  output.spentInBlock = spentInBlock;
-  output.spentInputIndex = spentInputIndex;
 }
 
 function formatError(error: unknown): string {

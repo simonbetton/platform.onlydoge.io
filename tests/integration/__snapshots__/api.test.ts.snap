@@ -1221,10 +1221,7 @@ exports[`api integration > serves heartbeat and openapi 1`] = `
               "schema": {
                 "properties": {
                   "architecture": {
-                    "enum": [
-                      "dogecoin",
-                      "evm",
-                    ],
+                    "const": "dogecoin",
                     "type": "string",
                   },
                   "blockTime": {
@@ -1270,10 +1267,7 @@ exports[`api integration > serves heartbeat and openapi 1`] = `
               "schema": {
                 "properties": {
                   "architecture": {
-                    "enum": [
-                      "dogecoin",
-                      "evm",
-                    ],
+                    "const": "dogecoin",
                     "type": "string",
                   },
                   "blockTime": {
@@ -1319,10 +1313,7 @@ exports[`api integration > serves heartbeat and openapi 1`] = `
               "schema": {
                 "properties": {
                   "architecture": {
-                    "enum": [
-                      "dogecoin",
-                      "evm",
-                    ],
+                    "const": "dogecoin",
                     "type": "string",
                   },
                   "blockTime": {
@@ -1411,10 +1402,7 @@ exports[`api integration > serves heartbeat and openapi 1`] = `
               "schema": {
                 "properties": {
                   "architecture": {
-                    "enum": [
-                      "dogecoin",
-                      "evm",
-                    ],
+                    "const": "dogecoin",
                     "type": "string",
                   },
                   "blockTime": {
@@ -1451,10 +1439,7 @@ exports[`api integration > serves heartbeat and openapi 1`] = `
               "schema": {
                 "properties": {
                   "architecture": {
-                    "enum": [
-                      "dogecoin",
-                      "evm",
-                    ],
+                    "const": "dogecoin",
                     "type": "string",
                   },
                   "blockTime": {
@@ -1491,10 +1476,7 @@ exports[`api integration > serves heartbeat and openapi 1`] = `
               "schema": {
                 "properties": {
                   "architecture": {
-                    "enum": [
-                      "dogecoin",
-                      "evm",
-                    ],
+                    "const": "dogecoin",
                     "type": "string",
                   },
                   "blockTime": {

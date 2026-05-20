@@ -8,7 +8,7 @@ export type PrimaryId = number;
 
 export type IdPrefix = 'net' | 'key' | 'ent' | 'adr' | 'tag' | 'tok';
 
-export type ChainFamily = 'dogecoin' | 'evm';
+export type ChainFamily = 'dogecoin';
 
 export type Mode = 'both' | 'indexer' | 'http';
 
@@ -23,7 +23,7 @@ function isIdPrefix(value: string | undefined): value is IdPrefix {
 }
 
 function isChainFamily(value: string): value is ChainFamily {
-  return value === 'dogecoin' || value === 'evm';
+  return value === 'dogecoin';
 }
 
 function isMode(value: string): value is Mode {

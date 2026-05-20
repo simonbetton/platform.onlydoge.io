@@ -5,7 +5,7 @@ import type { PrimaryId } from '@onlydoge/shared-kernel';
 export interface ExplorerActiveNetworkPort {
   listActiveNetworks(): Promise<
     Array<{
-      architecture: 'dogecoin' | 'evm';
+      architecture: 'dogecoin';
       blockTime: number;
       chainId: number;
       id: string;
@@ -19,6 +19,7 @@ export interface ExplorerActiveNetworkPort {
 }
 
 export interface ExplorerConfigPort {
+  canReadDogecoinHistory(networkId: PrimaryId): Promise<boolean>;
   getJsonValue<T>(key: string): Promise<T | null>;
 }
 

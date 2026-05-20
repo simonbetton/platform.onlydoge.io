@@ -19,6 +19,7 @@ import {
   NotFoundError,
   type PrimaryId,
   type RiskLevel,
+  TooEarlyError,
   ValidationError,
 } from '@onlydoge/shared-kernel';
 
@@ -114,6 +115,7 @@ export class ExplorerQueryService {
   }> {
     const q = normalizeRequiredQuery(query);
     const network = await this.resolveNetwork(networkId);
+    await this.assertHistoryReady(network.networkId);
 
     if (/^\d+$/u.test(q)) {
       return { matches: await this.searchBlockHeight(network, Number(q)) };
@@ -225,6 +227,7 @@ export class ExplorerQueryService {
     transactions: ExplorerTransactionSummary[];
   }> {
     const network = await this.resolveNetwork(networkId);
+    await this.assertHistoryReady(network.networkId);
     const parsed = await this.resolveBlockSnapshot(network.networkId, ref);
     const inputMap = await this.loadResolvedInputs(network.networkId, parsed.tx);
 
@@ -242,6 +245,7 @@ export class ExplorerQueryService {
   ): Promise<ExplorerTransactionDetail> {
     const normalizedTxid = txid.trim();
     const network = await this.resolveNetwork(networkId);
+    await this.assertHistoryReady(network.networkId);
     const txRef = await this.requireTransactionRef(network.networkId, normalizedTxid);
     const block = await this.loadBlockSnapshot(network.networkId, txRef.blockHeight);
     const transaction = this.requireTransaction(block, normalizedTxid);
@@ -412,6 +416,7 @@ export class ExplorerQueryService {
     }
 
     const network = await this.resolveNetwork(networkId);
+    await this.assertHistoryReady(network.networkId);
     const rows = await this.warehouse.listAddressTransactions(
       network.networkId,
       normalizedAddress,
@@ -423,31 +428,34 @@ export class ExplorerQueryService {
     ]);
 
     return {
-      transactions: rows.flatMap((row) => {
-        const block = snapshotsByHeight.get(row.blockHeight);
-        if (!block) {
-          return [];
-        }
-        const transaction = block.tx.find(
-          (candidate) => this.readString(candidate.txid) === row.txid,
-        );
-        if (!transaction) {
-          return [];
-        }
-        const summary = this.serializeTransactionSummary(
-          network.id,
-          block,
-          transaction,
-          row.txIndex,
-        );
-        return [
-          {
-            transaction: summary,
-            receivedBase: row.receivedBase,
-            sentBase: row.sentBase,
-          },
-        ];
-      }),
+      transactions: rows
+        .flatMap((row) => {
+          const block = snapshotsByHeight.get(row.blockHeight);
+          if (!block) {
+            return [];
+          }
+          const txIndex = block.tx.findIndex(
+            (candidate) => this.readString(candidate.txid) === row.txid,
+          );
+          const transaction = txIndex >= 0 ? block.tx[txIndex] : undefined;
+          if (!transaction) {
+            return [];
+          }
+          const summary = this.serializeTransactionSummary(network.id, block, transaction, txIndex);
+          return [
+            {
+              transaction: summary,
+              receivedBase: row.receivedBase,
+              sentBase: row.sentBase,
+            },
+          ];
+        })
+        .sort(
+          (left, right) =>
+            right.transaction.blockHeight - left.transaction.blockHeight ||
+            right.transaction.txIndex - left.transaction.txIndex ||
+            right.transaction.txid.localeCompare(left.transaction.txid),
+        ),
     };
   }
 
@@ -501,6 +509,12 @@ export class ExplorerQueryService {
     }
 
     return explorerNetworkRef(requireDefaultExplorerNetwork(activeNetworks));
+  }
+
+  private async assertHistoryReady(networkId: PrimaryId): Promise<void> {
+    if (!(await this.configs.canReadDogecoinHistory(networkId))) {
+      throw new TooEarlyError('dogecoin history index is not ready');
+    }
   }
 
   private async resolveBlockSnapshot(

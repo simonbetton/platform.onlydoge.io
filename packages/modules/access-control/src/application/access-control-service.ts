@@ -29,7 +29,7 @@ export class AccessControlService {
     const entity = ApiKey.create(input);
     const created = await this.apiKeys.createApiKey(entity.record);
 
-    return apiKeyToResponse(created);
+    return apiKeyToResponse(created, { includeSecret: true });
   }
 
   public async listKeys(
@@ -39,7 +39,7 @@ export class AccessControlService {
     keys: ApiKeyResponse[];
   }> {
     return {
-      keys: (await this.apiKeys.listApiKeys(offset, limit)).map(apiKeyToResponse),
+      keys: (await this.apiKeys.listApiKeys(offset, limit)).map((key) => apiKeyToResponse(key)),
     };
   }
 

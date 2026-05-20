@@ -282,8 +282,6 @@ describe('relational metadata store', () => {
             spentByTxid: 'tx-1',
             spentInBlock: 1,
             spentInputIndex: 0,
-            address: 'DSource',
-            valueBase: '10000000000',
           },
         ],
         utxoCreates: [

@@ -144,7 +144,8 @@ CREATE TABLE IF NOT EXISTS onlydoge.utxo_outputs_v2
   version UInt64
 )
 ENGINE = ReplacingMergeTree(version)
-ORDER BY (network_id, output_key);
+ORDER BY (network_id, output_key)
+SETTINGS old_parts_lifetime = 0;
 
 CREATE TABLE IF NOT EXISTS onlydoge.utxo_outputs_current_v2
 (
@@ -167,7 +168,8 @@ CREATE TABLE IF NOT EXISTS onlydoge.utxo_outputs_current_v2
   version UInt64
 )
 ENGINE = ReplacingMergeTree(version)
-ORDER BY (network_id, output_key);
+ORDER BY (network_id, output_key)
+SETTINGS old_parts_lifetime = 0;
 
 CREATE TABLE IF NOT EXISTS onlydoge.utxo_outputs_current_by_address_v2
 (
@@ -190,7 +192,8 @@ CREATE TABLE IF NOT EXISTS onlydoge.utxo_outputs_current_by_address_v2
   version UInt64
 )
 ENGINE = ReplacingMergeTree(version)
-ORDER BY (network_id, address, output_key);
+ORDER BY (network_id, address, output_key)
+SETTINGS old_parts_lifetime = 0;
 
 CREATE MATERIALIZED VIEW IF NOT EXISTS onlydoge.utxo_outputs_current_by_address_v2_mv
 TO onlydoge.utxo_outputs_current_by_address_v2
@@ -325,3 +328,47 @@ CREATE TABLE IF NOT EXISTS onlydoge.direct_links_v2
 )
 ENGINE = ReplacingMergeTree(version)
 ORDER BY (network_id, from_address, to_address, asset_address);
+
+CREATE TABLE IF NOT EXISTS onlydoge.core_utxo_creates_v1
+(
+  network_id UInt64,
+  block_height UInt64,
+  block_hash String,
+  block_time UInt64,
+  txid String,
+  tx_index UInt64,
+  vout UInt64,
+  output_key String,
+  address String,
+  script_type String,
+  value_base String,
+  is_coinbase UInt8,
+  is_spendable UInt8,
+  version UInt64
+)
+ENGINE = ReplacingMergeTree(version)
+ORDER BY (network_id, output_key);
+
+CREATE TABLE IF NOT EXISTS onlydoge.core_utxo_spends_v1
+(
+  network_id UInt64,
+  spent_output_key String,
+  spent_by_txid String,
+  spent_in_block UInt64,
+  spent_input_index UInt64,
+  version UInt64
+)
+ENGINE = ReplacingMergeTree(version)
+ORDER BY (network_id, spent_output_key);
+
+CREATE TABLE IF NOT EXISTS onlydoge.core_processed_blocks_v1
+(
+  network_id UInt64,
+  block_height UInt64,
+  block_hash String,
+  block_time UInt64,
+  tx_count UInt64,
+  version UInt64
+)
+ENGINE = ReplacingMergeTree(version)
+ORDER BY (network_id, block_height);

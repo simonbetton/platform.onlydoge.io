@@ -651,12 +651,10 @@ export interface CoreBlockRecord {
 }
 
 export interface CoreDogecoinSpend {
-  address: string;
   outputKey: string;
   spentByTxid: string;
   spentInBlock: number;
   spentInputIndex: number;
-  valueBase: string;
 }
 
 export interface CoreDogecoinBlockApplication {

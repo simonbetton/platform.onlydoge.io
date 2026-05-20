@@ -1,13 +1,14 @@
 import { AccessControlService } from '@onlydoge/access-control';
 import { EntityLabelingService } from '@onlydoge/entity-labeling';
 import { ExplorerQueryService } from '@onlydoge/explorer-query';
-import {
-  CoreDogecoinIndexerService,
-  type IndexingPipelineService,
-} from '@onlydoge/indexing-pipeline';
+import { CoreDogecoinIndexerService } from '@onlydoge/indexing-pipeline';
 import { InvestigationQueryService } from '@onlydoge/investigation-query';
 import { NetworkCatalogService } from '@onlydoge/network-catalog';
 
+import {
+  ClickHouseCoreDogecoinStateStore,
+  isClickHouseCoreDogecoinStore,
+} from './core-dogecoin-state-store';
 import { RelationalMetadataStore } from './metadata-store';
 import { createRawBlockStorage } from './raw-block-storage';
 import { HttpBlockchainRpcGateway } from './rpc';
@@ -22,7 +23,7 @@ export interface Runtime {
   accessControl: AccessControlService;
   entityLabeling: EntityLabelingService;
   explorerQuery: ExplorerQueryService;
-  indexingPipeline: Pick<IndexingPipelineService, 'runOnce' | 'start'>;
+  indexingPipeline: Pick<CoreDogecoinIndexerService, 'runOnce' | 'start'>;
   investigationQuery: InvestigationQueryService;
   metadata: RelationalMetadataStore;
   networkCatalog: NetworkCatalogService;
@@ -40,7 +41,18 @@ export async function createRuntime(input?: {
   const rpc = new HttpBlockchainRpcGateway();
   const factWarehouse = await createFactWarehouse(settings.warehouse);
   const stateStore = new MirroredProjectionStateStore(metadata, factWarehouse, factWarehouse);
-  const explorerWarehouse = new CompositeWarehouseAdapter(stateStore, factWarehouse);
+  const explorerStateStore =
+    settings.warehouse.driver === 'clickhouse' ? factWarehouse : stateStore;
+  const explorerWarehouse = new CompositeWarehouseAdapter(explorerStateStore, factWarehouse);
+  const coreStateStore = (() => {
+    if (settings.warehouse.driver !== 'clickhouse') {
+      return metadata;
+    }
+    if (!isClickHouseCoreDogecoinStore(factWarehouse)) {
+      throw new Error('ClickHouse warehouse does not support Dogecoin core state operations');
+    }
+    return new ClickHouseCoreDogecoinStateStore(metadata, factWarehouse);
+  })();
 
   const accessControl = new AccessControlService(metadata);
   const entityLabeling = new EntityLabelingService(
@@ -69,7 +81,7 @@ export async function createRuntime(input?: {
     metadata,
     rawBlockStorage,
     rpc,
-    metadata,
+    coreStateStore,
     settings.indexer,
   );
 

@@ -26,6 +26,7 @@ import {
   type CoreIndexerStage,
   type CoreIndexerState,
   collectProjectionDirectLinkSnapshotKeys,
+  configKeyDogecoinHistoryReady,
   configKeyNewlyAddedAddress,
   configKeyProjectionBootstrapTail,
   type DirectLinkDelta,
@@ -1627,6 +1628,10 @@ export class RelationalMetadataStore
     return row ? this.mapCoreIndexerState(row) : null;
   }
 
+  public async canReadDogecoinHistory(networkId: PrimaryId): Promise<boolean> {
+    return (await this.getJsonValue<boolean>(configKeyDogecoinHistoryReady(networkId))) !== false;
+  }
+
   public async upsertCoreIndexerState(input: {
     lastError?: string | null;
     networkId: PrimaryId;
@@ -1780,6 +1785,32 @@ export class RelationalMetadataStore
     );
   }
 
+  public async listCoreBackfillBenchmarkRanges(
+    networkId: PrimaryId,
+    input: { blocks: number; ranges: number },
+  ): Promise<Array<{ end: number; start: number; txCount: number }>> {
+    const rows = await this.query<DatabaseRow>(
+      `
+        SELECT block_height, tx_count
+        FROM core_blocks
+        WHERE network_id = ?
+        ORDER BY tx_count DESC, block_height ASC
+        LIMIT ?
+      `,
+      [networkId, input.ranges],
+    );
+    const halfWindow = Math.floor(input.blocks / 2);
+    return rows.map((row) => {
+      const center = Number(row.block_height);
+      const start = Math.max(0, center - halfWindow);
+      return {
+        start,
+        end: start + input.blocks - 1,
+        txCount: Number(row.tx_count),
+      };
+    });
+  }
+
   public async getCoreUtxoOutputs(
     networkId: PrimaryId,
     outputKeys: string[],
@@ -1877,6 +1908,28 @@ export class RelationalMetadataStore
       context?.statementTimeoutMs ? { statementTimeoutMs: context.statementTimeoutMs } : {},
     );
   }
+
+  public async applyCoreDogecoinWindow(
+    input: CoreDogecoinBlockApplication[],
+    context?: CoreDogecoinApplyContext,
+  ): Promise<CoreDogecoinApplyResult> {
+    let applied = false;
+    let processTail = input.at(-1)?.blockHeight ?? -1;
+
+    for (const application of input) {
+      const result = await this.applyCoreDogecoinBlock(application, context);
+      applied = applied || result.applied;
+      processTail = result.processTail;
+    }
+
+    return { applied, processTail };
+  }
+
+  public async materializeCoreDogecoinCurrentState(
+    _networkId: PrimaryId,
+    _asOfBlockHeight: number,
+    _context?: CoreDogecoinApplyContext,
+  ): Promise<void> {}
 
   private mapProjectionUtxoOutput(row: DatabaseRow): ProjectionUtxoOutput {
     return {

@@ -8,9 +8,13 @@ import {
   applyDirectLinkDeltasToSnapshots,
   type BlockProjectionBatch,
   buildProjectionStateChanges,
+  type CoreDogecoinApplyContext,
+  type CoreDogecoinApplyResult,
+  type CoreDogecoinBlockApplication,
   collectProjectionDirectLinkSnapshotKeys,
   type DirectLinkRecord,
   formatAmountBase,
+  mapWithConcurrency,
   mergeDirectLinkDelta,
   type ProjectionAppliedBlock,
   type ProjectionBalanceCursor,
@@ -36,6 +40,13 @@ import {
 import type { InvestigationWarehousePort } from '@onlydoge/investigation-query';
 import { InfrastructureError, type PrimaryId } from '@onlydoge/shared-kernel';
 
+import {
+  buildCoreCurrentStateOutputKeyRanges,
+  clickHouseCoreDogecoinTables,
+  clickHouseStringRangeClause,
+  clickHouseStringRangeParams,
+} from './clickhouse-core-dogecoin';
+import type { ClickHouseCoreDogecoinStore } from './core-dogecoin-state-store';
 import type { WarehouseSettings } from './settings';
 import {
   chunkQueryValues,
@@ -83,19 +94,60 @@ interface VersionedDirectLinkRow extends DirectLinkRecord {
   version: number;
 }
 
+interface CoreUtxoCreateRow {
+  blockHash: string;
+  blockHeight: number;
+  blockTime: number;
+  outputKey: string;
+  txIndex: number;
+  txid: string;
+  vout: number;
+}
+
+interface CoreUtxoSpendRow {
+  outputKey: string;
+  spentByTxid: string;
+  spentInBlock: number;
+  spentInputIndex: number;
+}
+
+interface CoreProcessedBlockRow {
+  blockHash: string;
+  blockHeight: number;
+}
+
 const maxClickHouseHotOutputKeyValuesPerChunk = 128;
 const maxClickHouseHotOutputKeyBytesPerChunk = 6_000;
+const maxClickHouseCoreOutputKeyValuesPerChunk = 512;
+const maxClickHouseCoreOutputKeyBytesPerChunk = 48_000;
+const maxClickHouseCoreOutputKeyQueryConcurrency = 4;
 const addressMovementsByAddressTable = 'address_movements_by_address_v2';
-const utxoCurrentStateTable = 'utxo_outputs_current_v2';
-const utxoCurrentStateByAddressTable = 'utxo_outputs_current_by_address_v2';
+const appliedBlocksTable = clickHouseCoreDogecoinTables.appliedBlocks;
+const balancesTable = clickHouseCoreDogecoinTables.balances;
+const coreProcessedBlocksTable = clickHouseCoreDogecoinTables.coreProcessedBlocks;
+const coreUtxoCreatesTable = clickHouseCoreDogecoinTables.coreUtxoCreates;
+const coreUtxoSpendsTable = clickHouseCoreDogecoinTables.coreUtxoSpends;
+const utxoCurrentStateTable = clickHouseCoreDogecoinTables.currentUtxos;
+const utxoCurrentStateByAddressTable = clickHouseCoreDogecoinTables.currentUtxosByAddress;
+const coreCurrentStateOutputKeyRanges = buildCoreCurrentStateOutputKeyRanges();
 type ClickHouseClient = ReturnType<typeof createClient>;
 type ClickHouseCommandParameters = Parameters<ClickHouseClient['command']>[0];
+type ClickHouseCommandSettings = NonNullable<ClickHouseCommandParameters['clickhouse_settings']>;
 type ClickHouseInsertParameters = Parameters<ClickHouseClient['insert']>[0];
 type ClickHouseJsonQueryParameters = Parameters<ClickHouseClient['query']>[0];
+type ClickHouseRequestContext = ReturnType<typeof createAbortableRequestContext>;
 type AddressMovementSummaryRow = {
   receivedBase: string;
   sentBase: string;
   txCount: number;
+};
+type CoreBenchmarkTables = {
+  appliedBlocks: string;
+  balances: string;
+  creates: string;
+  currentUtxos: string;
+  processedBlocks: string;
+  spends: string;
 };
 export class InMemoryWarehouseAdapter
   implements
@@ -821,7 +873,8 @@ export class ClickHouseWarehouseAdapter
     InvestigationWarehousePort,
     ProjectionWarehousePort,
     ProjectionFactWarehousePort,
-    ExplorerWarehousePort
+    ExplorerWarehousePort,
+    ClickHouseCoreDogecoinStore
 {
   private readonly client: ReturnType<typeof createClient>;
   private readonly requestTimeoutMs: number;
@@ -833,6 +886,446 @@ export class ClickHouseWarehouseAdapter
 
   public async boot(): Promise<void> {
     await this.migrate();
+  }
+
+  public async applyCoreDogecoinWindow(
+    input: CoreDogecoinBlockApplication[],
+    context?: CoreDogecoinApplyContext,
+  ): Promise<CoreDogecoinApplyResult> {
+    if (input.length === 0) {
+      return { applied: false, processTail: -1 };
+    }
+
+    const timeoutMs = context?.statementTimeoutMs ?? this.requestTimeoutMs;
+    const requestContext = createAbortableRequestContext(context?.abortSignal, timeoutMs);
+    try {
+      return await this.applyCoreDogecoinWindowWithRequestContext(input, requestContext, context);
+    } catch (error) {
+      if (requestContext.didTimeout()) {
+        throw this.toDeadlineInfrastructureError(error, requestContext, timeoutMs);
+      }
+      throw error;
+    } finally {
+      requestContext.cleanup();
+    }
+  }
+
+  private async applyCoreDogecoinWindowWithRequestContext(
+    input: CoreDogecoinBlockApplication[],
+    requestContext: ClickHouseRequestContext,
+    context?: CoreDogecoinApplyContext,
+  ): Promise<CoreDogecoinApplyResult> {
+    if (input.length === 0) {
+      return { applied: false, processTail: -1 };
+    }
+
+    const networkId = input[0]?.networkId ?? 0;
+    const processedBlocks = await this.getCoreProcessedBlocks(
+      networkId,
+      input.map((application) => application.blockHeight),
+      requestContext,
+    );
+    const pending = input.filter((application) => {
+      const existing = processedBlocks.get(application.blockHeight);
+      if (!existing) {
+        return true;
+      }
+      if (existing.blockHash !== application.blockHash) {
+        throw new Error(
+          `core block hash mismatch network=${networkId} height=${application.blockHeight} existing=${existing.blockHash} next=${application.blockHash}`,
+        );
+      }
+      return false;
+    });
+
+    if (pending.length === 0) {
+      return {
+        applied: false,
+        processTail: input.at(-1)?.blockHeight ?? -1,
+      };
+    }
+
+    this.assertCoreWindowShape(networkId, pending);
+    if (context?.validatePrevouts !== false) {
+      await this.assertCoreWindowPrevouts(networkId, pending, requestContext);
+    }
+
+    const createRows = pending.flatMap((application) => application.utxoCreates);
+    const spendRows = pending.flatMap((application) => application.utxoSpends);
+    await this.insertRows(
+      coreUtxoCreatesTable,
+      createRows.map(toCoreUtxoCreateInsertRow),
+      requestContext,
+    );
+    await this.insertRows(
+      coreUtxoSpendsTable,
+      spendRows.map((spend) => toCoreUtxoSpendInsertRow(networkId, spend)),
+      requestContext,
+    );
+    if (context?.updateCurrentState === true) {
+      await this.applyCoreCurrentStateWindow(networkId, pending, requestContext);
+    }
+    await this.insertRows(
+      coreProcessedBlocksTable,
+      pending.map(toCoreProcessedBlockInsertRow),
+      requestContext,
+    );
+
+    return {
+      applied: true,
+      processTail: pending.at(-1)?.blockHeight ?? input.at(-1)?.blockHeight ?? -1,
+    };
+  }
+
+  private async applyCoreCurrentStateWindow(
+    networkId: PrimaryId,
+    pending: CoreDogecoinBlockApplication[],
+    requestContext: ClickHouseRequestContext,
+  ): Promise<void> {
+    const windowEnd = pending.at(-1)?.blockHeight ?? -1;
+    if (windowEnd < 0) {
+      return;
+    }
+
+    const currentOutputs = await this.getCurrentUtxoOutputMap(
+      networkId,
+      [
+        ...new Set(
+          pending.flatMap((application) => application.utxoSpends.map((spend) => spend.outputKey)),
+        ),
+      ],
+      requestContext,
+    );
+    const nextOutputs = new Map<string, ProjectionUtxoOutput>();
+    const balanceDeltas = new Map<
+      string,
+      {
+        address: string;
+        amount: bigint;
+        assetAddress: string;
+      }
+    >();
+
+    for (const application of pending) {
+      for (const output of application.utxoCreates) {
+        nextOutputs.set(output.outputKey, { ...output });
+        addCoreBalanceDelta(balanceDeltas, output, BigInt(output.valueBase));
+      }
+
+      for (const spend of application.utxoSpends) {
+        const current = nextOutputs.get(spend.outputKey) ?? currentOutputs.get(spend.outputKey);
+        if (!current) {
+          throw new Error(`missing current dogecoin prevout: ${spend.outputKey}`);
+        }
+        nextOutputs.set(spend.outputKey, {
+          ...current,
+          spentByTxid: spend.spentByTxid,
+          spentInBlock: spend.spentInBlock,
+          spentInputIndex: spend.spentInputIndex,
+        });
+        addCoreBalanceDelta(balanceDeltas, current, -BigInt(current.valueBase));
+      }
+    }
+
+    const balanceKeys = [...balanceDeltas.keys()];
+    const currentBalances = await this.getBalanceRowsByKeys(networkId, balanceKeys, requestContext);
+    const nextBalances: VersionedBalanceRow[] = [];
+    for (const [key, delta] of balanceDeltas) {
+      const currentBalance = BigInt(currentBalances.get(key)?.balance ?? '0');
+      const nextBalance = currentBalance + delta.amount;
+      if (nextBalance < 0n) {
+        throw new Error(`negative balance for ${networkId}:${delta.address}:${delta.assetAddress}`);
+      }
+      nextBalances.push({
+        networkId,
+        address: delta.address,
+        assetAddress: delta.assetAddress,
+        balance: formatAmountBase(nextBalance),
+        asOfBlockHeight: windowEnd,
+        version: coreCurrentBalanceVersion(windowEnd),
+      });
+    }
+
+    await this.insertRows(
+      utxoCurrentStateTable,
+      [...nextOutputs.values()].map((row) => toUtxoInsertRow(row, coreCurrentUtxoVersion(row))),
+      requestContext,
+    );
+    await this.insertRows(
+      balancesTable,
+      nextBalances.map((row) => toBalanceInsertRow(row, row.version)),
+      requestContext,
+    );
+    await this.insertRows(
+      appliedBlocksTable,
+      toProjectionAppliedBlocks(pending).map(toAppliedBlockInsertRow),
+      requestContext,
+    );
+  }
+
+  public async materializeCoreDogecoinCurrentState(
+    networkId: PrimaryId,
+    asOfBlockHeight: number,
+    context?: CoreDogecoinApplyContext,
+  ): Promise<void> {
+    await this.clearCoreDogecoinCurrentStateForNetwork({
+      networkId,
+      currentUtxosTable: utxoCurrentStateTable,
+      currentUtxosByAddressTable: utxoCurrentStateByAddressTable,
+      balancesTable,
+      appliedBlocksTable,
+      ...(context ? { context } : {}),
+    });
+    await this.insertCoreCurrentStateMaterialization({
+      networkId,
+      asOfBlockHeight,
+      createsTable: coreUtxoCreatesTable,
+      spendsTable: coreUtxoSpendsTable,
+      currentUtxosTable: utxoCurrentStateTable,
+      currentUtxosByAddressTable: utxoCurrentStateByAddressTable,
+      balancesTable,
+      appliedBlocksTable,
+      processedBlocksTable: coreProcessedBlocksTable,
+      ...(context ? { context } : {}),
+    });
+  }
+
+  private async clearCoreDogecoinCurrentStateForNetwork(input: {
+    appliedBlocksTable: string;
+    balancesTable: string;
+    context?: CoreDogecoinApplyContext;
+    currentUtxosByAddressTable: string;
+    currentUtxosTable: string;
+    networkId: PrimaryId;
+  }): Promise<void> {
+    const materializationSettings = clickHouseCoreMaterializationSettings(input.context);
+    const mutationSettings = {
+      ...materializationSettings,
+      mutations_sync: '2',
+    };
+    for (const table of [
+      input.currentUtxosTable,
+      input.currentUtxosByAddressTable,
+      input.balancesTable,
+      input.appliedBlocksTable,
+    ]) {
+      await this.executeCommand({
+        query: `ALTER TABLE ${table} DELETE WHERE network_id = {networkId:UInt64}`,
+        query_params: { networkId: input.networkId },
+        clickhouse_settings: mutationSettings,
+      });
+    }
+  }
+
+  public async resetCoreDogecoinStorage(): Promise<void> {
+    for (const table of clickHouseDestructiveResetTables) {
+      await this.executeCommand({ query: `DROP TABLE IF EXISTS ${table} SYNC` });
+    }
+    await this.migrate();
+  }
+
+  public async resetCoreDogecoinBenchmarkStorage(
+    prefix = 'core_backfill_benchmark',
+  ): Promise<void> {
+    await this.dropCoreDogecoinBenchmarkTables(prefix);
+    await this.createCoreDogecoinBenchmarkStorage(prefix);
+  }
+
+  public async dropCoreDogecoinBenchmarkStorage(prefix = 'core_backfill_benchmark'): Promise<void> {
+    await this.dropCoreDogecoinBenchmarkTables(prefix);
+  }
+
+  private async dropCoreDogecoinBenchmarkTables(prefix: string): Promise<void> {
+    const tables = coreBenchmarkTableNames(prefix);
+    for (const table of Object.values(tables).reverse()) {
+      await this.executeCommand({ query: `DROP TABLE IF EXISTS ${table} SYNC` });
+    }
+  }
+
+  public async insertCoreDogecoinBenchmarkWindow(
+    input: CoreDogecoinBlockApplication[],
+    prefix = 'core_backfill_benchmark',
+  ): Promise<{ rowsInserted: number }> {
+    if (input.length === 0) {
+      return { rowsInserted: 0 };
+    }
+
+    const networkId = input[0]?.networkId ?? 0;
+    this.assertCoreWindowShape(networkId, input);
+    const tables = coreBenchmarkTableNames(prefix);
+    const createRows = input.flatMap((application) => application.utxoCreates);
+    const spendRows = input.flatMap((application) => application.utxoSpends);
+    await this.insertRows(tables.creates, createRows.map(toCoreUtxoCreateInsertRow));
+    await this.insertRows(
+      tables.spends,
+      spendRows.map((spend) => toCoreUtxoSpendInsertRow(networkId, spend)),
+    );
+    await this.insertRows(tables.processedBlocks, input.map(toCoreProcessedBlockInsertRow));
+
+    return {
+      rowsInserted: createRows.length + spendRows.length + input.length,
+    };
+  }
+
+  public async materializeCoreDogecoinBenchmarkCurrentState(
+    prefix: string,
+    networkId: PrimaryId,
+    asOfBlockHeight: number,
+  ): Promise<void> {
+    const tables = coreBenchmarkTableNames(prefix);
+    await this.executeCommand({ query: `TRUNCATE TABLE ${tables.currentUtxos}` });
+    await this.executeCommand({ query: `TRUNCATE TABLE ${tables.balances}` });
+    await this.executeCommand({ query: `TRUNCATE TABLE ${tables.appliedBlocks}` });
+    await this.insertCoreCurrentStateMaterialization({
+      networkId,
+      asOfBlockHeight,
+      createsTable: tables.creates,
+      spendsTable: tables.spends,
+      currentUtxosTable: tables.currentUtxos,
+      currentUtxosByAddressTable: tables.currentUtxos,
+      balancesTable: tables.balances,
+      appliedBlocksTable: tables.appliedBlocks,
+      processedBlocksTable: tables.processedBlocks,
+    });
+  }
+
+  private async createCoreDogecoinBenchmarkStorage(prefix: string): Promise<void> {
+    for (const statement of coreBenchmarkBootstrapStatements(coreBenchmarkTableNames(prefix))) {
+      await this.executeCommand({ query: statement });
+    }
+  }
+
+  private async insertCoreCurrentStateMaterialization(input: {
+    appliedBlocksTable: string;
+    asOfBlockHeight: number;
+    balancesTable: string;
+    createsTable: string;
+    currentUtxosByAddressTable: string;
+    currentUtxosTable: string;
+    context?: CoreDogecoinApplyContext;
+    networkId: PrimaryId;
+    processedBlocksTable: string;
+    spendsTable: string;
+  }): Promise<void> {
+    const materializationSettings = clickHouseCoreMaterializationSettings(input.context);
+    for (const range of coreCurrentStateOutputKeyRanges) {
+      await this.executeCommand({
+        query: `
+          INSERT INTO ${input.currentUtxosTable} (
+            network_id,
+            block_height,
+            block_hash,
+            block_time,
+            txid,
+            tx_index,
+            vout,
+            output_key,
+            address,
+            script_type,
+            value_base,
+            is_coinbase,
+            is_spendable,
+            spent_by_txid,
+            spent_in_block,
+            spent_input_index,
+            version
+          )
+          SELECT
+            c.network_id,
+            c.block_height,
+            c.block_hash,
+            c.block_time,
+            c.txid,
+            c.tx_index,
+            c.vout,
+            c.output_key,
+            c.address,
+            c.script_type,
+            c.value_base,
+            c.is_coinbase,
+            c.is_spendable,
+            NULL,
+            NULL,
+            NULL,
+            {asOfBlockHeight:UInt64}
+          FROM (
+            SELECT *
+            FROM ${input.createsTable}
+            WHERE
+              network_id = {networkId:UInt64}
+              AND version <= {asOfBlockHeight:UInt64}
+              ${clickHouseStringRangeClause('output_key', range)}
+            ORDER BY output_key ASC, version DESC
+            LIMIT 1 BY output_key
+          ) AS c
+          LEFT ANTI JOIN (
+            SELECT network_id, spent_output_key
+            FROM ${input.spendsTable}
+            WHERE
+              network_id = {networkId:UInt64}
+              AND version <= {asOfBlockHeight:UInt64}
+              ${clickHouseStringRangeClause('spent_output_key', range)}
+            ORDER BY spent_output_key ASC, version DESC
+            LIMIT 1 BY spent_output_key
+          ) AS s
+          ON c.network_id = s.network_id AND c.output_key = s.spent_output_key
+        `,
+        query_params: {
+          ...clickHouseStringRangeParams(range),
+          networkId: input.networkId,
+          asOfBlockHeight: input.asOfBlockHeight,
+        },
+        clickhouse_settings: materializationSettings,
+      });
+    }
+    await this.executeCommand({
+      query: `
+        INSERT INTO ${input.balancesTable} (
+          network_id,
+          address,
+          asset_address,
+          balance,
+          as_of_block_height,
+          version
+        )
+        SELECT
+          network_id,
+          address,
+          '',
+          toString(sum(toInt256(value_base))),
+          {asOfBlockHeight:UInt64},
+          {asOfBlockHeight:UInt64}
+        FROM ${input.currentUtxosByAddressTable}
+        WHERE
+          network_id = {networkId:UInt64}
+          AND is_spendable = 1
+          AND address != ''
+          AND spent_by_txid IS NULL
+        GROUP BY network_id, address
+      `,
+      query_params: { networkId: input.networkId, asOfBlockHeight: input.asOfBlockHeight },
+      clickhouse_settings: {
+        ...materializationSettings,
+        optimize_aggregation_in_order: 1,
+      },
+    });
+    await this.executeCommand({
+      query: `
+        INSERT INTO ${input.appliedBlocksTable} (network_id, block_height, block_hash)
+        SELECT network_id, block_height, block_hash
+        FROM (
+          SELECT network_id, block_height, block_hash, version
+          FROM ${input.processedBlocksTable}
+          WHERE
+            network_id = {networkId:UInt64}
+            AND block_height <= {asOfBlockHeight:UInt64}
+          ORDER BY block_height ASC, version DESC
+          LIMIT 1 BY block_height
+        )
+      `,
+      query_params: { networkId: input.networkId, asOfBlockHeight: input.asOfBlockHeight },
+      clickhouse_settings: materializationSettings,
+    });
   }
 
   public async getCurrentAddressSummary(networkId: PrimaryId, address: string) {
@@ -970,15 +1463,52 @@ export class ClickHouseWarehouseAdapter
       format: 'JSONEachRow',
     });
 
+    return rows[0] ?? (await this.getCoreTransactionRef(networkId, txid));
+  }
+
+  private async getCoreTransactionRef(networkId: PrimaryId, txid: string) {
+    const prefix = `${txid}:`;
+    const rows = await this.queryRows<{
+      blockHash: string;
+      blockHeight: number;
+      blockTime: number;
+      txIndex: number;
+    }>({
+      query: `
+          SELECT
+            block_height AS "blockHeight",
+            block_hash AS "blockHash",
+            block_time AS "blockTime",
+            tx_index AS "txIndex"
+          FROM ${coreUtxoCreatesTable}
+          WHERE
+            network_id = {networkId:UInt64}
+            AND output_key >= {prefix:String}
+            AND output_key < {prefixEnd:String}
+          ORDER BY output_key ASC, version DESC
+          LIMIT 1 BY output_key
+          LIMIT 1
+        `,
+      query_params: {
+        networkId,
+        prefix,
+        prefixEnd: `${txid};`,
+      },
+      format: 'JSONEachRow',
+    });
+
     return rows[0] ?? null;
   }
 
   public async getAddressSummary(networkId: PrimaryId, address: string) {
-    const [movement, balance, utxoCount] = await Promise.all([
+    const [movementFromTable, balance, utxoCount] = await Promise.all([
       this.queryAddressMovementSummary(networkId, address),
       this.queryNativeBalance(networkId, address),
       this.querySpendableUtxoCount(networkId, address),
     ]);
+    const movement = hasAddressMovementSummary(movementFromTable)
+      ? movementFromTable
+      : await this.queryCoreAddressMovementSummary(networkId, address);
 
     return buildClickHouseAddressSummary(movement, balance, utxoCount);
   }
@@ -995,6 +1525,62 @@ export class ClickHouseWarehouseAdapter
             uniqExact(txid) AS "txCount"
           FROM ${addressMovementsByAddressTable}
           WHERE network_id = {networkId:UInt64} AND address = {address:String} AND asset_address = ''
+        `,
+      query_params: { networkId, address },
+      format: 'JSONEachRow',
+    });
+
+    return rows[0];
+  }
+
+  private async queryCoreAddressMovementSummary(
+    networkId: PrimaryId,
+    address: string,
+  ): Promise<AddressMovementSummaryRow | undefined> {
+    const rows = await this.queryRows<AddressMovementSummaryRow>({
+      query: `
+          WITH address_outputs AS (
+            SELECT
+              output_key,
+              txid,
+              value_base
+            FROM ${coreUtxoCreatesTable}
+            WHERE
+              network_id = {networkId:UInt64}
+              AND address = {address:String}
+              AND is_spendable = 1
+            ORDER BY output_key ASC, version DESC
+            LIMIT 1 BY output_key
+          )
+          SELECT
+            CAST(sumIf(amount_base_i256, direction = 'credit') AS String) AS "receivedBase",
+            CAST(sumIf(amount_base_i256, direction = 'debit') AS String) AS "sentBase",
+            uniqExact(txid) AS "txCount"
+          FROM (
+            SELECT
+              txid,
+              toInt256(value_base) AS amount_base_i256,
+              'credit' AS direction
+            FROM address_outputs
+            UNION ALL
+            SELECT
+              s.spent_by_txid AS txid,
+              toInt256(c.value_base) AS amount_base_i256,
+              'debit' AS direction
+            FROM address_outputs AS c
+            INNER JOIN (
+              SELECT
+                spent_output_key,
+                spent_by_txid
+              FROM ${coreUtxoSpendsTable}
+              WHERE
+                network_id = {networkId:UInt64}
+                AND spent_output_key IN (SELECT output_key FROM address_outputs)
+              ORDER BY spent_output_key ASC, version DESC
+              LIMIT 1 BY spent_output_key
+            ) AS s
+            ON c.output_key = s.spent_output_key
+          )
         `,
       query_params: { networkId, address },
       format: 'JSONEachRow',
@@ -1084,7 +1670,110 @@ export class ClickHouseWarehouseAdapter
       format: 'JSONEachRow',
     });
 
-    return rows;
+    return rows.length > 0
+      ? rows
+      : await this.listCoreAddressTransactions(networkId, address, offset, limit);
+  }
+
+  private async listCoreAddressTransactions(
+    networkId: PrimaryId,
+    address: string,
+    offset = 0,
+    limit?: number,
+  ) {
+    const pagination = clickHousePagination(offset, limit);
+    return await this.queryRows<{
+      blockHash: string;
+      blockHeight: number;
+      blockTime: number;
+      receivedBase: string;
+      sentBase: string;
+      txIndex: number;
+      txid: string;
+    }>({
+      query: `
+          WITH address_outputs AS (
+            SELECT
+              block_height,
+              block_hash,
+              block_time,
+              txid,
+              tx_index,
+              output_key,
+              value_base
+            FROM ${coreUtxoCreatesTable}
+            WHERE
+              network_id = {networkId:UInt64}
+              AND address = {address:String}
+              AND is_spendable = 1
+            ORDER BY output_key ASC, version DESC
+            LIMIT 1 BY output_key
+          )
+          SELECT
+            block_height AS "blockHeight",
+            any(block_hash) AS "blockHash",
+            any(block_time) AS "blockTime",
+            txid,
+            max(tx_index) AS "txIndex",
+            CAST(sumIf(amount_base_i256, direction = 'credit') AS String) AS "receivedBase",
+            CAST(sumIf(amount_base_i256, direction = 'debit') AS String) AS "sentBase"
+          FROM (
+            SELECT
+              block_height,
+              block_hash,
+              block_time,
+              txid,
+              tx_index,
+              toInt256(value_base) AS amount_base_i256,
+              'credit' AS direction
+            FROM address_outputs
+            UNION ALL
+            SELECT
+              s.spent_in_block AS block_height,
+              b.block_hash AS block_hash,
+              b.block_time AS block_time,
+              s.spent_by_txid AS txid,
+              0 AS tx_index,
+              toInt256(c.value_base) AS amount_base_i256,
+              'debit' AS direction
+            FROM address_outputs AS c
+            INNER JOIN (
+              SELECT
+                spent_output_key,
+                spent_by_txid,
+                spent_in_block
+              FROM ${coreUtxoSpendsTable}
+              WHERE
+                network_id = {networkId:UInt64}
+                AND spent_output_key IN (SELECT output_key FROM address_outputs)
+              ORDER BY spent_output_key ASC, version DESC
+              LIMIT 1 BY spent_output_key
+            ) AS s
+            ON c.output_key = s.spent_output_key
+            INNER JOIN (
+              SELECT
+                block_height,
+                block_hash,
+                block_time
+              FROM ${coreProcessedBlocksTable}
+              WHERE network_id = {networkId:UInt64}
+              ORDER BY block_height ASC, version DESC
+              LIMIT 1 BY block_height
+            ) AS b
+            ON b.block_height = s.spent_in_block
+          )
+          GROUP BY block_height, txid
+          ORDER BY block_height DESC, max(tx_index) DESC, txid DESC
+          ${pagination.limitClause}
+          ${pagination.offsetClause}
+        `,
+      query_params: {
+        networkId,
+        address,
+        ...pagination.queryParams,
+      },
+      format: 'JSONEachRow',
+    });
   }
 
   public async listAddressUtxos(networkId: PrimaryId, address: string, offset = 0, limit?: number) {
@@ -1170,17 +1859,23 @@ export class ClickHouseWarehouseAdapter
     }
 
     await this.addFallbackUtxoOutputs(networkId, missingOutputKeys, currentOutputs);
+    const stillMissingOutputKeys = outputKeys.filter((outputKey) => !currentOutputs.has(outputKey));
+    if (stillMissingOutputKeys.length > 0) {
+      await this.addCoreHistoricalUtxoOutputs(networkId, stillMissingOutputKeys, currentOutputs);
+    }
     return currentOutputs;
   }
 
   private async getCurrentUtxoOutputMap(
     networkId: PrimaryId,
     outputKeys: string[],
+    requestContext?: ClickHouseRequestContext,
   ): Promise<Map<string, ProjectionUtxoOutput>> {
     const currentRows = await this.queryUtxoOutputsFromTable(
       utxoCurrentStateTable,
       networkId,
       outputKeys,
+      requestContext,
     );
     return new Map(currentRows.map((row) => [row.outputKey, row]));
   }
@@ -1203,6 +1898,84 @@ export class ClickHouseWarehouseAdapter
       for (const row of fallbackRows) {
         currentOutputs.set(row.outputKey, row);
       }
+    }
+  }
+
+  private async addCoreHistoricalUtxoOutputs(
+    networkId: PrimaryId,
+    missingOutputKeys: string[],
+    currentOutputs: Map<string, ProjectionUtxoOutput>,
+  ): Promise<void> {
+    const rowChunks = await mapWithConcurrency(
+      chunkQueryValues([...new Set(missingOutputKeys)], {
+        maxBytes: maxClickHouseCoreOutputKeyBytesPerChunk,
+        maxValues: maxClickHouseCoreOutputKeyValuesPerChunk,
+      }),
+      maxClickHouseCoreOutputKeyQueryConcurrency,
+      (chunk) =>
+        this.queryRows<ProjectionUtxoOutput>({
+          query: `
+              SELECT
+                c.network_id AS "networkId",
+                c.block_height AS "blockHeight",
+                c.block_hash AS "blockHash",
+                c.block_time AS "blockTime",
+                c.txid,
+                c.tx_index AS "txIndex",
+                c.vout,
+                c.output_key AS "outputKey",
+                c.address,
+                c.script_type AS "scriptType",
+                c.value_base AS "valueBase",
+                c.is_coinbase = 1 AS "isCoinbase",
+                c.is_spendable = 1 AS "isSpendable",
+                s.spent_by_txid AS "spentByTxid",
+                s.spent_in_block AS "spentInBlock",
+                s.spent_input_index AS "spentInputIndex"
+              FROM (
+                SELECT
+                  network_id,
+                  block_height,
+                  block_hash,
+                  block_time,
+                  txid,
+                  tx_index,
+                  vout,
+                  output_key,
+                  address,
+                  script_type,
+                  value_base,
+                  is_coinbase,
+                  is_spendable
+                FROM ${coreUtxoCreatesTable}
+                WHERE
+                  network_id = {networkId:UInt64}
+                  AND output_key IN ({outputKeys:Array(String)})
+                ORDER BY output_key ASC, version DESC
+                LIMIT 1 BY output_key
+              ) AS c
+              LEFT JOIN (
+                SELECT
+                  spent_output_key,
+                  spent_by_txid,
+                  spent_in_block,
+                  spent_input_index
+                FROM ${coreUtxoSpendsTable}
+                WHERE
+                  network_id = {networkId:UInt64}
+                  AND spent_output_key IN ({outputKeys:Array(String)})
+                ORDER BY spent_output_key ASC, version DESC
+                LIMIT 1 BY spent_output_key
+              ) AS s
+              ON c.output_key = s.spent_output_key
+            `,
+          query_params: { networkId, outputKeys: chunk },
+          format: 'JSONEachRow',
+        }),
+    );
+
+    for (const row of rowChunks.flat()) {
+      currentOutputs.set(row.outputKey, row);
     }
   }
 
@@ -1405,7 +2178,7 @@ export class ClickHouseWarehouseAdapter
       [...nextOutputs.values()].map((row) => toUtxoInsertRow(row, windowEnd)),
     );
     await this.insertRows(
-      'balances_v2',
+      balancesTable,
       [...nextBalances.values()].map((row) => toBalanceInsertRow(row, row.version)),
     );
     await this.insertRows(
@@ -1413,7 +2186,7 @@ export class ClickHouseWarehouseAdapter
       [...nextDirectLinks.values()].map((row) => toDirectLinkInsertRow(row, row.version)),
     );
     await this.insertRows(
-      'applied_blocks_v2',
+      appliedBlocksTable,
       toProjectionAppliedBlocks(window.pendingBatches).map(toAppliedBlockInsertRow),
     );
   }
@@ -1433,14 +2206,14 @@ export class ClickHouseWarehouseAdapter
       window.utxoOutputs.map((row) => toUtxoInsertRow(row, row.spentInBlock ?? row.blockHeight)),
     );
     await this.insertRows(
-      'balances_v2',
+      balancesTable,
       window.balances.map((row) => toBalanceInsertRow(row, row.asOfBlockHeight)),
     );
     await this.insertRows(
       'direct_links_v2',
       window.directLinks.map((row) => toDirectLinkInsertRow(row, row.lastSeenBlockHeight)),
     );
-    await this.insertRows('applied_blocks_v2', window.appliedBlocks.map(toAppliedBlockInsertRow));
+    await this.insertRows(appliedBlocksTable, window.appliedBlocks.map(toAppliedBlockInsertRow));
   }
 
   public async applyBlockProjection(batch: BlockProjectionBatch): Promise<void> {
@@ -1702,6 +2475,7 @@ export class ClickHouseWarehouseAdapter
   private async getBalanceRowsByKeys(
     networkId: PrimaryId,
     keys: string[],
+    requestContext?: ClickHouseRequestContext,
   ): Promise<Map<string, VersionedBalanceRow>> {
     if (keys.length === 0) {
       return new Map();
@@ -1719,8 +2493,9 @@ export class ClickHouseWarehouseAdapter
           BalanceRow & {
             version: number;
           }
-        >({
-          query: `
+        >(
+          {
+            query: `
               SELECT
                 network_id AS "networkId",
                 address,
@@ -1733,10 +2508,12 @@ export class ClickHouseWarehouseAdapter
                 AND (address, asset_address) IN ${formatBalanceTupleList(chunk)}
               ORDER BY address ASC, asset_address ASC, version DESC
               LIMIT 1 BY network_id, address, asset_address
-            `,
-          query_params: { networkId },
-          format: 'JSONEachRow',
-        }),
+          `,
+            query_params: { networkId },
+            format: 'JSONEachRow',
+          },
+          requestContext,
+        ),
       ),
     );
     const rows = rowChunks.flat();
@@ -1819,30 +2596,238 @@ export class ClickHouseWarehouseAdapter
     );
   }
 
-  private async insertRows(table: string, values: Record<string, unknown>[]): Promise<void> {
+  private assertCoreWindowShape(
+    networkId: PrimaryId,
+    applications: CoreDogecoinBlockApplication[],
+  ): void {
+    const created = new Set<string>();
+    const spent = new Set<string>();
+    let previousHeight: number | null = null;
+
+    for (const application of applications) {
+      if (application.networkId !== networkId) {
+        throw new Error(
+          `mixed core dogecoin networks in window expected=${networkId} actual=${application.networkId}`,
+        );
+      }
+      if (previousHeight !== null && application.blockHeight !== previousHeight + 1) {
+        throw new Error(
+          `non-contiguous core dogecoin window previous=${previousHeight} next=${application.blockHeight}`,
+        );
+      }
+      previousHeight = application.blockHeight;
+
+      for (const output of application.utxoCreates) {
+        if (created.has(output.outputKey)) {
+          throw new Error(`duplicate dogecoin output in core window: ${output.outputKey}`);
+        }
+        created.add(output.outputKey);
+      }
+      for (const spend of application.utxoSpends) {
+        if (spent.has(spend.outputKey)) {
+          throw new Error(`duplicate dogecoin spend in core window: ${spend.outputKey}`);
+        }
+        spent.add(spend.outputKey);
+      }
+    }
+  }
+
+  private async assertCoreWindowPrevouts(
+    networkId: PrimaryId,
+    applications: CoreDogecoinBlockApplication[],
+    requestContext?: ClickHouseRequestContext,
+  ): Promise<void> {
+    const createdInWindow = new Set(
+      applications.flatMap((application) =>
+        application.utxoCreates.map((output) => output.outputKey),
+      ),
+    );
+    const externalSpendKeys = [
+      ...new Set(
+        applications
+          .flatMap((application) => application.utxoSpends.map((spend) => spend.outputKey))
+          .filter((outputKey) => !createdInWindow.has(outputKey)),
+      ),
+    ];
+    if (externalSpendKeys.length === 0) {
+      return;
+    }
+
+    const [created, spent] = await Promise.all([
+      this.getCoreUtxoCreateRows(networkId, externalSpendKeys, requestContext),
+      this.getCoreUtxoSpendRows(networkId, externalSpendKeys, requestContext),
+    ]);
+    const missing = externalSpendKeys.find((outputKey) => !created.has(outputKey));
+    if (missing) {
+      throw new Error(`missing core dogecoin prevout: ${missing}`);
+    }
+
+    const spendsInWindow = new Map(
+      applications
+        .flatMap((application) => application.utxoSpends)
+        .map((spend) => [spend.outputKey, spend]),
+    );
+    const alreadySpent = externalSpendKeys.find((outputKey) => {
+      const row = spent.get(outputKey);
+      if (!row) {
+        return false;
+      }
+
+      const retrySpend = spendsInWindow.get(outputKey);
+      return (
+        !retrySpend ||
+        row.spentByTxid !== retrySpend.spentByTxid ||
+        row.spentInBlock !== retrySpend.spentInBlock ||
+        row.spentInputIndex !== retrySpend.spentInputIndex
+      );
+    });
+    if (alreadySpent) {
+      throw new Error(`core dogecoin prevout already spent: ${alreadySpent}`);
+    }
+  }
+
+  private async getCoreProcessedBlocks(
+    networkId: PrimaryId,
+    blockHeights: number[],
+    requestContext?: ClickHouseRequestContext,
+  ): Promise<Map<number, CoreProcessedBlockRow>> {
+    if (blockHeights.length === 0) {
+      return new Map();
+    }
+
+    const rowChunks = await Promise.all(
+      chunkQueryValues([...new Set(blockHeights)]).map((chunk) =>
+        this.queryRows<CoreProcessedBlockRow>(
+          {
+            query: `
+            SELECT
+              block_height AS "blockHeight",
+              block_hash AS "blockHash"
+            FROM ${coreProcessedBlocksTable}
+            WHERE network_id = {networkId:UInt64} AND block_height IN ({blockHeights:Array(UInt64)})
+            ORDER BY block_height ASC, version DESC
+            LIMIT 1 BY block_height
+          `,
+            query_params: { networkId, blockHeights: chunk },
+            format: 'JSONEachRow',
+          },
+          requestContext,
+        ),
+      ),
+    );
+
+    return new Map(rowChunks.flat().map((row) => [row.blockHeight, row]));
+  }
+
+  private async getCoreUtxoCreateRows(
+    networkId: PrimaryId,
+    outputKeys: string[],
+    requestContext?: ClickHouseRequestContext,
+  ): Promise<Map<string, CoreUtxoCreateRow>> {
+    return this.queryCoreOutputKeyRows(
+      outputKeys,
+      (chunk) => ({
+        query: `
+            SELECT
+              block_height AS "blockHeight",
+              block_hash AS "blockHash",
+              block_time AS "blockTime",
+              txid,
+              tx_index AS "txIndex",
+              vout,
+              output_key AS "outputKey"
+            FROM ${coreUtxoCreatesTable}
+            WHERE network_id = {networkId:UInt64} AND output_key IN ({outputKeys:Array(String)})
+            ORDER BY output_key ASC, version DESC
+            LIMIT 1 BY output_key
+          `,
+        query_params: { networkId, outputKeys: chunk },
+        format: 'JSONEachRow',
+      }),
+      requestContext,
+    );
+  }
+
+  private async getCoreUtxoSpendRows(
+    networkId: PrimaryId,
+    outputKeys: string[],
+    requestContext?: ClickHouseRequestContext,
+  ): Promise<Map<string, CoreUtxoSpendRow>> {
+    return this.queryCoreOutputKeyRows(
+      outputKeys,
+      (chunk) => ({
+        query: `
+            SELECT
+              spent_output_key AS "outputKey",
+              spent_by_txid AS "spentByTxid",
+              spent_in_block AS "spentInBlock",
+              spent_input_index AS "spentInputIndex"
+            FROM ${coreUtxoSpendsTable}
+            WHERE network_id = {networkId:UInt64} AND spent_output_key IN ({outputKeys:Array(String)})
+            ORDER BY spent_output_key ASC, version DESC
+            LIMIT 1 BY spent_output_key
+          `,
+        query_params: { networkId, outputKeys: chunk },
+        format: 'JSONEachRow',
+      }),
+      requestContext,
+    );
+  }
+
+  private async queryCoreOutputKeyRows<T extends { outputKey: string }>(
+    outputKeys: string[],
+    queryForChunk: (chunk: string[]) => ClickHouseJsonQueryParameters,
+    requestContext?: ClickHouseRequestContext,
+  ): Promise<Map<string, T>> {
+    if (outputKeys.length === 0) {
+      return new Map();
+    }
+
+    const rowChunks = await mapWithConcurrency(
+      chunkQueryValues([...new Set(outputKeys)], {
+        maxBytes: maxClickHouseCoreOutputKeyBytesPerChunk,
+        maxValues: maxClickHouseCoreOutputKeyValuesPerChunk,
+      }),
+      maxClickHouseCoreOutputKeyQueryConcurrency,
+      (chunk) => this.queryRows<T>(queryForChunk(chunk), requestContext),
+    );
+
+    return new Map(rowChunks.flat().map((row) => [row.outputKey, row]));
+  }
+
+  private async insertRows(
+    table: string,
+    values: Record<string, unknown>[],
+    requestContext?: ClickHouseRequestContext,
+  ): Promise<void> {
     if (values.length === 0) {
       return;
     }
 
-    await this.executeInsert({
-      table,
-      values,
-      format: 'JSONEachRow',
-    });
+    await this.executeInsert(
+      {
+        table,
+        values,
+        format: 'JSONEachRow',
+      },
+      requestContext,
+    );
   }
 
   private async queryUtxoOutputsFromTable(
     table: string,
     networkId: PrimaryId,
     outputKeys: string[],
+    requestContext?: ClickHouseRequestContext,
   ): Promise<ProjectionUtxoOutput[]> {
     const rowChunks: ProjectionUtxoOutput[][] = await Promise.all(
       chunkQueryValues(outputKeys, {
         maxBytes: maxClickHouseHotOutputKeyBytesPerChunk,
         maxValues: maxClickHouseHotOutputKeyValuesPerChunk,
       }).map((chunk) =>
-        this.queryRows<ProjectionUtxoOutput>({
-          query: `
+        this.queryRows<ProjectionUtxoOutput>(
+          {
+            query: `
               SELECT
                 {networkId:UInt64} AS "networkId",
                 block_height AS "blockHeight",
@@ -1864,10 +2849,12 @@ export class ClickHouseWarehouseAdapter
               WHERE network_id = {networkId:UInt64} AND output_key IN ({outputKeys:Array(String)})
               ORDER BY output_key ASC, version DESC
               LIMIT 1 BY output_key
-            `,
-          query_params: { networkId, outputKeys: chunk },
-          format: 'JSONEachRow',
-        }),
+          `,
+            query_params: { networkId, outputKeys: chunk },
+            format: 'JSONEachRow',
+          },
+          requestContext,
+        ),
       ),
     );
 
@@ -1982,8 +2969,14 @@ export class ClickHouseWarehouseAdapter
     return rows.length > 0;
   }
 
-  private async queryRows<T>(parameters: ClickHouseJsonQueryParameters): Promise<T[]> {
+  private async queryRows<T>(
+    parameters: ClickHouseJsonQueryParameters,
+    requestContext?: ClickHouseRequestContext,
+  ): Promise<T[]> {
     try {
+      if (requestContext) {
+        return await this.queryRowsWithRequestContext<T>(parameters, requestContext);
+      }
       const result = await this.client.query(parameters);
       return (await result.json<T>()) as T[];
     } catch (error) {
@@ -2011,11 +3004,13 @@ export class ClickHouseWarehouseAdapter
     parameters: ClickHouseJsonQueryParameters,
     requestContext: ReturnType<typeof createAbortableRequestContext>,
   ): Promise<T[]> {
-    const result = await this.client.query({
-      ...parameters,
-      abort_signal: requestContext.signal,
-    });
-    return (await result.json<T>()) as T[];
+    const result = await this.runWithRequestContext(requestContext, () =>
+      this.client.query({
+        ...parameters,
+        abort_signal: requestContext.signal,
+      }),
+    );
+    return (await this.runWithRequestContext(requestContext, () => result.json<T>())) as T[];
   }
 
   private toDeadlineInfrastructureError(
@@ -2040,11 +3035,45 @@ export class ClickHouseWarehouseAdapter
     }
   }
 
-  private async executeInsert(parameters: ClickHouseInsertParameters): Promise<void> {
+  private async executeInsert(
+    parameters: ClickHouseInsertParameters,
+    requestContext?: ClickHouseRequestContext,
+  ): Promise<void> {
     try {
+      if (requestContext) {
+        await this.runWithRequestContext(requestContext, () =>
+          this.client.insert({ ...parameters, abort_signal: requestContext.signal }),
+        );
+        return;
+      }
+
       await this.client.insert(parameters);
     } catch (error) {
       throw this.toInfrastructureError(error);
+    }
+  }
+
+  private async runWithRequestContext<T>(
+    requestContext: ClickHouseRequestContext,
+    work: () => Promise<T>,
+  ): Promise<T> {
+    if (requestContext.signal.aborted) {
+      throw abortReason(requestContext.signal);
+    }
+
+    let listener: (() => void) | null = null;
+    try {
+      return await Promise.race([
+        work(),
+        new Promise<never>((_resolve, reject) => {
+          listener = () => reject(abortReason(requestContext.signal));
+          requestContext.signal.addEventListener('abort', listener, { once: true });
+        }),
+      ]);
+    } finally {
+      if (listener) {
+        requestContext.signal.removeEventListener('abort', listener);
+      }
     }
   }
 
@@ -2247,6 +3276,15 @@ function buildClickHouseAddressSummary(
     txCount: 0,
     utxoCount,
   };
+}
+
+function hasAddressMovementSummary(
+  movement: AddressMovementSummaryRow | undefined,
+): movement is AddressMovementSummaryRow {
+  return (
+    movement !== undefined &&
+    (Number(movement.txCount) > 0 || movement.receivedBase !== '0' || movement.sentBase !== '0')
+  );
 }
 
 export class MirroredProjectionStateStore implements ProjectionStateStorePort {
@@ -2501,7 +3539,295 @@ function dedupeRecords<T>(rows: T[], keyFor: (row: T) => string): T[] {
   return [...deduped.values()];
 }
 
+function abortReason(signal: AbortSignal): Error {
+  if (signal.reason instanceof Error) {
+    return signal.reason;
+  }
+
+  return new Error('warehouse request aborted');
+}
+
+function toCoreUtxoCreateInsertRow(output: ProjectionUtxoOutput): Record<string, unknown> {
+  return {
+    network_id: output.networkId,
+    block_height: output.blockHeight,
+    block_hash: output.blockHash,
+    block_time: output.blockTime,
+    txid: output.txid,
+    tx_index: output.txIndex,
+    vout: output.vout,
+    output_key: output.outputKey,
+    address: output.address,
+    script_type: output.scriptType,
+    value_base: output.valueBase,
+    is_coinbase: output.isCoinbase ? 1 : 0,
+    is_spendable: output.isSpendable ? 1 : 0,
+    version: output.blockHeight,
+  };
+}
+
+function toCoreUtxoSpendInsertRow(
+  networkId: PrimaryId,
+  spend: CoreDogecoinBlockApplication['utxoSpends'][number],
+): Record<string, unknown> {
+  return {
+    network_id: networkId,
+    spent_output_key: spend.outputKey,
+    spent_by_txid: spend.spentByTxid,
+    spent_in_block: spend.spentInBlock,
+    spent_input_index: spend.spentInputIndex,
+    version: spend.spentInBlock,
+  };
+}
+
+function toCoreProcessedBlockInsertRow(
+  input: CoreDogecoinBlockApplication,
+): Record<string, unknown> {
+  return {
+    network_id: input.networkId,
+    block_height: input.blockHeight,
+    block_hash: input.blockHash,
+    block_time: input.blockTime,
+    tx_count: input.txCount,
+    version: input.blockHeight,
+  };
+}
+
+function clickHouseCoreMaterializationSettings(
+  context: CoreDogecoinApplyContext | undefined,
+): ClickHouseCommandSettings {
+  const timeoutMs = context?.statementTimeoutMs ?? 300_000;
+  return {
+    max_execution_time: toClickHouseMaxExecutionTimeSeconds(timeoutMs),
+    max_block_size: '65536',
+    max_bytes_before_external_group_by: '1073741824',
+    max_bytes_before_external_sort: '1073741824',
+    max_insert_block_size: '65536',
+    min_insert_block_size_bytes: '0',
+    min_insert_block_size_rows: '0',
+  };
+}
+
+function addCoreBalanceDelta(
+  deltas: Map<string, { address: string; amount: bigint; assetAddress: string }>,
+  output: ProjectionUtxoOutput,
+  amount: bigint,
+): void {
+  if (!output.isSpendable || output.address === '') {
+    return;
+  }
+
+  const assetAddress = '';
+  const key = balanceKey(output.networkId, output.address, assetAddress);
+  const current = deltas.get(key);
+  if (current) {
+    current.amount += amount;
+    return;
+  }
+
+  deltas.set(key, {
+    address: output.address,
+    amount,
+    assetAddress,
+  });
+}
+
+function coreCurrentUtxoVersion(row: ProjectionUtxoOutput): number {
+  return row.spentInBlock === null
+    ? coreCurrentCreateVersion(row.blockHeight)
+    : coreCurrentSpendVersion(row.spentInBlock);
+}
+
+function coreCurrentCreateVersion(blockHeight: number): number {
+  return blockHeight * 2;
+}
+
+function coreCurrentSpendVersion(blockHeight: number): number {
+  return blockHeight * 2 + 1;
+}
+
+function coreCurrentBalanceVersion(blockHeight: number): number {
+  return coreCurrentSpendVersion(blockHeight);
+}
+
+function coreBenchmarkTableNames(prefix: string): CoreBenchmarkTables {
+  const safePrefix = assertClickHouseIdentifier(prefix);
+  return {
+    creates: `${safePrefix}_utxo_creates_v1`,
+    spends: `${safePrefix}_utxo_spends_v1`,
+    processedBlocks: `${safePrefix}_processed_blocks_v1`,
+    currentUtxos: `${safePrefix}_utxo_current_v1`,
+    balances: `${safePrefix}_balances_v1`,
+    appliedBlocks: `${safePrefix}_applied_blocks_v1`,
+  };
+}
+
+function assertClickHouseIdentifier(value: string): string {
+  if (!/^[A-Za-z_][A-Za-z0-9_]*$/u.test(value)) {
+    throw new Error(`invalid ClickHouse identifier: ${value}`);
+  }
+  return value;
+}
+
+function coreBenchmarkBootstrapStatements(tables: CoreBenchmarkTables): string[] {
+  return [
+    `
+      CREATE TABLE IF NOT EXISTS ${tables.creates}
+      (
+        network_id UInt64,
+        block_height UInt64,
+        block_hash String,
+        block_time UInt64,
+        txid String,
+        tx_index UInt64,
+        vout UInt64,
+        output_key String,
+        address String,
+        script_type String,
+        value_base String,
+        is_coinbase UInt8,
+        is_spendable UInt8,
+        version UInt64
+      )
+      ENGINE = MergeTree
+      ORDER BY (network_id, output_key)
+    `,
+    `
+      CREATE TABLE IF NOT EXISTS ${tables.spends}
+      (
+        network_id UInt64,
+        spent_output_key String,
+        spent_by_txid String,
+        spent_in_block UInt64,
+        spent_input_index UInt64,
+        version UInt64
+      )
+      ENGINE = MergeTree
+      ORDER BY (network_id, spent_output_key)
+    `,
+    `
+      CREATE TABLE IF NOT EXISTS ${tables.processedBlocks}
+      (
+        network_id UInt64,
+        block_height UInt64,
+        block_hash String,
+        block_time UInt64,
+        tx_count UInt64,
+        version UInt64
+      )
+      ENGINE = MergeTree
+      ORDER BY (network_id, block_height)
+    `,
+    `
+      CREATE TABLE IF NOT EXISTS ${tables.currentUtxos}
+      (
+        network_id UInt64,
+        block_height UInt64,
+        block_hash String,
+        block_time UInt64,
+        txid String,
+        tx_index UInt64,
+        vout UInt64,
+        output_key String,
+        address String,
+        script_type String,
+        value_base String,
+        is_coinbase UInt8,
+        is_spendable UInt8,
+        spent_by_txid Nullable(String),
+        spent_in_block Nullable(UInt64),
+        spent_input_index Nullable(UInt64),
+        version UInt64
+      )
+      ENGINE = MergeTree
+      ORDER BY (network_id, output_key)
+    `,
+    `
+      CREATE TABLE IF NOT EXISTS ${tables.balances}
+      (
+        network_id UInt64,
+        address String,
+        asset_address String,
+        balance String,
+        as_of_block_height UInt64,
+        version UInt64
+      )
+      ENGINE = MergeTree
+      ORDER BY (network_id, address, asset_address)
+    `,
+    `
+      CREATE TABLE IF NOT EXISTS ${tables.appliedBlocks}
+      (
+        network_id UInt64,
+        block_height UInt64,
+        block_hash String
+      )
+      ENGINE = MergeTree
+      ORDER BY (network_id, block_height, block_hash)
+    `,
+  ];
+}
+
 const clickHouseWarehouseBootstrapStatements = [
+  `
+    CREATE TABLE IF NOT EXISTS applied_blocks_v2
+    (
+      network_id UInt64,
+      block_height UInt64,
+      block_hash String
+    )
+    ENGINE = MergeTree
+    ORDER BY (network_id, block_height, block_hash)
+  `,
+  `
+    CREATE TABLE IF NOT EXISTS utxo_outputs_v2
+    (
+      network_id UInt64,
+      block_height UInt64,
+      block_hash String,
+      block_time UInt64,
+      txid String,
+      tx_index UInt64,
+      vout UInt64,
+      output_key String,
+      address String,
+      script_type String,
+      value_base String,
+      is_coinbase UInt8,
+      is_spendable UInt8,
+      spent_by_txid Nullable(String),
+      spent_in_block Nullable(UInt64),
+      spent_input_index Nullable(UInt64),
+      version UInt64
+    )
+    ENGINE = ReplacingMergeTree(version)
+    ORDER BY (network_id, output_key)
+  `,
+  `
+    CREATE TABLE IF NOT EXISTS ${utxoCurrentStateTable}
+    (
+      network_id UInt64,
+      block_height UInt64,
+      block_hash String,
+      block_time UInt64,
+      txid String,
+      tx_index UInt64,
+      vout UInt64,
+      output_key String,
+      address String,
+      script_type String,
+      value_base String,
+      is_coinbase UInt8,
+      is_spendable UInt8,
+      spent_by_txid Nullable(String),
+      spent_in_block Nullable(UInt64),
+      spent_input_index Nullable(UInt64),
+      version UInt64
+    )
+    ENGINE = ReplacingMergeTree(version)
+    ORDER BY (network_id, output_key)
+    SETTINGS old_parts_lifetime = 0
+  `,
   `
     CREATE TABLE IF NOT EXISTS ${utxoCurrentStateByAddressTable}
     (
@@ -2525,6 +3851,7 @@ const clickHouseWarehouseBootstrapStatements = [
     )
     ENGINE = ReplacingMergeTree(version)
     ORDER BY (network_id, address, output_key)
+    SETTINGS old_parts_lifetime = 0
   `,
   `
     CREATE MATERIALIZED VIEW IF NOT EXISTS ${utxoCurrentStateByAddressTable}_mv
@@ -2549,6 +3876,27 @@ const clickHouseWarehouseBootstrapStatements = [
       spent_input_index,
       version
     FROM ${utxoCurrentStateTable}
+  `,
+  `
+    CREATE TABLE IF NOT EXISTS address_movements_v2
+    (
+      movement_id String,
+      network_id UInt64,
+      block_height UInt64,
+      block_hash String,
+      block_time UInt64,
+      txid String,
+      tx_index UInt64,
+      entry_index UInt64,
+      address String,
+      asset_address String,
+      direction String,
+      amount_base String,
+      output_key Nullable(String),
+      derivation_method String
+    )
+    ENGINE = MergeTree
+    ORDER BY (network_id, movement_id)
   `,
   `
     CREATE TABLE IF NOT EXISTS ${addressMovementsByAddressTable}
@@ -2593,4 +3941,148 @@ const clickHouseWarehouseBootstrapStatements = [
       derivation_method
     FROM address_movements_v2
   `,
+  `
+    CREATE TABLE IF NOT EXISTS transfers_v2
+    (
+      transfer_id String,
+      network_id UInt64,
+      block_height UInt64,
+      block_hash String,
+      block_time UInt64,
+      txid String,
+      tx_index UInt64,
+      transfer_index UInt64,
+      asset_address String,
+      from_address String,
+      to_address String,
+      amount_base String,
+      derivation_method String,
+      confidence Float64,
+      is_change UInt8,
+      input_address_count UInt64,
+      output_address_count UInt64
+    )
+    ENGINE = MergeTree
+    ORDER BY (network_id, transfer_id)
+  `,
+  `
+    CREATE TABLE IF NOT EXISTS balances_v2
+    (
+      network_id UInt64,
+      address String,
+      asset_address String,
+      balance String,
+      as_of_block_height UInt64,
+      version UInt64
+    )
+    ENGINE = ReplacingMergeTree(version)
+    ORDER BY (network_id, address, asset_address)
+  `,
+  `
+    CREATE TABLE IF NOT EXISTS direct_links_v2
+    (
+      network_id UInt64,
+      from_address String,
+      to_address String,
+      asset_address String,
+      transfer_count UInt64,
+      total_amount_base String,
+      first_seen_block_height UInt64,
+      last_seen_block_height UInt64,
+      version UInt64
+    )
+    ENGINE = ReplacingMergeTree(version)
+    ORDER BY (network_id, from_address, to_address, asset_address)
+  `,
+  `
+    CREATE TABLE IF NOT EXISTS source_links
+    (
+      network_id UInt64,
+      source_address_id UInt64,
+      source_address String,
+      to_address String,
+      hop_count UInt64,
+      path_transfer_count UInt64,
+      path_addresses Array(String),
+      first_seen_block_height UInt64,
+      last_seen_block_height UInt64
+    )
+    ENGINE = MergeTree
+    ORDER BY (network_id, source_address_id, to_address)
+  `,
+  `
+    CREATE TABLE IF NOT EXISTS ${coreUtxoCreatesTable}
+    (
+      network_id UInt64,
+      block_height UInt64,
+      block_hash String,
+      block_time UInt64,
+      txid String,
+      tx_index UInt64,
+      vout UInt64,
+      output_key String,
+      address String,
+      script_type String,
+      value_base String,
+      is_coinbase UInt8,
+      is_spendable UInt8,
+      version UInt64
+    )
+    ENGINE = ReplacingMergeTree(version)
+    ORDER BY (network_id, output_key)
+  `,
+  `
+    ALTER TABLE ${coreUtxoCreatesTable}
+    ADD INDEX IF NOT EXISTS core_utxo_creates_address_idx address TYPE bloom_filter(0.01) GRANULARITY 4
+  `,
+  `
+    CREATE TABLE IF NOT EXISTS ${coreUtxoSpendsTable}
+    (
+      network_id UInt64,
+      spent_output_key String,
+      spent_by_txid String,
+      spent_in_block UInt64,
+      spent_input_index UInt64,
+      version UInt64
+    )
+    ENGINE = ReplacingMergeTree(version)
+    ORDER BY (network_id, spent_output_key)
+  `,
+  `
+    CREATE TABLE IF NOT EXISTS ${coreProcessedBlocksTable}
+    (
+      network_id UInt64,
+      block_height UInt64,
+      block_hash String,
+      block_time UInt64,
+      tx_count UInt64,
+      version UInt64
+    )
+    ENGINE = ReplacingMergeTree(version)
+    ORDER BY (network_id, block_height)
+  `,
+];
+
+const clickHouseDestructiveResetTables = [
+  `${utxoCurrentStateByAddressTable}_mv`,
+  `${addressMovementsByAddressTable}_mv`,
+  'applied_blocks',
+  'utxo_outputs',
+  'address_movements',
+  'transfers',
+  'balances',
+  'direct_links',
+  appliedBlocksTable,
+  'utxo_outputs_v2',
+  utxoCurrentStateTable,
+  utxoCurrentStateByAddressTable,
+  'address_movements_v2',
+  addressMovementsByAddressTable,
+  'transfers_v2',
+  balancesTable,
+  'direct_links_v2',
+  'source_links',
+  coreUtxoCreatesTable,
+  coreUtxoSpendsTable,
+  coreProcessedBlocksTable,
 ];

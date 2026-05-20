@@ -31,7 +31,7 @@ export interface CoordinatorConfigPort {
 export interface IndexedNetworkPort {
   listActiveNetworks(): Promise<
     Array<{
-      architecture: 'dogecoin' | 'evm';
+      architecture: 'dogecoin';
       blockTime: number;
       id: string;
       networkId: PrimaryId;
@@ -68,11 +68,20 @@ export interface CoreDogecoinStateStorePort {
     input: CoreDogecoinBlockApplication,
     context?: CoreDogecoinApplyContext,
   ): Promise<CoreDogecoinApplyResult>;
+  applyCoreDogecoinWindow(
+    input: CoreDogecoinBlockApplication[],
+    context?: CoreDogecoinApplyContext,
+  ): Promise<CoreDogecoinApplyResult>;
   getCoreIndexerState(networkId: PrimaryId): Promise<CoreIndexerState | null>;
   getCoreUtxoOutputs(
     networkId: PrimaryId,
     outputKeys: string[],
   ): Promise<Map<string, ProjectionUtxoOutput>>;
+  materializeCoreDogecoinCurrentState(
+    networkId: PrimaryId,
+    asOfBlockHeight: number,
+    context?: CoreDogecoinApplyContext,
+  ): Promise<void>;
   setCoreIndexerError(networkId: PrimaryId, error: string | null): Promise<void>;
   setCoreIndexerStage(networkId: PrimaryId, stage: CoreIndexerStage): Promise<void>;
   upsertCoreBlock(record: CoreBlockRecord): Promise<void>;
@@ -87,18 +96,21 @@ export interface CoreDogecoinStateStorePort {
 }
 
 export interface CoreDogecoinApplyContext {
+  abortSignal?: AbortSignal;
   statementTimeoutMs?: number;
+  updateCurrentState?: boolean;
+  validatePrevouts?: boolean;
 }
 
 export interface BlockchainRpcPort {
   getBlockHeight(network: {
-    architecture: 'dogecoin' | 'evm';
+    architecture: 'dogecoin';
     rpcEndpoint: string;
     rps: number;
   }): Promise<number>;
   getBlockSnapshot(
     network: {
-      architecture: 'dogecoin' | 'evm';
+      architecture: 'dogecoin';
       rpcEndpoint: string;
       rps: number;
     },
