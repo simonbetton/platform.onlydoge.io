@@ -8,13 +8,18 @@ import { parse as parseDotenv } from 'dotenv';
 
 const DEFAULT_IMAGE = 'ghcr.io/simonbetton/onlydoge-indexer:latest';
 const DEFAULT_ENV_FILE = '.env.managed';
-const DEFAULT_FALLBACK_ENV_FILE = '.env.once';
 const DEFAULT_HOST = 'api.example.com';
 const DEFAULT_REMOTE_DIR = '/opt/onlydoge';
-const DEFAULT_SSH_JUMP = 'root@203.0.113.10';
-const DEFAULT_SSH_TARGET = 'root@10.0.0.10';
+const DEFAULT_SSH_JUMP = '';
+const DEFAULT_SSH_TARGET = '';
 
 const FORWARDED_ENV_KEYS = new Set(['SECRET_KEY_BASE', 'VAPID_PRIVATE_KEY', 'VAPID_PUBLIC_KEY']);
+const DEPLOY_ONLY_ENV_KEYS = new Set([
+  'ONLYDOGE_PUBLIC_HOST',
+  'ONLYDOGE_REMOTE_DIR',
+  'ONLYDOGE_SSH_JUMP',
+  'ONLYDOGE_SSH_TARGET',
+]);
 
 const REQUIRED_ENV_KEYS = [
   'SECRET_KEY_BASE',
@@ -27,38 +32,6 @@ const REQUIRED_ENV_KEYS = [
   'ONLYDOGE_WAREHOUSE',
   'ONLYDOGE_WAREHOUSE_USER',
   'ONLYDOGE_WAREHOUSE_PASSWORD',
-  'ONLYDOGE_INDEXER_LEASE_HEARTBEAT_INTERVAL_MS',
-  'ONLYDOGE_INDEXER_BOOTSTRAP_TIMEOUT_MS',
-  'ONLYDOGE_INDEXER_NETWORK_CONCURRENCY',
-  'ONLYDOGE_INDEXER_SYNC_BACKLOG_HIGH_WATERMARK',
-  'ONLYDOGE_INDEXER_SYNC_BACKLOG_LOW_WATERMARK',
-  'ONLYDOGE_INDEXER_SYNC_WINDOW',
-  'ONLYDOGE_INDEXER_SYNC_WINDOW_MIN',
-  'ONLYDOGE_INDEXER_SYNC_WINDOW_MAX',
-  'ONLYDOGE_INDEXER_SYNC_CONCURRENCY',
-  'ONLYDOGE_INDEXER_SYNC_TARGET_MS',
-  'ONLYDOGE_INDEXER_SYNC_TIMEOUT_MS',
-  'ONLYDOGE_INDEXER_FACT_WINDOW',
-  'ONLYDOGE_INDEXER_FACT_TIMEOUT_MS',
-  'ONLYDOGE_CORE_BLOCK_TIMEOUT_MS',
-  'ONLYDOGE_CORE_DB_STATEMENT_TIMEOUT_MS',
-  'ONLYDOGE_CORE_SYNC_COMPLETE_DISTANCE',
-  'ONLYDOGE_CORE_PROCESS_LOAD_CONCURRENCY',
-  'ONLYDOGE_CORE_PROCESS_WINDOW',
-  'ONLYDOGE_CORE_PROGRESS_WATCHDOG_MS',
-  'ONLYDOGE_CORE_RAW_STORAGE_TIMEOUT_MS',
-  'ONLYDOGE_CORE_ONLINE_TIP_DISTANCE',
-  'ONLYDOGE_INDEXER_PROJECT_WINDOW',
-  'ONLYDOGE_INDEXER_PROJECT_WINDOW_MIN',
-  'ONLYDOGE_INDEXER_PROJECT_WINDOW_MAX',
-  'ONLYDOGE_INDEXER_PROJECT_TARGET_MS',
-  'ONLYDOGE_INDEXER_PROJECT_TIMEOUT_MS',
-  'ONLYDOGE_INDEXER_RELINK_BACKLOG_THRESHOLD',
-  'ONLYDOGE_INDEXER_RELINK_TIP_DISTANCE',
-  'ONLYDOGE_INDEXER_RELINK_BATCH_SIZE',
-  'ONLYDOGE_INDEXER_RELINK_CONCURRENCY',
-  'ONLYDOGE_INDEXER_RELINK_FRONTIER_BATCH',
-  'ONLYDOGE_INDEXER_RELINK_TIMEOUT_MS',
 ] as const;
 
 interface DeployPlan {
@@ -69,7 +42,6 @@ interface DeployPlan {
   resolvedImage: string;
   sshJump: string;
   sshTarget: string;
-  stopOnce: boolean;
 }
 
 const { values } = parseArgs({
@@ -98,10 +70,6 @@ const { values } = parseArgs({
     sshTarget: {
       type: 'string',
     },
-    stopOnce: {
-      type: 'boolean',
-      default: true,
-    },
     importRunningEnv: {
       type: 'boolean',
       default: true,
@@ -122,15 +90,17 @@ async function main() {
 }
 
 async function createDeployPlan(): Promise<DeployPlan> {
-  const envFile =
-    values.envFile ??
-    ((await fileExists(DEFAULT_ENV_FILE)) ? DEFAULT_ENV_FILE : DEFAULT_FALLBACK_ENV_FILE);
+  const envFile = values.envFile ?? DEFAULT_ENV_FILE;
   const fileValues = await loadEnvFile(envFile);
   const host = resolveDeployValue(values.host, fileValues.ONLYDOGE_PUBLIC_HOST, DEFAULT_HOST);
-  const sshJump = resolveDeployValue(values.sshJump, fileValues.ONCE_SSH_JUMP, DEFAULT_SSH_JUMP);
+  const sshJump = resolveDeployValue(
+    values.sshJump,
+    fileValues.ONLYDOGE_SSH_JUMP,
+    DEFAULT_SSH_JUMP,
+  );
   const sshTarget = resolveDeployValue(
     values.sshTarget,
-    fileValues.ONCE_SSH_TARGET,
+    fileValues.ONLYDOGE_SSH_TARGET,
     DEFAULT_SSH_TARGET,
   );
   const remoteDir = resolveDeployValue(
@@ -145,6 +115,7 @@ async function createDeployPlan(): Promise<DeployPlan> {
     ...collectForwardedEnv(fileValues),
     ONLYDOGE_IMAGE: resolvedImage,
   };
+  validateDeployTarget(sshTarget);
   validateRequiredEnv(envValues);
 
   return {
@@ -155,7 +126,6 @@ async function createDeployPlan(): Promise<DeployPlan> {
     resolvedImage,
     sshJump,
     sshTarget,
-    stopOnce: values.stopOnce ?? true,
   };
 }
 
@@ -221,19 +191,15 @@ async function readRunningOnlyDogeEnv(plan: DeployPlan): Promise<Record<string, 
 }
 
 function runningIndexerContainerCommand(): string {
-  return "name=$(docker ps --format '{{.Names}}' | grep -E '^(onlydoge-onlydoge-indexer-1|onlydoge-onlydoge-api-1|once-app-onlydoge-indexer|once-app-onlydoge-api)' | head -n1)";
+  return "name=$(docker ps --format '{{.Names}}' | grep -E '^(onlydoge-onlydoge-indexer-1|onlydoge-onlydoge-api-1)' | head -n1)";
 }
 
 function buildRemoteDeployCommand(plan: DeployPlan): string {
   const compose = 'docker compose --env-file .env -f docker-compose.managed.yml';
-  const stopOnce = plan.stopOnce
-    ? "docker ps --format '{{.Names}}' | grep -E '^(once-app-onlydoge-indexer|once-proxy)' | xargs -r docker stop"
-    : 'true';
 
   return [
     'set -eu',
     `cd ${shellEscape(plan.remoteDir)}`,
-    stopOnce,
     `${compose} pull`,
     `${compose} up -d --remove-orphans`,
     `${compose} ps`,
@@ -289,11 +255,20 @@ async function loadEnvFile(path: string): Promise<Record<string, string>> {
 function collectForwardedEnv(values: Record<string, string>): Record<string, string> {
   const forwarded: Record<string, string> = {};
   for (const [key, value] of Object.entries(values)) {
+    if (DEPLOY_ONLY_ENV_KEYS.has(key)) {
+      continue;
+    }
     if (key.startsWith('ONLYDOGE_') || FORWARDED_ENV_KEYS.has(key)) {
       forwarded[key] = value;
     }
   }
   return forwarded;
+}
+
+function validateDeployTarget(sshTarget: string) {
+  if (!sshTarget.trim()) {
+    throw new Error('Missing deploy SSH target: set ONLYDOGE_SSH_TARGET or pass --sshTarget');
+  }
 }
 
 function validateRequiredEnv(env: Record<string, string>) {
@@ -340,21 +315,11 @@ async function resolveImage(reference: string): Promise<string> {
   return `${reference}@${digest}`.replace(/:[^/@]+@/u, '@');
 }
 
-async function fileExists(path: string): Promise<boolean> {
-  try {
-    await readFile(path);
-    return true;
-  } catch {
-    return false;
-  }
-}
-
 async function runSsh(plan: DeployPlan, command: string): Promise<string> {
   return runCommand('ssh', [
     '-o',
     'BatchMode=yes',
-    '-J',
-    plan.sshJump,
+    ...sshJumpArgs(plan.sshJump),
     plan.sshTarget,
     `sh -lc ${shellEscape(command)}`,
   ]);
@@ -366,11 +331,14 @@ async function runScp(plan: DeployPlan, source: string, target: string): Promise
     'BatchMode=yes',
     '-o',
     'StrictHostKeyChecking=accept-new',
-    '-J',
-    plan.sshJump,
+    ...sshJumpArgs(plan.sshJump),
     source,
     `${plan.sshTarget}:${target}`,
   ]);
+}
+
+function sshJumpArgs(sshJump: string): string[] {
+  return sshJump.trim() ? ['-J', sshJump] : [];
 }
 
 async function runCommand(command: string, args: string[]): Promise<string> {
@@ -397,10 +365,9 @@ function printDeployPlan(plan: DeployPlan): void {
   console.log(`env file: ${plan.envFile}`);
   console.log(`host: ${plan.host}`);
   console.log(`remote dir: ${plan.remoteDir}`);
-  console.log(`ssh jump: ${plan.sshJump}`);
+  console.log(`ssh jump: ${plan.sshJump || '(none)'}`);
   console.log(`ssh target: ${plan.sshTarget}`);
   console.log(`image: ${plan.resolvedImage}`);
-  console.log(`stop once: ${plan.stopOnce}`);
   console.log(`env keys: ${Object.keys(plan.envValues).sort().join(', ')}`);
 }
 

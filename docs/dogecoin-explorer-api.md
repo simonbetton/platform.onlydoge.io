@@ -1,145 +1,69 @@
 # Dogecoin Explorer API
 
-## Current Goal
+This document describes the current Dogecoin explorer read surface. It is not a projection roadmap.
 
-Add a Dogecoin block-explorer read surface without breaking the existing authenticated investigation API.
-
-The explorer should:
-
-1. read only from indexed warehouse facts and stored raw block snapshots,
-2. stay inside the modular-monolith boundaries already used by the repo,
-3. expose a `/v1/explorer/*` route group,
-4. preserve entity, tag, and source-path overlays where they add value.
-
-## Explorer Module Shape
-
-Keep explorer reads in a dedicated `explorer-query` module.
-
-- `domain`
-  - explorer response models
-- `application`
-  - block, transaction, address, and search orchestration
-- `contracts`
-  - active-network reader, warehouse reader, raw-block reader, overlay reader
-- `infrastructure`
-  - public Elysia HTTP routes
-
-This keeps the split clear:
-
-- `investigation-query` stays analyst-oriented and authenticated,
-- `explorer-query` stays read-only, API-key protected, and Dogecoin-focused.
-
-## Route Surface
-
-Explorer routes:
+## Routes
 
 - `GET /v1/explorer/networks`
-  - active Dogecoin networks plus indexing status
 - `GET /v1/explorer/search?q=...&network=...`
-  - numeric query => block height
-  - otherwise try txid, then block hash, then address
 - `GET /v1/explorer/blocks`
-  - recent indexed blocks
 - `GET /v1/explorer/blocks/:ref`
-  - block by height or block hash
 - `GET /v1/explorer/transactions/:txid`
-  - transaction summary, inputs, outputs, transfer projection, label refs
 - `GET /v1/explorer/addresses/:address`
-  - balance summary plus the full investigation overlay
 - `GET /v1/explorer/addresses/:address/transactions`
-  - reverse-chronological address history
 - `GET /v1/explorer/addresses/:address/utxos`
-  - current spendable outputs
 
-Network selection:
+All explorer routes require `x-api-token`, except the public health and OpenAPI routes outside the explorer group.
 
-- if one active Dogecoin network exists, it becomes the implicit default
-- if more than one exists, explorer reads require `?network=...`
+If one active Dogecoin network exists, it is the default explorer network. If more than one active Dogecoin network exists, callers should pass `?network=<network-id>`.
 
 ## Data Sources
 
-The explorer reads from existing storage instead of live RPC.
+Explorer reads use stored data only. They do not call live Dogecoin RPC.
 
-### Raw block snapshots
+- Raw block snapshots provide block and transaction detail shape.
+- `core_utxo_creates_v1` stores append-only output creates.
+- `core_utxo_spends_v1` stores append-only spend records keyed by spent output.
+- `core_processed_blocks_v1` stores block identity for processed core windows.
+- `utxo_outputs_current_v2` and `utxo_outputs_current_by_address_v2` provide current spendable UTXO reads.
+- `balances_v2` provides current native DOGE balances.
+- `applied_blocks_v2` provides explorer block identity after current-state materialization.
 
-Used for:
+Older projection tables may still exist for compatibility and investigation graph reads, but the current production Dogecoin indexer does not rebuild a full transfer/direct-link graph.
 
-- recent block lists
-- block detail
-- transaction output shapes and ordering
+## Readiness
 
-The raw block storage remains keyed by `networkId + blockHeight + part`.
+Current-state reads become available after core backfill and current-state materialization:
 
-### Warehouse read models
+- `GET /v1/explorer/networks`
+- `GET /v1/explorer/blocks`
+- `GET /v1/explorer/addresses/:address`
+- `GET /v1/explorer/addresses/:address/utxos`
 
-Used for:
+History-dependent reads require `dogecoin_history_ready_n{networkId} = true`:
 
-- block ref lookup via `applied_blocks_v2`
-- tx lookup via `utxo_outputs_v2`
-- address history via `address_movements_by_address_v2`
-- current UTXOs via `utxo_outputs_current_by_address_v2`
-- current balances via `balances_v2`
+- `GET /v1/explorer/search`
+- `GET /v1/explorer/blocks/:ref`
+- `GET /v1/explorer/transactions/:txid`
+- `GET /v1/explorer/addresses/:address/transactions`
 
-The address-facing explorer routes now read from address-ordered ClickHouse tables instead of the write-oriented facts:
+When history is not ready, those routes return a `425` response with a clear `dogecoin history index is not ready` error.
 
-- `address_movements_by_address_v2`
-  - materialized from `address_movements_v2`
-  - ordered by `network_id, address, block_height, tx_index, entry_index, movement_id`
-  - includes a precomputed `amount_base_i256` helper column so address aggregations do not repeatedly cast string amounts
-- `utxo_outputs_current_by_address_v2`
-  - materialized from `utxo_outputs_current_v2`
-  - ordered by `network_id, address, output_key`
-  - keeps the same current-state versioning model while aligning with address detail and UTXO page filters
+## Response Notes
 
-This keeps the immutable facts intact while giving the explorer API a cheaper physical read path.
+Address summaries combine current balances and UTXO counts with investigation metadata overlays. Transaction detail resolves input values and addresses from the core UTXO state where possible.
 
-### Metadata and overlay
+Cache headers are intentionally private because explorer routes are authenticated:
 
-Used for:
-
-- active network catalog
-- labeled address to entity joins
-- tag joins and risk level derivation
-- address detail overlay via the existing investigation read path
-
-## Auth And Cache Policy
-
-Explorer routes require the same `x-api-token` authentication as the rest of `/v1`.
-
-- `/up`, `/v1/heartbeat`, and `/openapi` bypass API token enforcement
-- `POST /v1/keys` stays open only until the first API key exists
-- `/v1/explorer/*` is authenticated like the other protected `/v1` routes
-
-Cache policy:
-
-- `/v1/explorer/search`: `private, max-age=5, stale-while-revalidate=15`
-- `/v1/explorer/addresses*`: `private, max-age=15, stale-while-revalidate=60`
-- `/v1/explorer/blocks*`, `/v1/explorer/transactions*`, `/v1/explorer/networks`: `private, max-age=30, stale-while-revalidate=120`
-- all explorer cacheable responses vary by `x-api-token`
+- search responses are short-lived,
+- address responses may be cached briefly,
+- block, transaction, and network responses may be cached longer.
 
 ## Test Coverage
 
-The explorer work should stay covered by the same layers used elsewhere:
+Coverage is split across:
 
-- API integration tests for authenticated access, block/tx/address reads, and OpenAPI exposure
-- warehouse contract tests for block refs, tx refs, address summaries, history, and UTXOs
-- existing indexer integration tests continue proving the underlying Dogecoin projection data
-
-## ClickHouse Memory Strategy
-
-The explorer and projector now use a lower-memory ClickHouse posture by default.
-
-- current-state UTXO lookups avoid `FINAL`
-- hot output-key fetches are chunked more aggressively than general warehouse reads
-- address summary and history queries read from address-ordered tables instead of grouping over the write-optimized base tables
-- ClickHouse defaults now cap query thread fan-out and spill sort/group intermediates earlier
-- indexer defaults use smaller sync, projection, and relink windows so the background projector does not assume a large warehouse host
-
-## Runtime Migration
-
-ClickHouse read-model changes are applied both ways:
-
-- fresh Docker stacks get the optimized tables and materialized views from `docker/clickhouse/init/001_schema.sql`
-- existing deployments get the same objects from the platform warehouse boot path
-
-The runtime boot path also backfills the new address-oriented tables once when they are empty, so production rollouts do not require a manual warehouse rebuild before the explorer routes benefit from the new layout.
+- API integration tests for auth, OpenAPI exposure, explorer reads, and history-not-ready behavior,
+- warehouse tests for core ClickHouse reads and current-state materialization,
+- indexer integration tests for raw snapshot persistence and core UTXO state,
+- production E2E tests for deployed API behavior and teardown.
