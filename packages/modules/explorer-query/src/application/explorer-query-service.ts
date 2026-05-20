@@ -35,6 +35,7 @@ import type {
   ExplorerAddressTransactionSummary,
   ExplorerAddressUtxo,
   ExplorerBlockSummary,
+  ExplorerHdWalletBalance,
   ExplorerLabelRef,
   ExplorerNetworkSummary,
   ExplorerSearchResult,
@@ -56,10 +57,29 @@ import {
   type WarehouseAddressSummary,
   withTransactionLabels,
 } from './explorer-response-builders';
+import {
+  hdWalletCacheKey,
+  normalizeHdWalletRequest,
+  scanHdWalletBalance,
+} from './hd-wallet-balance';
 
 export type ExplorerWarehouse = ExplorerWarehousePort &
   InvestigationWarehousePort &
   Pick<ProjectionWarehousePort, 'getUtxoOutputs'>;
+
+type HdWalletBalanceInput = {
+  chains?: number[];
+  gapLimit?: number;
+  network?: string;
+  xpub: string;
+};
+
+type HdWalletBalanceCacheEntry = {
+  expiresAtMs: number;
+  result: Omit<ExplorerHdWalletBalance, 'cache'>;
+};
+
+const hdWalletBalanceCacheTtlMs = 60_000;
 
 type ExplorerNetworkRef = {
   id: string;
@@ -75,6 +95,8 @@ export class ExplorerQueryService {
     private readonly rawBlocks: ExplorerRawBlockPort,
     private readonly configs: ExplorerConfigPort,
   ) {}
+
+  private readonly hdWalletBalanceCache = new Map<string, HdWalletBalanceCacheEntry>();
 
   public async listNetworks(): Promise<{
     networks: ExplorerNetworkSummary[];
@@ -499,6 +521,46 @@ export class ExplorerQueryService {
     };
   }
 
+  public async getHdWalletBalance(input: HdWalletBalanceInput): Promise<ExplorerHdWalletBalance> {
+    const network = await this.resolveNetwork(input.network);
+    await this.assertHistoryReady(network.networkId);
+    const normalized = normalizeHdWalletRequest(input);
+    const cacheKey = hdWalletCacheKey({
+      chains: normalized.chains,
+      gapLimit: normalized.gapLimit,
+      network: network.id,
+      xpub: normalized.xpub,
+    });
+    const nowMs = Date.now();
+    const cached = this.hdWalletBalanceCache.get(cacheKey);
+
+    if (cached && cached.expiresAtMs > nowMs) {
+      return hdWalletBalanceWithCache(cached, true);
+    }
+
+    this.evictExpiredHdWalletCache(nowMs);
+    const scanned = await scanHdWalletBalance(normalized, (address) =>
+      this.warehouse.getAddressSummary(network.networkId, address),
+    );
+    const entry = {
+      expiresAtMs: Date.now() + hdWalletBalanceCacheTtlMs,
+      result: {
+        network: network.id,
+        ...scanned,
+      },
+    };
+    this.hdWalletBalanceCache.set(cacheKey, entry);
+    return hdWalletBalanceWithCache(entry, false);
+  }
+
+  private evictExpiredHdWalletCache(nowMs: number): void {
+    for (const [key, entry] of this.hdWalletBalanceCache.entries()) {
+      if (entry.expiresAtMs <= nowMs) {
+        this.hdWalletBalanceCache.delete(key);
+      }
+    }
+  }
+
   private async resolveNetwork(networkId?: string): Promise<ExplorerNetworkRef> {
     const activeNetworks = (await this.networks.listActiveNetworks()).filter(
       (network) => network.architecture === 'dogecoin',
@@ -852,6 +914,20 @@ function normalizeRequiredQuery(query: string | undefined): string {
   }
 
   return q;
+}
+
+function hdWalletBalanceWithCache(
+  entry: HdWalletBalanceCacheEntry,
+  hit: boolean,
+): ExplorerHdWalletBalance {
+  return {
+    ...entry.result,
+    cache: {
+      expiresAt: new Date(entry.expiresAtMs).toISOString(),
+      hit,
+      ttlSeconds: Math.max(0, Math.ceil((entry.expiresAtMs - Date.now()) / 1000)),
+    },
+  };
 }
 
 function blockSearchResult(block: ExplorerBlockSummary): ExplorerSearchResult {

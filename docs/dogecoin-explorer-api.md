@@ -12,6 +12,7 @@ This document describes the current Dogecoin explorer read surface. It is not a 
 - `GET /v1/explorer/addresses/:address`
 - `GET /v1/explorer/addresses/:address/transactions`
 - `GET /v1/explorer/addresses/:address/utxos`
+- `POST /v1/explorer/hd-wallet/balance`
 
 All explorer routes require `x-api-token`, except the public health and OpenAPI routes outside the explorer group.
 
@@ -46,6 +47,7 @@ History-dependent reads require `dogecoin_history_ready_n{networkId} = true`:
 - `GET /v1/explorer/blocks/:ref`
 - `GET /v1/explorer/transactions/:txid`
 - `GET /v1/explorer/addresses/:address/transactions`
+- `POST /v1/explorer/hd-wallet/balance`
 
 When history is not ready, those routes return a `425` response with a clear `dogecoin history index is not ready` error.
 
@@ -53,11 +55,24 @@ When history is not ready, those routes return a `425` response with a clear `do
 
 Address summaries combine current balances and UTXO counts with investigation metadata overlays. Transaction detail resolves input values and addresses from the core UTXO state where possible.
 
+`POST /v1/explorer/hd-wallet/balance` accepts an account-level public extended key, not a seed phrase or private extended key. It derives standard Dogecoin P2PKH addresses from the account xpub at `m/0/index` for receive addresses and `m/1/index` for change addresses. It scans each chain until the unused-address gap is reached; `gapLimit` is bounded to 20-200, and there is no product address-count cap for balance discovery. Identical requests are cached in-process for 60 seconds.
+
+Example request:
+
+```json
+{
+  "network": "net_70d4738a0c0e4aa6ae8c3b7d",
+  "xpub": "xpub...",
+  "gapLimit": 20
+}
+```
+
 Cache headers are intentionally private because explorer routes are authenticated:
 
 - search responses are short-lived,
 - address responses may be cached briefly,
 - block, transaction, and network responses may be cached longer.
+- HD wallet balance scan responses use a 60-second private cache header and an in-process scan cache.
 
 ## Test Coverage
 

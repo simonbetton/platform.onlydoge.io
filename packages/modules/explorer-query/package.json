@@ -8,6 +8,8 @@
     "@onlydoge/indexing-pipeline": "workspace:*",
     "@onlydoge/investigation-query": "workspace:*",
     "@onlydoge/shared-kernel": "workspace:*",
+    "@scure/base": "2.2.0",
+    "@scure/bip32": "2.2.0",
     "elysia": "1.4.28"
   }
 }

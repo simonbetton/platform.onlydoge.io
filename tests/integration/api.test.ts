@@ -1,4 +1,5 @@
 import { configKeyDogecoinHistoryReady } from '@onlydoge/indexing-pipeline';
+import { HDKey } from '@scure/bip32';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import { dogecoinFixture } from '../fixtures/dogecoin';
@@ -297,6 +298,15 @@ describe('api integration', () => {
       );
       expect(history.status).toBe(425);
 
+      const hdWalletBalance = await request(scenario.ctx.app, '/v1/explorer/hd-wallet/balance', {
+        method: 'POST',
+        headers: scenario.headers,
+        body: {
+          xpub: testAccountXpub(),
+        },
+      });
+      expect(hdWalletBalance.status).toBe(425);
+
       const utxos = await request(
         scenario.ctx.app,
         `/v1/explorer/addresses/${dogecoinFixture.targetAddress}/utxos`,
@@ -307,6 +317,52 @@ describe('api integration', () => {
       expect(requireStringField(utxo ?? {}, 'outputKey')).toBe('doge-tx-2:0');
     } finally {
       await scenario.ctx.cleanup();
+    }
+  });
+
+  it('serves authenticated HD wallet balance scans with one-minute private cache headers', async () => {
+    const { ctx, headers } = await createAuthenticatedTestApp();
+    const network = await createDogecoinTestNetwork(ctx.runtime);
+    const xpub = testAccountXpub();
+
+    try {
+      const denied = await request(ctx.app, '/v1/explorer/hd-wallet/balance', {
+        method: 'POST',
+        body: {
+          xpub,
+          network: network.id,
+        },
+      });
+      expect(denied.status).toBe(401);
+
+      const first = await request(ctx.app, '/v1/explorer/hd-wallet/balance', {
+        method: 'POST',
+        headers,
+        body: {
+          xpub,
+          network: network.id,
+        },
+      });
+      expect(first.status).toBe(200);
+      expect(first.headers.get('cache-control')).toBe('private, max-age=60');
+      expect(first.headers.get('vary')).toBe('x-api-token');
+      const firstBody = await readJsonObject(first);
+      expect(requireStringField(firstBody, 'balanceBase')).toBe('0');
+      expect(requireNumberField(firstBody, 'scannedAddressCount')).toBe(40);
+      expect(requireObject(firstBody.cache, 'cache').hit).toBe(false);
+
+      const second = await request(ctx.app, '/v1/explorer/hd-wallet/balance', {
+        method: 'POST',
+        headers,
+        body: {
+          xpub,
+          network: network.id,
+        },
+      });
+      const secondBody = await readJsonObject(second);
+      expect(requireObject(secondBody.cache, 'cache').hit).toBe(true);
+    } finally {
+      await ctx.cleanup();
     }
   });
 
@@ -359,6 +415,12 @@ describe('api integration', () => {
 });
 
 type ExplorerScenario = Awaited<ReturnType<typeof createExplorerScenario>>;
+
+function testAccountXpub(): string {
+  return HDKey.fromMasterSeed(Uint8Array.from({ length: 32 }, (_, index) => index + 1)).derive(
+    "m/44'/3'/0'",
+  ).publicExtendedKey;
+}
 
 async function createExplorerScenario() {
   const { ctx, headers } = await createAuthenticatedTestApp();

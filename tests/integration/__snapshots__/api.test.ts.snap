@@ -778,6 +778,97 @@ exports[`api integration > serves heartbeat and openapi 1`] = `
         ],
       },
     },
+    "/v1/explorer/hd-wallet/balance": {
+      "post": {
+        "description": "Scans a Dogecoin account xpub receive/change chains and returns aggregate HD wallet balance.",
+        "operationId": "postV1ExplorerHd-walletBalance",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "properties": {
+                  "chains": {
+                    "items": {
+                      "type": "number",
+                    },
+                    "type": "array",
+                  },
+                  "gapLimit": {
+                    "type": "number",
+                  },
+                  "network": {
+                    "type": "string",
+                  },
+                  "xpub": {
+                    "type": "string",
+                  },
+                },
+                "required": [
+                  "xpub",
+                ],
+                "type": "object",
+              },
+            },
+            "application/x-www-form-urlencoded": {
+              "schema": {
+                "properties": {
+                  "chains": {
+                    "items": {
+                      "type": "number",
+                    },
+                    "type": "array",
+                  },
+                  "gapLimit": {
+                    "type": "number",
+                  },
+                  "network": {
+                    "type": "string",
+                  },
+                  "xpub": {
+                    "type": "string",
+                  },
+                },
+                "required": [
+                  "xpub",
+                ],
+                "type": "object",
+              },
+            },
+            "multipart/form-data": {
+              "schema": {
+                "properties": {
+                  "chains": {
+                    "items": {
+                      "type": "number",
+                    },
+                    "type": "array",
+                  },
+                  "gapLimit": {
+                    "type": "number",
+                  },
+                  "network": {
+                    "type": "string",
+                  },
+                  "xpub": {
+                    "type": "string",
+                  },
+                },
+                "required": [
+                  "xpub",
+                ],
+                "type": "object",
+              },
+            },
+          },
+          "required": true,
+        },
+        "security": [
+          {
+            "ApiTokenAuth": [],
+          },
+        ],
+      },
+    },
     "/v1/explorer/networks": {
       "get": {
         "description": "Lists Dogecoin explorer networks and their indexing status.",

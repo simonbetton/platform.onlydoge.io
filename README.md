@@ -306,10 +306,13 @@ Explorer endpoints:
 - `GET /v1/explorer/addresses/:address`
 - `GET /v1/explorer/addresses/:address/transactions`
 - `GET /v1/explorer/addresses/:address/utxos`
+- `POST /v1/explorer/hd-wallet/balance`
 
 Explorer routes require `x-api-token`, like the rest of `/v1`, except `/up`, `/v1/heartbeat`, and `/openapi`.
 
 History-dependent routes return `425` until Dogecoin history readiness is marked true.
+
+HD wallet balance scans accept an account-level public extended key only. The API rejects private extended keys, derives Dogecoin P2PKH receive/change addresses at `m/0/index` and `m/1/index`, scans until the unused-address gap is reached, bounds `gapLimit` to 20-200, has no product address-count cap, and caches identical scans in-process for 60 seconds.
 
 ## Production E2E
 

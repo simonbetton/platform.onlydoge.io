@@ -111,5 +111,16 @@ export function buildExplorerQueryHttp(service: ExplorerQueryService) {
         params: addressParamsSchema,
         query: paginatedNetworkQuerySchema,
       },
-    );
+    )
+    .post('/hd-wallet/balance', ({ body }) => service.getHdWalletBalance(body), {
+      detail: describeProtected(
+        'Scans a Dogecoin account xpub receive/change chains and returns aggregate HD wallet balance.',
+      ),
+      body: t.Object({
+        xpub: t.String(),
+        network: t.Optional(t.String()),
+        chains: t.Optional(t.Array(t.Number())),
+        gapLimit: t.Optional(t.Number()),
+      }),
+    });
 }

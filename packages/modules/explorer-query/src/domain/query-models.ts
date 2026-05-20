@@ -109,6 +109,52 @@ export interface ExplorerAddressTransactionSummary {
   transaction: ExplorerTransactionSummary;
 }
 
+export interface ExplorerHdWalletBalance {
+  balanceBase: string;
+  cache: {
+    expiresAt: string;
+    hit: boolean;
+    ttlSeconds: number;
+  };
+  chains: ExplorerHdWalletChainBalance[];
+  complete: boolean;
+  gapLimit: number;
+  network: string;
+  scannedAddressCount: number;
+  usedAddressCount: number;
+  utxoCount: number;
+  xpubDepth: number;
+  xpubFingerprint: number;
+}
+
+export interface ExplorerHdWalletChainBalance {
+  balanceBase: string;
+  chain: number;
+  complete: boolean;
+  gapLimit: number;
+  lastScannedIndex: number | null;
+  lastUsedIndex: number | null;
+  nextUnusedIndex: number;
+  role: 'receive' | 'change';
+  scannedAddressCount: number;
+  usedAddressCount: number;
+  usedAddresses: ExplorerHdWalletUsedAddress[];
+  utxoCount: number;
+}
+
+export interface ExplorerHdWalletUsedAddress {
+  address: string;
+  balance: string;
+  chain: number;
+  index: number;
+  path: string;
+  receivedBase: string;
+  role: 'receive' | 'change';
+  sentBase: string;
+  txCount: number;
+  utxoCount: number;
+}
+
 export interface ExplorerAddressUtxo
   extends Pick<
     ProjectionUtxoOutput,

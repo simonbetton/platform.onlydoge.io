@@ -256,6 +256,12 @@ function resolveCachePolicy(
   status: number,
 ): { cacheControl: string; vary?: string } | null {
   if (status >= 400 || !isCacheableMethod(method)) {
+    if (status < 400 && path.startsWith('/v1/explorer/hd-wallet')) {
+      return {
+        cacheControl: 'private, max-age=60',
+        vary: 'x-api-token',
+      };
+    }
     return {
       cacheControl: 'no-store',
     };
@@ -424,6 +430,13 @@ const cachePolicyRules: Array<{
   {
     matches: (path) => path === '/up' || path.startsWith('/v1/heartbeat'),
     policy: noStorePolicy,
+  },
+  {
+    matches: (path) => path.startsWith('/v1/explorer/hd-wallet'),
+    policy: {
+      cacheControl: 'private, max-age=60',
+      vary: 'x-api-token',
+    },
   },
   {
     matches: (path) => path.startsWith('/v1/explorer/search'),
