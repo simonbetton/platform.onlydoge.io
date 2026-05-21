@@ -1,5 +1,7 @@
 #!/usr/bin/env bun
 
+import { randomUUID } from 'node:crypto';
+
 import { createClient } from '@clickhouse/client';
 import {
   configKeyIndexerProcessTail,
@@ -47,6 +49,7 @@ const currentUtxosTable = clickHouseCoreDogecoinTables.currentUtxos;
 const currentUtxosByAddressTable = clickHouseCoreDogecoinTables.currentUtxosByAddress;
 const currentUtxosByAddressView = `${currentUtxosByAddressTable}_mv`;
 const legacyUtxosTable = 'utxo_outputs_v2';
+const scriptPubKeyPatchTable = 'dogecoin_script_pub_key_backfill_patches_v1';
 const replacementWriteTables = [createsTable, currentUtxosTable, legacyUtxosTable];
 const mutationWriteTables = [
   createsTable,
@@ -374,6 +377,16 @@ async function ensureClickHouseScriptPubKeySchema(
       FROM ${currentUtxosTable}
     `,
   });
+  await client.command({
+    query: `
+      CREATE TABLE IF NOT EXISTS ${scriptPubKeyPatchTable}
+      (
+        output_key String,
+        script_pub_key String
+      )
+      ENGINE = Memory
+    `,
+  });
 }
 
 async function loadScriptPubKeyPatches(input: {
@@ -509,44 +522,69 @@ async function insertScriptPubKeyReplacementRows(
   patches: ScriptPubKeyPatch[],
   tables: string[],
 ) {
-  const outputKeys = patches.map((patch) => patch.outputKey);
-  const scriptPubKeys = patches.map((patch) => patch.scriptPubKey);
-  for (const table of tables) {
-    const columns = replacementColumnsForTable(table);
-    const selectExpressions = columns.map((column) => {
-      if (column === 'script_pub_key') {
-        return `arrayElement({scriptPubKeys:Array(String)}, indexOf({outputKeys:Array(String)}, output_key)) AS script_pub_key`;
-      }
-      if (column === 'version') {
-        return `version + ${replacementDefaultVersionIncrement} AS version`;
-      }
-      return column;
-    });
-    await client.command({
-      query: `
-        INSERT INTO ${table} (${columns.join(', ')})
-        SELECT ${selectExpressions.join(', ')}
-        FROM (
-          SELECT ${columns.join(', ')}
-          FROM ${table}
-          WHERE
-            network_id = {networkId:UInt64}
-            AND output_key IN ({outputKeys:Array(String)})
-          ORDER BY output_key ASC, version DESC
-          LIMIT 1 BY output_key
-        )
-        WHERE script_pub_key != arrayElement(
-          {scriptPubKeys:Array(String)},
-          indexOf({outputKeys:Array(String)}, output_key)
-        )
-      `,
-      query_params: {
-        networkId,
-        outputKeys,
-        scriptPubKeys,
-      },
-    });
+  const runId = randomUUID();
+  await clearScriptPubKeyPatchTable(client);
+  await client.insert({
+    table: scriptPubKeyPatchTable,
+    values: patches.map((patch) => ({
+      output_key: `${runId}:${patch.outputKey}`,
+      script_pub_key: patch.scriptPubKey,
+    })),
+    format: 'JSONEachRow',
+  });
+
+  try {
+    for (const table of tables) {
+      const columns = replacementColumnsForTable(table);
+      const selectExpressions = columns.map((column) => {
+        if (column === 'script_pub_key') {
+          return 'patch.script_pub_key AS script_pub_key';
+        }
+        if (column === 'version') {
+          return `source.version + ${replacementDefaultVersionIncrement} AS version`;
+        }
+        return `source.${column}`;
+      });
+      await client.command({
+        query: `
+          INSERT INTO ${table} (${columns.join(', ')})
+          SELECT ${selectExpressions.join(', ')}
+          FROM (
+            SELECT ${columns.join(', ')}
+            FROM ${table}
+            WHERE
+              network_id = {networkId:UInt64}
+              AND output_key IN (
+                SELECT substring(output_key, {keyPrefixLength:UInt64})
+                FROM ${scriptPubKeyPatchTable}
+              )
+            ORDER BY output_key ASC, version DESC
+            LIMIT 1 BY output_key
+          ) AS source
+          INNER JOIN (
+            SELECT
+              substring(output_key, {keyPrefixLength:UInt64}) AS output_key,
+              script_pub_key
+            FROM ${scriptPubKeyPatchTable}
+          ) AS patch
+          ON source.output_key = patch.output_key
+          WHERE source.script_pub_key != patch.script_pub_key
+        `,
+        query_params: {
+          keyPrefixLength: runId.length + 2,
+          networkId,
+        },
+      });
+    }
+  } finally {
+    await clearScriptPubKeyPatchTable(client);
   }
+}
+
+async function clearScriptPubKeyPatchTable(client: ReturnType<typeof createClient>) {
+  await client.command({
+    query: `TRUNCATE TABLE IF EXISTS ${scriptPubKeyPatchTable}`,
+  });
 }
 
 function replacementColumnsForTable(table: string): string[] {
