@@ -60,6 +60,7 @@ const mutationWriteTables = [
 const replacementDefaultVersionIncrement = 1;
 
 type BackfillWriteMode = 'replacement' | 'mutation';
+type BackfillTarget = 'all' | 'creates' | 'current';
 
 const program = new Command()
   .name('backfill-dogecoin-script-pub-key')
@@ -79,6 +80,11 @@ const program = new Command()
   .option('--rawTimeoutMs <ms>', 'raw block storage request timeout per block', '30000')
   .option('--statementTimeoutMs <ms>', 'ClickHouse statement timeout in milliseconds', '3600000')
   .option('--mutationsSync <0|1|2>', 'ClickHouse mutations_sync setting', '1')
+  .option(
+    '--target <all|creates|current>',
+    'table group to backfill; current is enough for address UTXO API responses',
+    'all',
+  )
   .option(
     '--writeMode <replacement|mutation>',
     'write replacement rows into ReplacingMergeTree tables, or use ALTER UPDATE mutations',
@@ -104,6 +110,7 @@ const options = program.opts<{
   skipLegacy?: boolean;
   skipMissingBlocks?: boolean;
   statementTimeoutMs: string;
+  target: string;
   toHeight?: string;
   withCounts?: boolean;
   writeMode: string;
@@ -147,15 +154,16 @@ async function main() {
   const rawTimeoutMs = parsePositiveInteger(options.rawTimeoutMs, 'rawTimeoutMs');
   const statementTimeoutMs = parsePositiveInteger(options.statementTimeoutMs, 'statementTimeoutMs');
   const mutationsSync = parseMutationsSync(options.mutationsSync);
+  const target = parseBackfillTarget(options.target);
   const writeMode = parseWriteMode(options.writeMode);
   const blockLimit =
     options.blockLimit === undefined
       ? null
       : parsePositiveInteger(options.blockLimit, 'blockLimit');
 
-  const schemaTables = backfillTables(mutationWriteTables, options.skipLegacy === true);
+  const schemaTables = schemaTablesForTarget(target, options.skipLegacy === true);
   const writeTables = backfillTables(
-    writeMode === 'replacement' ? replacementWriteTables : mutationWriteTables,
+    writeTablesForTarget(target, writeMode),
     options.skipLegacy === true,
   );
   const client = createClient({
@@ -166,7 +174,7 @@ async function main() {
     request_timeout: statementTimeoutMs + 60_000,
   });
   const rawBlocks = createRawBlockStorage(settings.storage);
-  const checkpointKey = scriptPubKeyBackfillCheckpointKey(networkId);
+  const checkpointKey = scriptPubKeyBackfillCheckpointKey(networkId, target);
 
   try {
     const existingCheckpoint =
@@ -185,6 +193,7 @@ async function main() {
       rawTimeoutMs,
       statementTimeoutMs,
       mutationsSync,
+      target,
       schemaTables,
       writeMode,
       writeTables,
@@ -688,8 +697,33 @@ function backfillTables(tables: string[], skipLegacy: boolean): string[] {
   return tables.filter((table) => !skipLegacy || table !== legacyUtxosTable);
 }
 
-function scriptPubKeyBackfillCheckpointKey(networkId: number): string {
-  return `dogecoin_script_pub_key_backfill_n${networkId}`;
+function schemaTablesForTarget(target: BackfillTarget, skipLegacy: boolean): string[] {
+  if (target === 'creates') {
+    return [createsTable];
+  }
+  if (target === 'current') {
+    return [currentUtxosTable, currentUtxosByAddressTable];
+  }
+  return backfillTables(mutationWriteTables, skipLegacy);
+}
+
+function writeTablesForTarget(target: BackfillTarget, writeMode: BackfillWriteMode): string[] {
+  if (target === 'creates') {
+    return [createsTable];
+  }
+  if (target === 'current') {
+    return writeMode === 'replacement'
+      ? [currentUtxosTable]
+      : [currentUtxosTable, currentUtxosByAddressTable];
+  }
+  return writeMode === 'replacement' ? replacementWriteTables : mutationWriteTables;
+}
+
+function scriptPubKeyBackfillCheckpointKey(networkId: number, target: BackfillTarget): string {
+  if (target === 'all') {
+    return `dogecoin_script_pub_key_backfill_n${networkId}`;
+  }
+  return `dogecoin_script_pub_key_backfill_${target}_n${networkId}`;
 }
 
 function parseMutationsSync(value: string): 0 | 1 | 2 {
@@ -698,6 +732,13 @@ function parseMutationsSync(value: string): 0 | 1 | 2 {
     throw new Error(`invalid mutationsSync: ${value}`);
   }
   return parsed;
+}
+
+function parseBackfillTarget(value: string): BackfillTarget {
+  if (value === 'all' || value === 'creates' || value === 'current') {
+    return value;
+  }
+  throw new Error(`invalid target: ${value}`);
 }
 
 function parseWriteMode(value: string): BackfillWriteMode {

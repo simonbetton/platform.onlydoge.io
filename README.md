@@ -280,6 +280,7 @@ bun run backfill:dogecoin-script-pub-key -- --networkId 1 --toHeight <height> --
 ```
 
 By default this writes replacement rows into the `ReplacingMergeTree` UTXO tables instead of issuing large ClickHouse mutations.
+Use `--target current --skipLegacy` when the immediate goal is the address UTXO API response.
 
 Prepare core-backed history:
 
