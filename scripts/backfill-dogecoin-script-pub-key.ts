@@ -47,6 +47,16 @@ const currentUtxosTable = clickHouseCoreDogecoinTables.currentUtxos;
 const currentUtxosByAddressTable = clickHouseCoreDogecoinTables.currentUtxosByAddress;
 const currentUtxosByAddressView = `${currentUtxosByAddressTable}_mv`;
 const legacyUtxosTable = 'utxo_outputs_v2';
+const replacementWriteTables = [createsTable, currentUtxosTable, legacyUtxosTable];
+const mutationWriteTables = [
+  createsTable,
+  currentUtxosTable,
+  currentUtxosByAddressTable,
+  legacyUtxosTable,
+];
+const replacementDefaultVersionIncrement = 1;
+
+type BackfillWriteMode = 'replacement' | 'mutation';
 
 const program = new Command()
   .name('backfill-dogecoin-script-pub-key')
@@ -57,15 +67,24 @@ const program = new Command()
   .option('--toHeight <height>', 'last block height to scan; defaults to core process tail')
   .option('--blockBatchSize <count>', 'raw blocks to load per checkpointed batch', '100')
   .option('--blockLimit <count>', 'process at most this many blocks in this run')
-  .option('--mutationBatchSize <count>', 'UTXO outputs to update per ClickHouse mutation', '5000')
+  .option(
+    '--mutationBatchSize <count>',
+    'UTXO outputs to update per ClickHouse write batch',
+    '5000',
+  )
   .option('--loadConcurrency <count>', 'raw block snapshot load concurrency', '8')
   .option('--rawTimeoutMs <ms>', 'raw block storage request timeout per block', '30000')
   .option('--statementTimeoutMs <ms>', 'ClickHouse statement timeout in milliseconds', '3600000')
   .option('--mutationsSync <0|1|2>', 'ClickHouse mutations_sync setting', '1')
+  .option(
+    '--writeMode <replacement|mutation>',
+    'write replacement rows into ReplacingMergeTree tables, or use ALTER UPDATE mutations',
+    'replacement',
+  )
   .option('--resetCheckpoint', 'discard any existing scriptPubKey backfill checkpoint')
   .option('--skipLegacy', 'do not update the legacy utxo_outputs_v2 fallback table')
   .option('--skipMissingBlocks', 'continue when a raw block snapshot is missing')
-  .option('--withCounts', 'include table-wide empty scriptPubKey counts in dry-run/final output')
+  .option('--withCounts', 'include logical empty scriptPubKey counts in dry-run/final output')
   .parse();
 
 const options = program.opts<{
@@ -84,6 +103,7 @@ const options = program.opts<{
   statementTimeoutMs: string;
   toHeight?: string;
   withCounts?: boolean;
+  writeMode: string;
 }>();
 
 async function main() {
@@ -124,12 +144,17 @@ async function main() {
   const rawTimeoutMs = parsePositiveInteger(options.rawTimeoutMs, 'rawTimeoutMs');
   const statementTimeoutMs = parsePositiveInteger(options.statementTimeoutMs, 'statementTimeoutMs');
   const mutationsSync = parseMutationsSync(options.mutationsSync);
+  const writeMode = parseWriteMode(options.writeMode);
   const blockLimit =
     options.blockLimit === undefined
       ? null
       : parsePositiveInteger(options.blockLimit, 'blockLimit');
 
-  const tables = backfillTables(options.skipLegacy === true);
+  const schemaTables = backfillTables(mutationWriteTables, options.skipLegacy === true);
+  const writeTables = backfillTables(
+    writeMode === 'replacement' ? replacementWriteTables : mutationWriteTables,
+    options.skipLegacy === true,
+  );
   const client = createClient({
     url: settings.warehouse.location,
     database: settings.warehouse.database,
@@ -143,7 +168,7 @@ async function main() {
   try {
     const existingCheckpoint =
       await metadata.getJsonValue<ScriptPubKeyBackfillCheckpoint>(checkpointKey);
-    const columnStatus = await listScriptPubKeyColumnStatus(client, tables);
+    const columnStatus = await listScriptPubKeyColumnStatus(client, schemaTables);
     const plan = {
       mode: options.execute ? 'execute' : 'dry-run',
       networkId,
@@ -157,12 +182,14 @@ async function main() {
       rawTimeoutMs,
       statementTimeoutMs,
       mutationsSync,
-      tables,
+      schemaTables,
+      writeMode,
+      writeTables,
       checkpointKey,
       existingCheckpoint,
       columnStatus,
       ...(options.withCounts
-        ? { emptyCounts: await countEmptyScriptPubKeys(client, networkId, tables) }
+        ? { emptyCounts: await countEmptyScriptPubKeys(client, networkId, schemaTables) }
         : {}),
     };
     console.log(JSON.stringify({ plan }, null, 2));
@@ -171,7 +198,7 @@ async function main() {
       return;
     }
 
-    await ensureClickHouseScriptPubKeySchema(client, tables);
+    await ensureClickHouseScriptPubKeySchema(client, schemaTables);
     let checkpoint = await prepareCheckpoint({
       checkpointKey,
       existingCheckpoint,
@@ -204,9 +231,10 @@ async function main() {
       });
 
       for (const chunk of chunkArray(patches, mutationBatchSize)) {
-        await applyScriptPubKeyPatch(client, networkId, chunk, tables, {
+        await applyScriptPubKeyPatch(client, networkId, chunk, writeTables, {
           mutationsSync,
           statementTimeoutMs,
+          writeMode,
         });
       }
 
@@ -259,7 +287,7 @@ async function main() {
           phase: 'complete',
           checkpoint: completeCheckpoint,
           ...(options.withCounts
-            ? { emptyCounts: await countEmptyScriptPubKeys(client, networkId, tables) }
+            ? { emptyCounts: await countEmptyScriptPubKeys(client, networkId, schemaTables) }
             : {}),
         },
         null,
@@ -432,9 +460,15 @@ async function applyScriptPubKeyPatch(
   settings: {
     mutationsSync: 0 | 1 | 2;
     statementTimeoutMs: number;
+    writeMode: BackfillWriteMode;
   },
 ) {
   if (patches.length === 0) {
+    return;
+  }
+
+  if (settings.writeMode === 'replacement') {
+    await insertScriptPubKeyReplacementRows(client, networkId, patches, tables);
     return;
   }
 
@@ -467,6 +501,95 @@ async function applyScriptPubKeyPatch(
       },
     });
   }
+}
+
+async function insertScriptPubKeyReplacementRows(
+  client: ReturnType<typeof createClient>,
+  networkId: number,
+  patches: ScriptPubKeyPatch[],
+  tables: string[],
+) {
+  const outputKeys = patches.map((patch) => patch.outputKey);
+  const scriptPubKeys = patches.map((patch) => patch.scriptPubKey);
+  for (const table of tables) {
+    const columns = replacementColumnsForTable(table);
+    const selectExpressions = columns.map((column) => {
+      if (column === 'script_pub_key') {
+        return `arrayElement({scriptPubKeys:Array(String)}, indexOf({outputKeys:Array(String)}, output_key)) AS script_pub_key`;
+      }
+      if (column === 'version') {
+        return `version + ${replacementDefaultVersionIncrement} AS version`;
+      }
+      return column;
+    });
+    await client.command({
+      query: `
+        INSERT INTO ${table} (${columns.join(', ')})
+        SELECT ${selectExpressions.join(', ')}
+        FROM (
+          SELECT ${columns.join(', ')}
+          FROM ${table}
+          WHERE
+            network_id = {networkId:UInt64}
+            AND output_key IN ({outputKeys:Array(String)})
+          ORDER BY output_key ASC, version DESC
+          LIMIT 1 BY output_key
+        )
+        WHERE script_pub_key != arrayElement(
+          {scriptPubKeys:Array(String)},
+          indexOf({outputKeys:Array(String)}, output_key)
+        )
+      `,
+      query_params: {
+        networkId,
+        outputKeys,
+        scriptPubKeys,
+      },
+    });
+  }
+}
+
+function replacementColumnsForTable(table: string): string[] {
+  if (table === createsTable) {
+    return [
+      'network_id',
+      'block_height',
+      'block_hash',
+      'block_time',
+      'txid',
+      'tx_index',
+      'vout',
+      'output_key',
+      'address',
+      'script_type',
+      'script_pub_key',
+      'value_base',
+      'is_coinbase',
+      'is_spendable',
+      'version',
+    ];
+  }
+
+  return [
+    'network_id',
+    'block_height',
+    'block_hash',
+    'block_time',
+    'txid',
+    'tx_index',
+    'vout',
+    'output_key',
+    'address',
+    'script_type',
+    'script_pub_key',
+    'value_base',
+    'is_coinbase',
+    'is_spendable',
+    'spent_by_txid',
+    'spent_in_block',
+    'spent_input_index',
+    'version',
+  ];
 }
 
 async function listScriptPubKeyColumnStatus(
@@ -505,8 +628,14 @@ async function countEmptyScriptPubKeys(
     const queryResult = await client.query({
       query: `
         SELECT count() AS count
-        FROM ${table}
-        WHERE network_id = {networkId:UInt64} AND script_pub_key = ''
+        FROM (
+          SELECT script_pub_key
+          FROM ${table}
+          WHERE network_id = {networkId:UInt64}
+          ORDER BY output_key ASC, version DESC
+          LIMIT 1 BY output_key
+        )
+        WHERE script_pub_key = ''
       `,
       query_params: { networkId },
       format: 'JSONEachRow',
@@ -517,13 +646,8 @@ async function countEmptyScriptPubKeys(
   return result;
 }
 
-function backfillTables(skipLegacy: boolean): string[] {
-  return [
-    createsTable,
-    currentUtxosTable,
-    currentUtxosByAddressTable,
-    ...(skipLegacy ? [] : [legacyUtxosTable]),
-  ];
+function backfillTables(tables: string[], skipLegacy: boolean): string[] {
+  return tables.filter((table) => !skipLegacy || table !== legacyUtxosTable);
 }
 
 function scriptPubKeyBackfillCheckpointKey(networkId: number): string {
@@ -536,6 +660,13 @@ function parseMutationsSync(value: string): 0 | 1 | 2 {
     throw new Error(`invalid mutationsSync: ${value}`);
   }
   return parsed;
+}
+
+function parseWriteMode(value: string): BackfillWriteMode {
+  if (value === 'replacement' || value === 'mutation') {
+    return value;
+  }
+  throw new Error(`invalid writeMode: ${value}`);
 }
 
 function toClickHouseMaxExecutionTimeSeconds(timeoutMs: number): number {

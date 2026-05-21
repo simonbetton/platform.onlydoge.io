@@ -279,6 +279,8 @@ Backfill stored UTXO `scriptPubKey` hex from raw blocks:
 bun run backfill:dogecoin-script-pub-key -- --networkId 1 --toHeight <height> --execute
 ```
 
+By default this writes replacement rows into the `ReplacingMergeTree` UTXO tables instead of issuing large ClickHouse mutations.
+
 Prepare core-backed history:
 
 ```bash

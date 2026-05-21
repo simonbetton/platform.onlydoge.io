@@ -150,7 +150,7 @@ Bound a production run to a smaller block window:
 bun run backfill:dogecoin-script-pub-key -- --networkId 1 --toHeight <height> --execute --blockLimit 10000
 ```
 
-The script checkpoints progress in metadata as `dogecoin_script_pub_key_backfill_n{networkId}` and can resume safely with the same height range. It updates `core_utxo_creates_v1`, `utxo_outputs_current_v2`, `utxo_outputs_current_by_address_v2`, and the legacy `utxo_outputs_v2` fallback table.
+The script checkpoints progress in metadata as `dogecoin_script_pub_key_backfill_n{networkId}` and can resume safely with the same height range. By default it writes replacement rows into `core_utxo_creates_v1`, `utxo_outputs_current_v2`, and the legacy `utxo_outputs_v2` fallback table; the `utxo_outputs_current_by_address_v2` projection is updated by the current-UTXO materialized view. Use `--writeMode mutation` only if replacement rows are not acceptable for a specific maintenance run.
 
 ## History Preparation
 
