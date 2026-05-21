@@ -1015,7 +1015,10 @@ export class ClickHouseWarehouseAdapter
       for (const spend of application.utxoSpends) {
         const current = nextOutputs.get(spend.outputKey) ?? currentOutputs.get(spend.outputKey);
         if (!current) {
-          throw new Error(`missing current dogecoin prevout: ${spend.outputKey}`);
+          console.warn(
+            `[onlydoge] missing current dogecoin prevout ignored output_key=${spend.outputKey} spent_by_txid=${spend.spentByTxid} spent_in_block=${spend.spentInBlock}`,
+          );
+          continue;
         }
         nextOutputs.set(spend.outputKey, {
           ...current,

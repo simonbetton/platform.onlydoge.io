@@ -929,6 +929,65 @@ describe('clickhouse warehouse adapter', () => {
     );
   });
 
+  it('ignores missing current prevouts while updating core Dogecoin current state', async () => {
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    const adapter = new ClickHouseWarehouseAdapter({
+      driver: 'clickhouse',
+      location: 'http://clickhouse:8123',
+    });
+    const query = vi.fn(async ({ query: statement }: { query: string }) => {
+      if (statement.includes('FROM core_processed_blocks_v1')) {
+        return { json: async () => [] };
+      }
+      return { json: async () => [] };
+    });
+    const { insert } = installClickHouseClient(adapter, query);
+
+    await expect(
+      adapter.applyCoreDogecoinWindow(
+        [
+          coreApplication({
+            blockHeight: 2,
+            blockHash: 'block-2',
+            spends: ['missing-current-tx:0'],
+            creates: ['new-tx:0'],
+          }),
+        ],
+        { updateCurrentState: true, validatePrevouts: false },
+      ),
+    ).resolves.toEqual({
+      applied: true,
+      processTail: 2,
+    });
+
+    expect(warn).toHaveBeenCalledWith(
+      '[onlydoge] missing current dogecoin prevout ignored output_key=missing-current-tx:0 spent_by_txid=tx-2 spent_in_block=2',
+    );
+    expect(insert).toHaveBeenCalledWith(
+      expect.objectContaining({
+        table: 'utxo_outputs_current_v2',
+        values: [
+          expect.objectContaining({
+            output_key: 'new-tx:0',
+            spent_by_txid: null,
+          }),
+        ],
+      }),
+    );
+    expect(insert).not.toHaveBeenCalledWith(
+      expect.objectContaining({
+        table: 'balances_v2',
+        values: expect.arrayContaining([
+          expect.objectContaining({
+            address: 'DPrevAddress',
+          }),
+        ]),
+      }),
+    );
+
+    warn.mockRestore();
+  });
+
   it('rejects missing external prevouts in core Dogecoin windows', async () => {
     const { adapter } = installEmptyClickHouseClient();
 
