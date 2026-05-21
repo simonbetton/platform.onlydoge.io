@@ -988,6 +988,80 @@ describe('clickhouse warehouse adapter', () => {
     warn.mockRestore();
   });
 
+  it('ignores already spent current prevouts while updating core Dogecoin current state', async () => {
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    const adapter = new ClickHouseWarehouseAdapter({
+      driver: 'clickhouse',
+      location: 'http://clickhouse:8123',
+    });
+    const query = vi.fn(async ({ query: statement }: { query: string }) => {
+      if (statement.includes('FROM core_processed_blocks_v1')) {
+        return { json: async () => [] };
+      }
+      if (statement.includes('FROM utxo_outputs_current_v2')) {
+        return {
+          json: async () => [
+            clickHouseUtxoRow({
+              outputKey: 'already-spent-tx:0',
+              txid: 'already-spent-tx',
+              address: 'DSpentAddress',
+              valueBase: '100000000',
+              spentByTxid: 'previous-spend',
+              spentInBlock: 1,
+              spentInputIndex: 0,
+            }),
+          ],
+        };
+      }
+      return { json: async () => [] };
+    });
+    const { insert } = installClickHouseClient(adapter, query);
+
+    await expect(
+      adapter.applyCoreDogecoinWindow(
+        [
+          coreApplication({
+            blockHeight: 2,
+            blockHash: 'block-2',
+            spends: ['already-spent-tx:0'],
+            creates: ['new-tx:0'],
+          }),
+        ],
+        { updateCurrentState: true, validatePrevouts: false },
+      ),
+    ).resolves.toEqual({
+      applied: true,
+      processTail: 2,
+    });
+
+    expect(warn).toHaveBeenCalledWith(
+      '[onlydoge] already spent current dogecoin prevout ignored output_key=already-spent-tx:0 existing_spent_by_txid=previous-spend existing_spent_in_block=1 spent_by_txid=tx-2 spent_in_block=2',
+    );
+    expect(insert).toHaveBeenCalledWith(
+      expect.objectContaining({
+        table: 'utxo_outputs_current_v2',
+        values: [
+          expect.objectContaining({
+            output_key: 'new-tx:0',
+            spent_by_txid: null,
+          }),
+        ],
+      }),
+    );
+    expect(insert).not.toHaveBeenCalledWith(
+      expect.objectContaining({
+        table: 'balances_v2',
+        values: expect.arrayContaining([
+          expect.objectContaining({
+            address: 'DSpentAddress',
+          }),
+        ]),
+      }),
+    );
+
+    warn.mockRestore();
+  });
+
   it('rejects missing external prevouts in core Dogecoin windows', async () => {
     const { adapter } = installEmptyClickHouseClient();
 

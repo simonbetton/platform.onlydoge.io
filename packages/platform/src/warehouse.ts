@@ -1020,6 +1020,12 @@ export class ClickHouseWarehouseAdapter
           );
           continue;
         }
+        if (current.spentByTxid !== null || current.spentInBlock !== null) {
+          console.warn(
+            `[onlydoge] already spent current dogecoin prevout ignored output_key=${spend.outputKey} existing_spent_by_txid=${current.spentByTxid ?? ''} existing_spent_in_block=${current.spentInBlock ?? ''} spent_by_txid=${spend.spentByTxid} spent_in_block=${spend.spentInBlock}`,
+          );
+          continue;
+        }
         nextOutputs.set(spend.outputKey, {
           ...current,
           spentByTxid: spend.spentByTxid,
