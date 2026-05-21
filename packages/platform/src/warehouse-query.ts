@@ -256,6 +256,7 @@ export function toUtxoInsertRow(
     vout: row.vout,
     output_key: row.outputKey,
     address: row.address,
+    script_pub_key: row.scriptPubKey,
     script_type: row.scriptType,
     value_base: row.valueBase,
     is_coinbase: row.isCoinbase ? 1 : 0,

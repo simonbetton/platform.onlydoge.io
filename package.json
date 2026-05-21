@@ -19,6 +19,7 @@
     "health:indexer": "bun run scripts/indexer-health.ts",
     "rebuild:clickhouse-core": "bun run scripts/rebuild-clickhouse-core-state.ts",
     "materialize:clickhouse-core": "bun run scripts/materialize-clickhouse-core-current-state.ts",
+    "backfill:dogecoin-script-pub-key": "bun run scripts/backfill-dogecoin-script-pub-key.ts",
     "benchmark:clickhouse-core": "bun run scripts/benchmark-clickhouse-core-backfill.ts",
     "test": "vitest run",
     "test:watch": "vitest",

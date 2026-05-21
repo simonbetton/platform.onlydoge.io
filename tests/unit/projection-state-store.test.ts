@@ -78,6 +78,7 @@ describe('mirrored projection state store', () => {
                 outputKey: 'tx-1:0',
                 address: 'DTestAddress123',
                 scriptType: 'pubkeyhash',
+                scriptPubKey: '76a914000000000000000000000000000000000000000088ac',
                 valueBase: '100000000',
                 isCoinbase: false,
                 isSpendable: true,

@@ -315,6 +315,10 @@ describe('api integration', () => {
       expect(utxos.status).toBe(200);
       const [utxo] = readObjectArrayField(await readJsonObject(utxos), 'utxos');
       expect(requireStringField(utxo ?? {}, 'outputKey')).toBe('doge-tx-2:0');
+      expect(requireStringField(utxo ?? {}, 'scriptPubKey')).toBe(
+        '76a914333333333333333333333333333333333333333388ac',
+      );
+      expect(requireNumberField(utxo ?? {}, 'confirmations')).toBe(1);
     } finally {
       await scenario.ctx.cleanup();
     }
@@ -531,6 +535,10 @@ async function expectExplorerAddressHistoryAndUtxos({
   );
   const [utxo] = readObjectArrayField(await readJsonObject(utxos), 'utxos');
   expect(requireStringField(utxo ?? {}, 'outputKey')).toBe('doge-tx-2:0');
+  expect(requireStringField(utxo ?? {}, 'scriptPubKey')).toBe(
+    '76a914333333333333333333333333333333333333333388ac',
+  );
+  expect(requireNumberField(utxo ?? {}, 'confirmations')).toBe(1);
 }
 
 async function expectExplorerInfoAuth({ ctx }: ExplorerScenario): Promise<void> {

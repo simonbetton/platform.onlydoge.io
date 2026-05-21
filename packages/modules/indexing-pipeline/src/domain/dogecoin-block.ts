@@ -10,6 +10,7 @@ export interface DogecoinVout {
   scriptPubKey?: {
     address?: string;
     addresses?: string[];
+    hex?: string;
     type?: string;
   };
 }

@@ -11,6 +11,7 @@ export interface ProjectionUtxoOutput {
   isSpendable: boolean;
   networkId: PrimaryId;
   outputKey: string;
+  scriptPubKey: string;
   scriptType: string;
   spentByTxid: string | null;
   spentInBlock: number | null;

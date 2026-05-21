@@ -1124,6 +1124,7 @@ export class RelationalMetadataStore
           output_key,
           address,
           script_type,
+          script_pub_key,
           value_base,
           is_coinbase,
           is_spendable,
@@ -1169,6 +1170,7 @@ export class RelationalMetadataStore
                 output_key,
                 address,
                 script_type,
+                script_pub_key,
                 value_base,
                 is_coinbase,
                 is_spendable,
@@ -1211,6 +1213,7 @@ export class RelationalMetadataStore
           output_key,
           address,
           script_type,
+          script_pub_key,
           value_base,
           is_coinbase,
           is_spendable,
@@ -1943,6 +1946,7 @@ export class RelationalMetadataStore
       outputKey: String(row.output_key),
       address: String(row.address),
       scriptType: String(row.script_type),
+      scriptPubKey: nullableString(row.script_pub_key) ?? '',
       valueBase: String(row.value_base),
       isCoinbase: toBoolean(row.is_coinbase),
       isSpendable: toBoolean(row.is_spendable),
@@ -1973,6 +1977,7 @@ export class RelationalMetadataStore
         output.vout,
         output.address,
         output.scriptType,
+        output.scriptPubKey,
         output.valueBase,
         this.booleanValue(output.isCoinbase),
         this.booleanValue(output.isSpendable),
@@ -1982,14 +1987,14 @@ export class RelationalMetadataStore
         timestamp,
       ]);
 
-      const values = multiRowPlaceholders(chunk.length, 17);
+      const values = multiRowPlaceholders(chunk.length, 18);
       if (executor.kind === 'mysql') {
         await this.executeWithExecutor(
           executor,
           `
             INSERT INTO projection_utxo_outputs_current (
               network_id, output_key, block_height, block_hash, block_time, txid, tx_index, vout,
-              address, script_type, value_base, is_coinbase, is_spendable,
+              address, script_type, script_pub_key, value_base, is_coinbase, is_spendable,
               spent_by_txid, spent_in_block, spent_input_index, updated_at
             )
             VALUES ${values}
@@ -2002,6 +2007,7 @@ export class RelationalMetadataStore
               vout = VALUES(vout),
               address = VALUES(address),
               script_type = VALUES(script_type),
+              script_pub_key = VALUES(script_pub_key),
               value_base = VALUES(value_base),
               is_coinbase = VALUES(is_coinbase),
               is_spendable = VALUES(is_spendable),
@@ -2020,7 +2026,7 @@ export class RelationalMetadataStore
         `
           INSERT INTO projection_utxo_outputs_current (
             network_id, output_key, block_height, block_hash, block_time, txid, tx_index, vout,
-            address, script_type, value_base, is_coinbase, is_spendable,
+            address, script_type, script_pub_key, value_base, is_coinbase, is_spendable,
             spent_by_txid, spent_in_block, spent_input_index, updated_at
           )
           VALUES ${values}
@@ -2033,6 +2039,7 @@ export class RelationalMetadataStore
             vout = excluded.vout,
             address = excluded.address,
             script_type = excluded.script_type,
+            script_pub_key = excluded.script_pub_key,
             value_base = excluded.value_base,
             is_coinbase = excluded.is_coinbase,
             is_spendable = excluded.is_spendable,
@@ -2361,6 +2368,7 @@ export class RelationalMetadataStore
         output.vout,
         output.address,
         output.scriptType,
+        output.scriptPubKey,
         output.valueBase,
         this.booleanValue(output.isCoinbase),
         this.booleanValue(output.isSpendable),
@@ -2369,7 +2377,7 @@ export class RelationalMetadataStore
         output.spentInputIndex,
         timestamp,
       ]);
-      const values = multiRowPlaceholders(chunk.length, 17);
+      const values = multiRowPlaceholders(chunk.length, 18);
 
       if (executor.kind === 'mysql') {
         await this.executeWithExecutor(
@@ -2377,11 +2385,12 @@ export class RelationalMetadataStore
           `
             INSERT INTO core_utxos (
               network_id, output_key, block_height, block_hash, block_time, txid, tx_index, vout,
-              address, script_type, value_base, is_coinbase, is_spendable, spent_by_txid,
+              address, script_type, script_pub_key, value_base, is_coinbase, is_spendable, spent_by_txid,
               spent_in_block, spent_input_index, updated_at
             )
             VALUES ${values}
             ON DUPLICATE KEY UPDATE
+              script_pub_key = VALUES(script_pub_key),
               spent_by_txid = VALUES(spent_by_txid),
               spent_in_block = VALUES(spent_in_block),
               spent_input_index = VALUES(spent_input_index),
@@ -2397,11 +2406,12 @@ export class RelationalMetadataStore
         `
           INSERT INTO core_utxos (
             network_id, output_key, block_height, block_hash, block_time, txid, tx_index, vout,
-            address, script_type, value_base, is_coinbase, is_spendable, spent_by_txid,
+            address, script_type, script_pub_key, value_base, is_coinbase, is_spendable, spent_by_txid,
             spent_in_block, spent_input_index, updated_at
           )
           VALUES ${values}
           ON CONFLICT (network_id, output_key) DO UPDATE SET
+            script_pub_key = excluded.script_pub_key,
             spent_by_txid = excluded.spent_by_txid,
             spent_in_block = excluded.spent_in_block,
             spent_input_index = excluded.spent_input_index,
@@ -2667,7 +2677,7 @@ export class RelationalMetadataStore
             `
               SELECT
                 network_id, block_height, block_hash, block_time, txid, tx_index, vout,
-                output_key, address, script_type, value_base, is_coinbase, is_spendable,
+                output_key, address, script_type, script_pub_key, value_base, is_coinbase, is_spendable,
                 spent_by_txid, spent_in_block, spent_input_index
               FROM core_utxos
               WHERE network_id = ? AND output_key IN (${placeholders(chunk.length)})
@@ -2986,6 +2996,7 @@ export class RelationalMetadataStore
     }
 
     await this.ensureNetworksZmqColumn();
+    await this.ensureUtxoScriptPubKeyColumns();
   }
 
   private async ensureNetworksZmqColumn(): Promise<void> {
@@ -3013,6 +3024,46 @@ export class RelationalMetadataStore
     );
     if (!columns.some((column) => String(column.column_name) === 'zmq_block_endpoint')) {
       await this.execute('ALTER TABLE networks ADD COLUMN zmq_block_endpoint TEXT NULL');
+    }
+  }
+
+  private async ensureUtxoScriptPubKeyColumns(): Promise<void> {
+    const tables = ['projection_utxo_outputs_current', 'core_utxos'];
+
+    if (this.client.kind === 'sqlite') {
+      for (const table of tables) {
+        const columns = await this.query<DatabaseRow>(`PRAGMA table_info(${table})`);
+        if (!columns.some((column) => String(column.name) === 'script_pub_key')) {
+          await this.execute(`ALTER TABLE ${table} ADD COLUMN script_pub_key TEXT NULL`);
+        }
+      }
+      return;
+    }
+
+    if (this.client.kind === 'postgres') {
+      for (const table of tables) {
+        await this.execute(
+          `ALTER TABLE ${table} ADD COLUMN IF NOT EXISTS script_pub_key TEXT NULL`,
+        );
+      }
+      return;
+    }
+
+    const columns = await this.query<DatabaseRow>(
+      `
+        SELECT TABLE_NAME AS table_name, COLUMN_NAME AS column_name
+        FROM INFORMATION_SCHEMA.COLUMNS
+        WHERE TABLE_SCHEMA = DATABASE()
+          AND TABLE_NAME IN ('projection_utxo_outputs_current', 'core_utxos')
+      `,
+    );
+    const existing = new Set(
+      columns.map((column) => `${String(column.table_name)}:${String(column.column_name)}`),
+    );
+    for (const table of tables) {
+      if (!existing.has(`${table}:script_pub_key`)) {
+        await this.execute(`ALTER TABLE ${table} ADD COLUMN script_pub_key TEXT NULL`);
+      }
     }
   }
 
@@ -3300,6 +3351,7 @@ const sqliteMigrations = [
       vout INTEGER NOT NULL,
       address TEXT NOT NULL,
       script_type TEXT NOT NULL,
+      script_pub_key TEXT NULL,
       value_base TEXT NOT NULL,
       is_coinbase INTEGER NOT NULL,
       is_spendable INTEGER NOT NULL,
@@ -3368,6 +3420,7 @@ const sqliteMigrations = [
       vout INTEGER NOT NULL,
       address TEXT NOT NULL,
       script_type TEXT NOT NULL,
+      script_pub_key TEXT NULL,
       value_base TEXT NOT NULL,
       is_coinbase INTEGER NOT NULL,
       is_spendable INTEGER NOT NULL,
@@ -3531,6 +3584,7 @@ const postgresMigrations = [
       vout BIGINT NOT NULL,
       address TEXT NOT NULL,
       script_type TEXT NOT NULL,
+      script_pub_key TEXT NULL,
       value_base TEXT NOT NULL,
       is_coinbase BOOLEAN NOT NULL,
       is_spendable BOOLEAN NOT NULL,
@@ -3599,6 +3653,7 @@ const postgresMigrations = [
       vout BIGINT NOT NULL,
       address TEXT NOT NULL,
       script_type TEXT NOT NULL,
+      script_pub_key TEXT NULL,
       value_base TEXT NOT NULL,
       is_coinbase BOOLEAN NOT NULL,
       is_spendable BOOLEAN NOT NULL,
@@ -3763,6 +3818,7 @@ const mysqlMigrations = [
       vout BIGINT NOT NULL,
       address TEXT NOT NULL,
       script_type TEXT NOT NULL,
+      script_pub_key TEXT NULL,
       value_base TEXT NOT NULL,
       is_coinbase BOOLEAN NOT NULL,
       is_spendable BOOLEAN NOT NULL,
@@ -3831,6 +3887,7 @@ const mysqlMigrations = [
       vout BIGINT NOT NULL,
       address VARCHAR(255) NOT NULL,
       script_type TEXT NOT NULL,
+      script_pub_key TEXT NULL,
       value_base TEXT NOT NULL,
       is_coinbase BOOLEAN NOT NULL,
       is_spendable BOOLEAN NOT NULL,

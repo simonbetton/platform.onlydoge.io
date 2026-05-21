@@ -162,6 +162,7 @@ export interface ExplorerAddressUtxo
     | 'blockHeight'
     | 'blockTime'
     | 'outputKey'
+    | 'scriptPubKey'
     | 'spentByTxid'
     | 'spentInBlock'
     | 'txid'
@@ -170,6 +171,7 @@ export interface ExplorerAddressUtxo
     | 'vout'
   > {
   address: string;
+  confirmations: number;
   network: string;
   scriptType: string;
 }

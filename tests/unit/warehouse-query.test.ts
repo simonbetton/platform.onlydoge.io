@@ -77,6 +77,7 @@ describe('warehouse query helpers', () => {
         outputKey: 'tx-1:0',
         address: 'DAddress',
         scriptType: 'pubkeyhash',
+        scriptPubKey: '76a914000000000000000000000000000000000000000088ac',
         valueBase: '100',
         isCoinbase: false,
         isSpendable: true,
@@ -157,6 +158,7 @@ describe('warehouse query helpers', () => {
           outputKey: 'tx-1:0',
           address: 'DAddress',
           scriptType: 'pubkeyhash',
+          scriptPubKey: '76a914000000000000000000000000000000000000000088ac',
           valueBase: '100',
           isCoinbase: true,
           isSpendable: false,
@@ -169,6 +171,7 @@ describe('warehouse query helpers', () => {
     ).toMatchObject({
       network_id: 7,
       output_key: 'tx-1:0',
+      script_pub_key: '76a914000000000000000000000000000000000000000088ac',
       is_coinbase: 1,
       is_spendable: 0,
       version: 9,

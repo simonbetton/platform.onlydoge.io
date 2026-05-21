@@ -29,6 +29,7 @@ type DogecoinFixtureVout = {
   n: number;
   scriptPubKey: {
     addresses: string[];
+    hex: string;
     type: string;
   };
   value: string;
@@ -54,6 +55,7 @@ export const dogecoinFixture = {
               value: '100.00000000',
               scriptPubKey: {
                 type: 'pubkeyhash',
+                hex: '76a914000000000000000000000000000000000000000088ac',
                 addresses: ['DMinerSource1111111111111111111111111'],
               },
             },
@@ -75,6 +77,7 @@ export const dogecoinFixture = {
               value: '40.00000000',
               scriptPubKey: {
                 type: 'pubkeyhash',
+                hex: '76a914111111111111111111111111111111111111111188ac',
                 addresses: ['DSeedRelay1111111111111111111111111'],
               },
             },
@@ -83,6 +86,7 @@ export const dogecoinFixture = {
               value: '59.00000000',
               scriptPubKey: {
                 type: 'pubkeyhash',
+                hex: '76a914222222222222222222222222222222222222222288ac',
                 addresses: ['DMinerSource1111111111111111111111111'],
               },
             },
@@ -104,6 +108,7 @@ export const dogecoinFixture = {
               value: '25.00000000',
               scriptPubKey: {
                 type: 'pubkeyhash',
+                hex: '76a914333333333333333333333333333333333333333388ac',
                 addresses: ['DTargetSink1111111111111111111111111'],
               },
             },
@@ -112,6 +117,7 @@ export const dogecoinFixture = {
               value: '14.00000000',
               scriptPubKey: {
                 type: 'pubkeyhash',
+                hex: '76a914444444444444444444444444444444444444444488ac',
                 addresses: ['DSeedRelay1111111111111111111111111'],
               },
             },

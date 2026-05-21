@@ -86,7 +86,9 @@ describe('core dogecoin indexer integration', () => {
       utxos: [
         expect.objectContaining({
           address: dogecoinFixture.targetAddress,
+          confirmations: 1,
           outputKey: 'doge-tx-2:0',
+          scriptPubKey: '76a914333333333333333333333333333333333333333388ac',
           valueBase: '2500000000',
         }),
       ],

@@ -791,6 +791,7 @@ export function buildFastCoreDogecoinBlockApplications(
           vout: requireNumber(output.n ?? outputIndex, 'vout.n'),
           outputKey,
           address,
+          scriptPubKey: output.scriptPubKey?.hex?.trim() ?? '',
           scriptType: output.scriptPubKey?.type?.trim() ?? '',
           valueBase: fromDecimalUnits(requireAmount(output.value), 8),
           isCoinbase: Boolean((tx.vin ?? []).some((input) => input.coinbase)),

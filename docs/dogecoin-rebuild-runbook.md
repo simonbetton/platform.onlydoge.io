@@ -128,6 +128,30 @@ bun run materialize:clickhouse-core -- --networkId 1 --asOfBlockHeight <height> 
 
 The script checkpoints progress in metadata and can resume safely at the same `asOfBlockHeight`.
 
+## scriptPubKey Backfill
+
+Existing rows created before `script_pub_key` was added need a one-time backfill from stored raw block snapshots.
+
+Dry-run:
+
+```bash
+bun run backfill:dogecoin-script-pub-key -- --networkId 1 --toHeight <height>
+```
+
+Execute:
+
+```bash
+bun run backfill:dogecoin-script-pub-key -- --networkId 1 --toHeight <height> --execute
+```
+
+Bound a production run to a smaller block window:
+
+```bash
+bun run backfill:dogecoin-script-pub-key -- --networkId 1 --toHeight <height> --execute --blockLimit 10000
+```
+
+The script checkpoints progress in metadata as `dogecoin_script_pub_key_backfill_n{networkId}` and can resume safely with the same height range. It updates `core_utxo_creates_v1`, `utxo_outputs_current_v2`, `utxo_outputs_current_by_address_v2`, and the legacy `utxo_outputs_v2` fallback table.
+
 ## History Preparation
 
 Core-backed history requires a ClickHouse skipping index on `core_utxo_creates_v1.address`.

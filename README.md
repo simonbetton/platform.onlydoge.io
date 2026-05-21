@@ -273,6 +273,12 @@ Materialize current state:
 bun run materialize:clickhouse-core -- --networkId 1 --asOfBlockHeight <height> --reset --execute
 ```
 
+Backfill stored UTXO `scriptPubKey` hex from raw blocks:
+
+```bash
+bun run backfill:dogecoin-script-pub-key -- --networkId 1 --toHeight <height> --execute
+```
+
 Prepare core-backed history:
 
 ```bash

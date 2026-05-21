@@ -53,7 +53,7 @@ When history is not ready, those routes return a `425` response with a clear `do
 
 ## Response Notes
 
-Address summaries combine current balances and UTXO counts with investigation metadata overlays. Transaction detail resolves input values and addresses from the core UTXO state where possible.
+Address summaries combine current balances and UTXO counts with investigation metadata overlays. Transaction detail resolves input values and addresses from the core UTXO state where possible. Address UTXO rows include the output script hex as `scriptPubKey` and compute `confirmations` from the current processed Dogecoin height.
 
 `POST /v1/explorer/hd-wallet/balance` accepts an account-level public extended key, not a seed phrase or private extended key. It derives standard Dogecoin P2PKH addresses from the account xpub at `m/0/index` for receive addresses and `m/1/index` for change addresses. It scans each chain until the unused-address gap is reached; `gapLimit` is bounded to 20-200, and there is no product address-count cap for balance discovery. Identical requests are cached in-process for 60 seconds.
 

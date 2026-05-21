@@ -1247,6 +1247,7 @@ export class ClickHouseWarehouseAdapter
             output_key,
             address,
             script_type,
+            script_pub_key,
             value_base,
             is_coinbase,
             is_spendable,
@@ -1266,6 +1267,7 @@ export class ClickHouseWarehouseAdapter
             c.output_key,
             c.address,
             c.script_type,
+            c.script_pub_key,
             c.value_base,
             c.is_coinbase,
             c.is_spendable,
@@ -1950,6 +1952,7 @@ export class ClickHouseWarehouseAdapter
                 c.vout,
                 c.output_key AS "outputKey",
                 c.address,
+                c.script_pub_key AS "scriptPubKey",
                 c.script_type AS "scriptType",
                 c.value_base AS "valueBase",
                 c.is_coinbase = 1 AS "isCoinbase",
@@ -1968,6 +1971,7 @@ export class ClickHouseWarehouseAdapter
                   vout,
                   output_key,
                   address,
+                  script_pub_key,
                   script_type,
                   value_base,
                   is_coinbase,
@@ -2289,6 +2293,7 @@ export class ClickHouseWarehouseAdapter
               vout,
               output_key AS "outputKey",
               address,
+              script_pub_key AS "scriptPubKey",
               script_type AS "scriptType",
               value_base AS "valueBase",
               is_coinbase = 1 AS "isCoinbase",
@@ -2406,6 +2411,7 @@ export class ClickHouseWarehouseAdapter
             vout,
             output_key AS "outputKey",
             address,
+            script_pub_key AS "scriptPubKey",
             script_type AS "scriptType",
             value_base AS "valueBase",
             is_coinbase = 1 AS "isCoinbase",
@@ -2423,6 +2429,7 @@ export class ClickHouseWarehouseAdapter
               vout,
               output_key,
               address,
+              script_pub_key,
               script_type,
               value_base,
               is_coinbase,
@@ -2867,6 +2874,7 @@ export class ClickHouseWarehouseAdapter
                 vout,
                 output_key AS "outputKey",
                 address,
+                script_pub_key AS "scriptPubKey",
                 script_type AS "scriptType",
                 value_base AS "valueBase",
                 is_coinbase = 1 AS "isCoinbase",
@@ -2907,6 +2915,7 @@ export class ClickHouseWarehouseAdapter
           output_key,
           address,
           script_type,
+          script_pub_key,
           value_base,
           is_coinbase,
           is_spendable,
@@ -2926,6 +2935,7 @@ export class ClickHouseWarehouseAdapter
           output_key,
           address,
           script_type,
+          script_pub_key,
           value_base,
           is_coinbase,
           is_spendable,
@@ -3585,6 +3595,7 @@ function toCoreUtxoCreateInsertRow(output: ProjectionUtxoOutput): Record<string,
     vout: output.vout,
     output_key: output.outputKey,
     address: output.address,
+    script_pub_key: output.scriptPubKey,
     script_type: output.scriptType,
     value_base: output.valueBase,
     is_coinbase: output.isCoinbase ? 1 : 0,
@@ -3711,6 +3722,7 @@ function coreBenchmarkBootstrapStatements(tables: CoreBenchmarkTables): string[]
         output_key String,
         address String,
         script_type String,
+        script_pub_key String,
         value_base String,
         is_coinbase UInt8,
         is_spendable UInt8,
@@ -3718,6 +3730,10 @@ function coreBenchmarkBootstrapStatements(tables: CoreBenchmarkTables): string[]
       )
       ENGINE = MergeTree
       ORDER BY (network_id, output_key)
+    `,
+    `
+      ALTER TABLE ${tables.creates}
+      ADD COLUMN IF NOT EXISTS script_pub_key String AFTER script_type
     `,
     `
       CREATE TABLE IF NOT EXISTS ${tables.spends}
@@ -3758,6 +3774,7 @@ function coreBenchmarkBootstrapStatements(tables: CoreBenchmarkTables): string[]
         output_key String,
         address String,
         script_type String,
+        script_pub_key String,
         value_base String,
         is_coinbase UInt8,
         is_spendable UInt8,
@@ -3768,6 +3785,10 @@ function coreBenchmarkBootstrapStatements(tables: CoreBenchmarkTables): string[]
       )
       ENGINE = MergeTree
       ORDER BY (network_id, output_key)
+    `,
+    `
+      ALTER TABLE ${tables.currentUtxos}
+      ADD COLUMN IF NOT EXISTS script_pub_key String AFTER script_type
     `,
     `
       CREATE TABLE IF NOT EXISTS ${tables.balances}
@@ -3819,6 +3840,7 @@ const clickHouseWarehouseBootstrapStatements = [
       output_key String,
       address String,
       script_type String,
+      script_pub_key String,
       value_base String,
       is_coinbase UInt8,
       is_spendable UInt8,
@@ -3843,6 +3865,7 @@ const clickHouseWarehouseBootstrapStatements = [
       output_key String,
       address String,
       script_type String,
+      script_pub_key String,
       value_base String,
       is_coinbase UInt8,
       is_spendable UInt8,
@@ -3868,6 +3891,7 @@ const clickHouseWarehouseBootstrapStatements = [
       output_key String,
       address String,
       script_type String,
+      script_pub_key String,
       value_base String,
       is_coinbase UInt8,
       is_spendable UInt8,
@@ -3879,6 +3903,9 @@ const clickHouseWarehouseBootstrapStatements = [
     ENGINE = ReplacingMergeTree(version)
     ORDER BY (network_id, address, output_key)
     SETTINGS old_parts_lifetime = 0
+  `,
+  `
+    DROP VIEW IF EXISTS ${utxoCurrentStateByAddressTable}_mv
   `,
   `
     CREATE MATERIALIZED VIEW IF NOT EXISTS ${utxoCurrentStateByAddressTable}_mv
@@ -3895,6 +3922,7 @@ const clickHouseWarehouseBootstrapStatements = [
       output_key,
       address,
       script_type,
+      script_pub_key,
       value_base,
       is_coinbase,
       is_spendable,
@@ -4050,6 +4078,7 @@ const clickHouseWarehouseBootstrapStatements = [
       output_key String,
       address String,
       script_type String,
+      script_pub_key String,
       value_base String,
       is_coinbase UInt8,
       is_spendable UInt8,
@@ -4057,6 +4086,22 @@ const clickHouseWarehouseBootstrapStatements = [
     )
     ENGINE = ReplacingMergeTree(version)
     ORDER BY (network_id, output_key)
+  `,
+  `
+    ALTER TABLE utxo_outputs_v2
+    ADD COLUMN IF NOT EXISTS script_pub_key String AFTER script_type
+  `,
+  `
+    ALTER TABLE ${utxoCurrentStateTable}
+    ADD COLUMN IF NOT EXISTS script_pub_key String AFTER script_type
+  `,
+  `
+    ALTER TABLE ${utxoCurrentStateByAddressTable}
+    ADD COLUMN IF NOT EXISTS script_pub_key String AFTER script_type
+  `,
+  `
+    ALTER TABLE ${coreUtxoCreatesTable}
+    ADD COLUMN IF NOT EXISTS script_pub_key String AFTER script_type
   `,
   `
     ALTER TABLE ${coreUtxoCreatesTable}

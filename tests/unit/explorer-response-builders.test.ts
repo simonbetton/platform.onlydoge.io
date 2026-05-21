@@ -102,6 +102,7 @@ describe('explorer response builders', () => {
         outputKey: 'tx-1:0',
         address: 'DAddress',
         scriptType: 'pubkeyhash',
+        scriptPubKey: '76a914000000000000000000000000000000000000000088ac',
         valueBase: '100',
         isCoinbase: false,
         isSpendable: true,

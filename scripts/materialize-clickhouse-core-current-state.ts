@@ -130,6 +130,8 @@ async function main() {
       return;
     }
 
+    await ensureScriptPubKeySchema(client);
+
     let checkpoint = await prepareCheckpoint({
       asOfBlockHeight,
       checkpointKey,
@@ -314,6 +316,48 @@ async function prepareCheckpoint(input: {
   return checkpoint;
 }
 
+async function ensureScriptPubKeySchema(client: ReturnType<typeof createClient>) {
+  for (const table of [
+    createsTable,
+    currentUtxosTable,
+    currentUtxosByAddressTable,
+    'utxo_outputs_v2',
+  ]) {
+    await client.command({
+      query: `ALTER TABLE ${table} ADD COLUMN IF NOT EXISTS script_pub_key String AFTER script_type`,
+    });
+  }
+
+  await client.command({ query: `DROP VIEW IF EXISTS ${currentUtxosByAddressTable}_mv` });
+  await client.command({
+    query: `
+      CREATE MATERIALIZED VIEW IF NOT EXISTS ${currentUtxosByAddressTable}_mv
+      TO ${currentUtxosByAddressTable}
+      AS
+      SELECT
+        network_id,
+        block_height,
+        block_hash,
+        block_time,
+        txid,
+        tx_index,
+        vout,
+        output_key,
+        address,
+        script_type,
+        script_pub_key,
+        value_base,
+        is_coinbase,
+        is_spendable,
+        spent_by_txid,
+        spent_in_block,
+        spent_input_index,
+        version
+      FROM ${currentUtxosTable}
+    `,
+  });
+}
+
 function newCheckpoint(asOfBlockHeight: number, timestamp: string): MaterializationCheckpoint {
   return {
     asOfBlockHeight,
@@ -361,6 +405,7 @@ async function insertCurrentRange(
         output_key,
         address,
         script_type,
+        script_pub_key,
         value_base,
         is_coinbase,
         is_spendable,
@@ -380,6 +425,7 @@ async function insertCurrentRange(
         c.output_key,
         c.address,
         c.script_type,
+        c.script_pub_key,
         c.value_base,
         c.is_coinbase,
         c.is_spendable,

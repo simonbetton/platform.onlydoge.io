@@ -1,4 +1,5 @@
 import {
+  configKeyIndexerProcessTail,
   type DogecoinTransaction,
   type DogecoinVin,
   type DogecoinVout,
@@ -495,12 +496,10 @@ export class ExplorerQueryService {
     }
 
     const network = await this.resolveNetwork(networkId);
-    const utxos = await this.warehouse.listAddressUtxos(
-      network.networkId,
-      normalizedAddress,
-      offset,
-      limit ?? 50,
-    );
+    const [utxos, latestBlockHeight] = await Promise.all([
+      this.warehouse.listAddressUtxos(network.networkId, normalizedAddress, offset, limit ?? 50),
+      this.currentConfirmationHeight(network.networkId),
+    ]);
 
     return {
       utxos: utxos.map((utxo) => ({
@@ -509,7 +508,9 @@ export class ExplorerQueryService {
         blockHash: utxo.blockHash,
         blockHeight: utxo.blockHeight,
         blockTime: utxo.blockTime,
+        confirmations: confirmationCount(utxo.blockHeight, latestBlockHeight),
         outputKey: utxo.outputKey,
+        scriptPubKey: utxo.scriptPubKey,
         scriptType: utxo.scriptType,
         spentByTxid: utxo.spentByTxid,
         spentInBlock: utxo.spentInBlock,
@@ -519,6 +520,18 @@ export class ExplorerQueryService {
         vout: utxo.vout,
       })),
     };
+  }
+
+  private async currentConfirmationHeight(networkId: PrimaryId): Promise<number | null> {
+    const processTail = await this.configs.getJsonValue<number>(
+      configKeyIndexerProcessTail(networkId),
+    );
+    if (typeof processTail === 'number' && processTail >= 0) {
+      return processTail;
+    }
+
+    const [latestBlock] = await this.warehouse.listAppliedBlocks(networkId, 0, 1);
+    return latestBlock?.blockHeight ?? null;
   }
 
   public async getHdWalletBalance(input: HdWalletBalanceInput): Promise<ExplorerHdWalletBalance> {
@@ -992,6 +1005,14 @@ function transactionFeeBase(
   }
 
   return formatAmountBase(totalInput - totalOutput);
+}
+
+function confirmationCount(blockHeight: number, latestBlockHeight: number | null): number {
+  if (latestBlockHeight === null || latestBlockHeight < blockHeight) {
+    return 0;
+  }
+
+  return latestBlockHeight - blockHeight + 1;
 }
 
 function stringDecimalToBase(value: string): string {

@@ -101,7 +101,7 @@ export function mergeWarehouseState(
     ...source,
     appliedBlocks: rowsOrEmpty(source.appliedBlocks),
     directLinkAppliedBlocks: rowsOrEmpty(source.directLinkAppliedBlocks),
-    utxoOutputs: rowsOrEmpty(source.utxoOutputs),
+    utxoOutputs: rowsOrEmpty(source.utxoOutputs).map(normalizeUtxoOutput),
     addressMovements: rowsOrEmpty(source.addressMovements),
     transfers: rowsOrEmpty(source.transfers),
     balances: rowsOrEmpty(source.balances),
@@ -211,6 +211,13 @@ export function assertNonNegativeBalance(movement: AddressMovement, nextAmount: 
 
 function rowsOrEmpty<T>(rows: T[] | undefined): T[] {
   return rows ?? [];
+}
+
+function normalizeUtxoOutput(row: ProjectionUtxoOutput): ProjectionUtxoOutput {
+  return {
+    ...row,
+    scriptPubKey: row.scriptPubKey ?? '',
+  };
 }
 
 function isCurrentBalancePageRow(
