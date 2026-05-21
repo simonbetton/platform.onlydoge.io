@@ -340,7 +340,7 @@ function parseIndexerSettings(env: NodeJS.ProcessEnv): IndexerSettings {
     coreBlockTimeoutMs: parsePositiveInteger(env.ONLYDOGE_CORE_BLOCK_TIMEOUT_MS, 120_000),
     coreDbStatementTimeoutMs: parsePositiveInteger(
       env.ONLYDOGE_CORE_DB_STATEMENT_TIMEOUT_MS,
-      30_000,
+      120_000,
     ),
     coreOnlineTipDistance: parsePositiveInteger(env.ONLYDOGE_CORE_ONLINE_TIP_DISTANCE, 6),
     coreProcessLoadConcurrency: parsePositiveInteger(env.ONLYDOGE_CORE_PROCESS_LOAD_CONCURRENCY, 8),

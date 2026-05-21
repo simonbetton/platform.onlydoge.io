@@ -31,7 +31,7 @@ describe('shared kernel', () => {
     expect(settings.database.driver).toBe('sqlite');
     expect(settings.indexer).toMatchObject({
       coreBlockTimeoutMs: 120000,
-      coreDbStatementTimeoutMs: 30000,
+      coreDbStatementTimeoutMs: 120000,
       coreOnlineTipDistance: 6,
       coreProcessLoadConcurrency: 8,
       coreProcessWindow: 100,

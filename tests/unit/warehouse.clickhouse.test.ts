@@ -1062,6 +1062,64 @@ describe('clickhouse warehouse adapter', () => {
     warn.mockRestore();
   });
 
+  it('does not credit outputs that already exist in core Dogecoin current state', async () => {
+    const adapter = new ClickHouseWarehouseAdapter({
+      driver: 'clickhouse',
+      location: 'http://clickhouse:8123',
+    });
+    const query = vi.fn(async ({ query: statement }: { query: string }) => {
+      if (statement.includes('FROM core_processed_blocks_v1')) {
+        return { json: async () => [] };
+      }
+      if (statement.includes('FROM utxo_outputs_current_v2')) {
+        return {
+          json: async () => [
+            clickHouseUtxoRow({
+              outputKey: 'new-tx:0',
+              txid: 'new-tx',
+              address: 'DAddress0',
+              valueBase: '100000000',
+            }),
+          ],
+        };
+      }
+      return { json: async () => [] };
+    });
+    const { insert } = installClickHouseClient(adapter, query);
+
+    await expect(
+      adapter.applyCoreDogecoinWindow(
+        [
+          coreApplication({
+            blockHeight: 2,
+            blockHash: 'block-2',
+            creates: ['new-tx:0'],
+          }),
+        ],
+        { updateCurrentState: true, validatePrevouts: false },
+      ),
+    ).resolves.toEqual({
+      applied: true,
+      processTail: 2,
+    });
+
+    expect(insert).not.toHaveBeenCalledWith(
+      expect.objectContaining({
+        table: 'utxo_outputs_current_v2',
+      }),
+    );
+    expect(insert).not.toHaveBeenCalledWith(
+      expect.objectContaining({
+        table: 'balances_v2',
+      }),
+    );
+    expect(insert).toHaveBeenCalledWith(
+      expect.objectContaining({
+        table: 'applied_blocks_v2',
+      }),
+    );
+  });
+
   it('rejects missing external prevouts in core Dogecoin windows', async () => {
     const { adapter } = installEmptyClickHouseClient();
 

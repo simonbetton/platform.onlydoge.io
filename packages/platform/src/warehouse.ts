@@ -118,9 +118,12 @@ interface CoreProcessedBlockRow {
 
 const maxClickHouseHotOutputKeyValuesPerChunk = 128;
 const maxClickHouseHotOutputKeyBytesPerChunk = 6_000;
+const maxClickHouseHotOutputKeyQueryConcurrency = 4;
+const maxClickHouseBalanceKeyQueryConcurrency = 4;
 const maxClickHouseCoreOutputKeyValuesPerChunk = 512;
 const maxClickHouseCoreOutputKeyBytesPerChunk = 48_000;
 const maxClickHouseCoreOutputKeyQueryConcurrency = 4;
+const maxCoreCurrentStateApplyBlocksPerChunk = 20;
 const addressMovementsByAddressTable = 'address_movements_by_address_v2';
 const appliedBlocksTable = clickHouseCoreDogecoinTables.appliedBlocks;
 const balancesTable = clickHouseCoreDogecoinTables.balances;
@@ -963,7 +966,13 @@ export class ClickHouseWarehouseAdapter
       requestContext,
     );
     if (context?.updateCurrentState === true) {
-      await this.applyCoreCurrentStateWindow(networkId, pending, requestContext);
+      for (let index = 0; index < pending.length; index += maxCoreCurrentStateApplyBlocksPerChunk) {
+        await this.applyCoreCurrentStateWindow(
+          networkId,
+          pending.slice(index, index + maxCoreCurrentStateApplyBlocksPerChunk),
+          requestContext,
+        );
+      }
     }
     await this.insertRows(
       coreProcessedBlocksTable,
@@ -991,7 +1000,10 @@ export class ClickHouseWarehouseAdapter
       networkId,
       [
         ...new Set(
-          pending.flatMap((application) => application.utxoSpends.map((spend) => spend.outputKey)),
+          pending.flatMap((application) => [
+            ...application.utxoCreates.map((output) => output.outputKey),
+            ...application.utxoSpends.map((spend) => spend.outputKey),
+          ]),
         ),
       ],
       requestContext,
@@ -1008,6 +1020,10 @@ export class ClickHouseWarehouseAdapter
 
     for (const application of pending) {
       for (const output of application.utxoCreates) {
+        const current = nextOutputs.get(output.outputKey) ?? currentOutputs.get(output.outputKey);
+        if (current) {
+          continue;
+        }
         nextOutputs.set(output.outputKey, { ...output });
         addCoreBalanceDelta(balanceDeltas, output, BigInt(output.valueBase));
       }
@@ -2496,8 +2512,10 @@ export class ClickHouseWarehouseAdapter
           version: number;
         }
       >
-    > = await Promise.all(
-      chunkQueryValues(keys).map((chunk) =>
+    > = await mapWithConcurrency(
+      chunkQueryValues(keys),
+      maxClickHouseBalanceKeyQueryConcurrency,
+      (chunk) =>
         this.queryRows<
           BalanceRow & {
             version: number;
@@ -2523,7 +2541,6 @@ export class ClickHouseWarehouseAdapter
           },
           requestContext,
         ),
-      ),
     );
     const rows = rowChunks.flat();
 
@@ -2829,11 +2846,14 @@ export class ClickHouseWarehouseAdapter
     outputKeys: string[],
     requestContext?: ClickHouseRequestContext,
   ): Promise<ProjectionUtxoOutput[]> {
-    const rowChunks: ProjectionUtxoOutput[][] = await Promise.all(
-      chunkQueryValues(outputKeys, {
-        maxBytes: maxClickHouseHotOutputKeyBytesPerChunk,
-        maxValues: maxClickHouseHotOutputKeyValuesPerChunk,
-      }).map((chunk) =>
+    const outputKeyChunks = chunkQueryValues(outputKeys, {
+      maxBytes: maxClickHouseHotOutputKeyBytesPerChunk,
+      maxValues: maxClickHouseHotOutputKeyValuesPerChunk,
+    });
+    const rowChunks: ProjectionUtxoOutput[][] = await mapWithConcurrency(
+      outputKeyChunks,
+      maxClickHouseHotOutputKeyQueryConcurrency,
+      (chunk) =>
         this.queryRows<ProjectionUtxoOutput>(
           {
             query: `
@@ -2864,9 +2884,7 @@ export class ClickHouseWarehouseAdapter
           },
           requestContext,
         ),
-      ),
     );
-
     return rowChunks.flat();
   }
 
