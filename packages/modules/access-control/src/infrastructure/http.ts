@@ -24,15 +24,46 @@ export const protectedOperationDetail = {
   security: [apiTokenSecurityRequirement],
 };
 
+export function protectedRouteDetail<T extends object>(detail?: T) {
+  return {
+    ...protectedOperationDetail,
+    ...(detail ?? {}),
+  };
+}
+
+const accessControlTag = 'Access Control';
+
+const paginationQuerySchema = t.Object({
+  offset: t.Optional(
+    t.String({
+      description: 'Zero-based number of records to skip.',
+      examples: ['0', '25'],
+    }),
+  ),
+  limit: t.Optional(
+    t.String({
+      description: 'Maximum number of records to return.',
+      examples: ['25', '100'],
+    }),
+  ),
+});
+
 export function buildAccessControlHttp(service: AccessControlService) {
   return new Elysia({ prefix: '/v1/keys' })
     .post('/', async ({ body }) => service.createKey(body), {
       detail: {
+        tags: [accessControlTag],
+        summary: 'Create API key',
         description:
-          'Creates the first API key without authentication. After the first key exists, this route also requires x-api-token.',
+          'Creates an API key and returns the plaintext secret once. The first key can be created without authentication; after one key exists this route also requires `x-api-token`.',
       },
       body: t.Object({
-        id: t.Optional(t.String()),
+        id: t.Optional(
+          t.String({
+            description: 'Optional key id. If omitted, OnlyDoge generates a `key_` id.',
+            examples: ['key_operator'],
+          }),
+        ),
       }),
     })
     .get(
@@ -44,11 +75,27 @@ export function buildAccessControlHttp(service: AccessControlService) {
         return service.listKeys(offset, limit);
       },
       {
-        detail: protectedOperationDetail,
+        detail: protectedRouteDetail({
+          tags: [accessControlTag],
+          summary: 'List API keys',
+          description:
+            'Lists API key metadata. Plaintext key secrets are only returned by `POST /v1/keys` and are omitted here.',
+        }),
+        query: paginationQuerySchema,
       },
     )
     .get('/:id', async ({ params }) => service.getKey(params.id), {
-      detail: protectedOperationDetail,
+      detail: protectedRouteDetail({
+        tags: [accessControlTag],
+        summary: 'Get API key',
+        description: 'Returns metadata for one API key without exposing the plaintext secret.',
+      }),
+      params: t.Object({
+        id: t.String({
+          description: 'API key id.',
+          examples: ['key_operator'],
+        }),
+      }),
     })
     .put(
       '/:id',
@@ -57,9 +104,30 @@ export function buildAccessControlHttp(service: AccessControlService) {
         return new Response(null, { status: 204 });
       },
       {
-        detail: protectedOperationDetail,
+        detail: protectedRouteDetail({
+          tags: [accessControlTag],
+          summary: 'Update API key',
+          description:
+            'Activates or deactivates an API key. Deactivated keys can no longer authenticate protected routes.',
+          responses: {
+            204: {
+              description: 'API key updated.',
+            },
+          },
+        }),
+        params: t.Object({
+          id: t.String({
+            description: 'API key id.',
+            examples: ['key_operator'],
+          }),
+        }),
         body: t.Object({
-          isActive: t.Optional(t.Boolean()),
+          isActive: t.Optional(
+            t.Boolean({
+              description: 'Whether this key can authenticate requests.',
+              examples: [false],
+            }),
+          ),
         }),
       },
     )
@@ -70,9 +138,26 @@ export function buildAccessControlHttp(service: AccessControlService) {
         return new Response(null, { status: 204 });
       },
       {
-        detail: protectedOperationDetail,
+        detail: protectedRouteDetail({
+          tags: [accessControlTag],
+          summary: 'Delete API keys',
+          description: 'Deletes one or more API keys by id.',
+          responses: {
+            204: {
+              description: 'API keys deleted.',
+            },
+          },
+        }),
         body: t.Object({
-          keys: t.Array(t.String()),
+          keys: t.Array(
+            t.String({
+              description: 'API key id.',
+              examples: ['key_operator'],
+            }),
+            {
+              description: 'API key ids to delete.',
+            },
+          ),
         }),
       },
     );

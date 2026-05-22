@@ -1,12 +1,18 @@
-import { protectedOperationDetail } from '@onlydoge/access-control';
+import { protectedRouteDetail } from '@onlydoge/access-control';
 import { Elysia, t } from 'elysia';
 
 import type { InvestigationQueryService } from '../application/investigation-query-service';
 
+const healthTag = 'Health';
+const investigationTag = 'Investigation';
+
 const infoOperationDetail = {
-  ...protectedOperationDetail,
+  ...protectedRouteDetail({
+    tags: [investigationTag],
+    summary: 'Investigate address or entity',
+  }),
   description:
-    'Looks up a blockchain address or an entity id and returns known balances, linked sources, tags, and related entities. Example searches: `?q=DTestAddress123`, `?q=ent_exampleentity`.',
+    'Looks up a Dogecoin address or an entity id and returns known balances, linked sources, tags, risk summary, and related metadata. Example searches: `?q=DTestAddress123`, `?q=ent_exampleentity`.',
   responses: {
     200: {
       description: 'Investigation result for the supplied address or entity.',
@@ -87,19 +93,40 @@ const infoOperationDetail = {
 export function buildInvestigationQueryHttp(service: InvestigationQueryService) {
   return new Elysia()
     .use(
-      new Elysia({ prefix: '/v1/heartbeat' }).get('/', async () => {
-        await service.heartbeat();
-        return new Response(null, {
-          status: 204,
-          headers: {
-            'cache-control': 'no-store',
+      new Elysia({ prefix: '/v1/heartbeat' }).get(
+        '/',
+        async () => {
+          await service.heartbeat();
+          return new Response(null, {
+            status: 204,
+            headers: {
+              'cache-control': 'no-store',
+            },
+          });
+        },
+        {
+          detail: {
+            tags: [healthTag],
+            summary: 'Heartbeat',
+            description:
+              'Public lightweight health check for API dependencies used by uptime probes.',
+            responses: {
+              204: {
+                description: 'API dependencies are reachable.',
+              },
+            },
           },
-        });
-      }),
+        },
+      ),
     )
     .use(
       new Elysia({ prefix: '/v1/stats' }).get('/', () => service.stats(), {
-        detail: protectedOperationDetail,
+        detail: protectedRouteDetail({
+          tags: [investigationTag],
+          summary: 'Get indexing stats',
+          description:
+            'Returns per-network indexing progress, online-tip visibility, stage, and latest error information.',
+        }),
       }),
     )
     .use(

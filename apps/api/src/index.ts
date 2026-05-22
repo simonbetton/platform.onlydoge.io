@@ -47,14 +47,63 @@ export function buildApiApp(runtime: Runtime) {
           info: {
             title: 'OnlyDoge API',
             version: '0.1.0',
+            description:
+              'Dogecoin-first investigation and explorer API. Use `/v1/keys` to bootstrap an API token, then send it in the `x-api-token` header for protected `/v1` routes.',
           },
+          servers: [
+            {
+              url: '/',
+              description: 'Current API origin',
+            },
+          ],
+          tags: [
+            {
+              name: 'Access Control',
+              description: 'Bootstrap, inspect, rotate, deactivate, and delete API keys.',
+            },
+            {
+              name: 'Network Catalog',
+              description: 'Configure indexed Dogecoin networks and their token metadata.',
+            },
+            {
+              name: 'Entity Labeling',
+              description: 'Maintain entities, labels, tagged addresses, and risk tags.',
+            },
+            {
+              name: 'Explorer',
+              description:
+                'Read indexed Dogecoin blocks, transactions, addresses, UTXOs, and search results.',
+            },
+            {
+              name: 'Investigation',
+              description: 'Run address/entity lookups and inspect indexer health signals.',
+            },
+            {
+              name: 'Health',
+              description: 'Public runtime health checks.',
+            },
+          ],
           components: {
+            schemas: {
+              ErrorResponse: {
+                type: 'object',
+                required: ['error'],
+                properties: {
+                  error: {
+                    type: 'string',
+                    description: 'Human-readable error message.',
+                    example: 'not found',
+                  },
+                },
+              },
+            },
             securitySchemes: {
               [apiTokenSecuritySchemeName]: {
                 type: 'apiKey',
                 in: 'header',
                 name: 'x-api-token',
-                description: 'OnlyDoge API token.',
+                description:
+                  'OnlyDoge API token returned once by `POST /v1/keys`. The first key can be created without authentication; subsequent protected requests require this header.',
               },
             },
           },
