@@ -3,10 +3,24 @@
 exports[`api integration > serves heartbeat and openapi 1`] = `
 {
   "components": {
-    "schemas": {},
+    "schemas": {
+      "ErrorResponse": {
+        "properties": {
+          "error": {
+            "description": "Human-readable error message.",
+            "example": "not found",
+            "type": "string",
+          },
+        },
+        "required": [
+          "error",
+        ],
+        "type": "object",
+      },
+    },
     "securitySchemes": {
       "ApiTokenAuth": {
-        "description": "OnlyDoge API token.",
+        "description": "OnlyDoge API token returned once by \`POST /v1/keys\`. The first key can be created without authentication; subsequent protected requests require this header.",
         "in": "header",
         "name": "x-api-token",
         "type": "apiKey",
@@ -14,7 +28,7 @@ exports[`api integration > serves heartbeat and openapi 1`] = `
     },
   },
   "info": {
-    "description": "Development documentation",
+    "description": "Dogecoin-first investigation and explorer API. Use \`/v1/keys\` to bootstrap an API token, then send it in the \`x-api-token\` header for protected \`/v1\` routes.",
     "title": "OnlyDoge API",
     "version": "0.1.0",
   },
@@ -22,6 +36,7 @@ exports[`api integration > serves heartbeat and openapi 1`] = `
   "paths": {
     "/v1/addresses/": {
       "delete": {
+        "description": "Soft-deletes one or more address labels by id.",
         "operationId": "deleteV1Addresses",
         "requestBody": {
           "content": {
@@ -29,7 +44,12 @@ exports[`api integration > serves heartbeat and openapi 1`] = `
               "schema": {
                 "properties": {
                   "addresses": {
+                    "description": "Address label ids to delete.",
                     "items": {
+                      "description": "Address label id.",
+                      "examples": [
+                        "adr_hot_wallet",
+                      ],
                       "type": "string",
                     },
                     "type": "array",
@@ -45,7 +65,12 @@ exports[`api integration > serves heartbeat and openapi 1`] = `
               "schema": {
                 "properties": {
                   "addresses": {
+                    "description": "Address label ids to delete.",
                     "items": {
+                      "description": "Address label id.",
+                      "examples": [
+                        "adr_hot_wallet",
+                      ],
                       "type": "string",
                     },
                     "type": "array",
@@ -61,7 +86,12 @@ exports[`api integration > serves heartbeat and openapi 1`] = `
               "schema": {
                 "properties": {
                   "addresses": {
+                    "description": "Address label ids to delete.",
                     "items": {
+                      "description": "Address label id.",
+                      "examples": [
+                        "adr_hot_wallet",
+                      ],
                       "type": "string",
                     },
                     "type": "array",
@@ -76,21 +106,64 @@ exports[`api integration > serves heartbeat and openapi 1`] = `
           },
           "required": true,
         },
+        "responses": {
+          "204": {
+            "description": "Address labels deleted.",
+          },
+        },
         "security": [
           {
             "ApiTokenAuth": [],
           },
+        ],
+        "summary": "Delete address labels",
+        "tags": [
+          "Entity Labeling",
         ],
       },
       "get": {
+        "description": "Lists active address labels with related network summaries.",
         "operationId": "getV1Addresses",
+        "parameters": [
+          {
+            "in": "query",
+            "name": "offset",
+            "required": false,
+            "schema": {
+              "description": "Zero-based number of records to skip.",
+              "examples": [
+                "0",
+                "25",
+              ],
+              "type": "string",
+            },
+          },
+          {
+            "in": "query",
+            "name": "limit",
+            "required": false,
+            "schema": {
+              "description": "Maximum number of records to return.",
+              "examples": [
+                "25",
+                "100",
+              ],
+              "type": "string",
+            },
+          },
+        ],
         "security": [
           {
             "ApiTokenAuth": [],
           },
         ],
+        "summary": "List address labels",
+        "tags": [
+          "Entity Labeling",
+        ],
       },
       "post": {
+        "description": "Labels one or more Dogecoin addresses for an existing entity on an existing network.",
         "operationId": "postV1Addresses",
         "requestBody": {
           "content": {
@@ -98,18 +171,33 @@ exports[`api integration > serves heartbeat and openapi 1`] = `
               "schema": {
                 "properties": {
                   "addresses": {
+                    "description": "Address labels to create.",
                     "items": {
                       "properties": {
                         "address": {
+                          "description": "Dogecoin address to label.",
+                          "examples": [
+                            "DTestAddress123",
+                          ],
                           "type": "string",
                         },
                         "data": {
+                          "description": "Free-form metadata for the record.",
+                          "examples": [
+                            {
+                              "source": "case-note-123",
+                            },
+                          ],
                           "patternProperties": {
                             "^(.*)$": {},
                           },
                           "type": "object",
                         },
                         "description": {
+                          "description": "Investigator-facing address description.",
+                          "examples": [
+                            "Hot wallet observed in case note 123.",
+                          ],
                           "type": "string",
                         },
                       },
@@ -122,9 +210,17 @@ exports[`api integration > serves heartbeat and openapi 1`] = `
                     "type": "array",
                   },
                   "entity": {
+                    "description": "Entity id that owns these address labels.",
+                    "examples": [
+                      "ent_exchange",
+                    ],
                     "type": "string",
                   },
                   "network": {
+                    "description": "Network id for the address labels.",
+                    "examples": [
+                      "net_dogecoin",
+                    ],
                     "type": "string",
                   },
                 },
@@ -140,18 +236,33 @@ exports[`api integration > serves heartbeat and openapi 1`] = `
               "schema": {
                 "properties": {
                   "addresses": {
+                    "description": "Address labels to create.",
                     "items": {
                       "properties": {
                         "address": {
+                          "description": "Dogecoin address to label.",
+                          "examples": [
+                            "DTestAddress123",
+                          ],
                           "type": "string",
                         },
                         "data": {
+                          "description": "Free-form metadata for the record.",
+                          "examples": [
+                            {
+                              "source": "case-note-123",
+                            },
+                          ],
                           "patternProperties": {
                             "^(.*)$": {},
                           },
                           "type": "object",
                         },
                         "description": {
+                          "description": "Investigator-facing address description.",
+                          "examples": [
+                            "Hot wallet observed in case note 123.",
+                          ],
                           "type": "string",
                         },
                       },
@@ -164,9 +275,17 @@ exports[`api integration > serves heartbeat and openapi 1`] = `
                     "type": "array",
                   },
                   "entity": {
+                    "description": "Entity id that owns these address labels.",
+                    "examples": [
+                      "ent_exchange",
+                    ],
                     "type": "string",
                   },
                   "network": {
+                    "description": "Network id for the address labels.",
+                    "examples": [
+                      "net_dogecoin",
+                    ],
                     "type": "string",
                   },
                 },
@@ -182,18 +301,33 @@ exports[`api integration > serves heartbeat and openapi 1`] = `
               "schema": {
                 "properties": {
                   "addresses": {
+                    "description": "Address labels to create.",
                     "items": {
                       "properties": {
                         "address": {
+                          "description": "Dogecoin address to label.",
+                          "examples": [
+                            "DTestAddress123",
+                          ],
                           "type": "string",
                         },
                         "data": {
+                          "description": "Free-form metadata for the record.",
+                          "examples": [
+                            {
+                              "source": "case-note-123",
+                            },
+                          ],
                           "patternProperties": {
                             "^(.*)$": {},
                           },
                           "type": "object",
                         },
                         "description": {
+                          "description": "Investigator-facing address description.",
+                          "examples": [
+                            "Hot wallet observed in case note 123.",
+                          ],
                           "type": "string",
                         },
                       },
@@ -206,9 +340,17 @@ exports[`api integration > serves heartbeat and openapi 1`] = `
                     "type": "array",
                   },
                   "entity": {
+                    "description": "Entity id that owns these address labels.",
+                    "examples": [
+                      "ent_exchange",
+                    ],
                     "type": "string",
                   },
                   "network": {
+                    "description": "Network id for the address labels.",
+                    "examples": [
+                      "net_dogecoin",
+                    ],
                     "type": "string",
                   },
                 },
@@ -228,10 +370,15 @@ exports[`api integration > serves heartbeat and openapi 1`] = `
             "ApiTokenAuth": [],
           },
         ],
+        "summary": "Create address labels",
+        "tags": [
+          "Entity Labeling",
+        ],
       },
     },
     "/v1/addresses/{id}": {
       "get": {
+        "description": "Returns one address label and its related network summary.",
         "operationId": "getV1AddressesById",
         "parameters": [
           {
@@ -239,6 +386,10 @@ exports[`api integration > serves heartbeat and openapi 1`] = `
             "name": "id",
             "required": true,
             "schema": {
+              "description": "Address label id.",
+              "examples": [
+                "adr_hot_wallet",
+              ],
               "type": "string",
             },
           },
@@ -248,10 +399,15 @@ exports[`api integration > serves heartbeat and openapi 1`] = `
             "ApiTokenAuth": [],
           },
         ],
+        "summary": "Get address label",
+        "tags": [
+          "Entity Labeling",
+        ],
       },
     },
     "/v1/entities/": {
       "delete": {
+        "description": "Soft-deletes one or more entities and their associated address labels.",
         "operationId": "deleteV1Entities",
         "requestBody": {
           "content": {
@@ -259,7 +415,12 @@ exports[`api integration > serves heartbeat and openapi 1`] = `
               "schema": {
                 "properties": {
                   "entities": {
+                    "description": "Entity ids to delete.",
                     "items": {
+                      "description": "Entity id.",
+                      "examples": [
+                        "ent_exchange",
+                      ],
                       "type": "string",
                     },
                     "type": "array",
@@ -275,7 +436,12 @@ exports[`api integration > serves heartbeat and openapi 1`] = `
               "schema": {
                 "properties": {
                   "entities": {
+                    "description": "Entity ids to delete.",
                     "items": {
+                      "description": "Entity id.",
+                      "examples": [
+                        "ent_exchange",
+                      ],
                       "type": "string",
                     },
                     "type": "array",
@@ -291,7 +457,12 @@ exports[`api integration > serves heartbeat and openapi 1`] = `
               "schema": {
                 "properties": {
                   "entities": {
+                    "description": "Entity ids to delete.",
                     "items": {
+                      "description": "Entity id.",
+                      "examples": [
+                        "ent_exchange",
+                      ],
                       "type": "string",
                     },
                     "type": "array",
@@ -306,21 +477,64 @@ exports[`api integration > serves heartbeat and openapi 1`] = `
           },
           "required": true,
         },
+        "responses": {
+          "204": {
+            "description": "Entities deleted.",
+          },
+        },
         "security": [
           {
             "ApiTokenAuth": [],
           },
+        ],
+        "summary": "Delete entities",
+        "tags": [
+          "Entity Labeling",
         ],
       },
       "get": {
+        "description": "Lists active investigation entities with related tag, address, and network context.",
         "operationId": "getV1Entities",
+        "parameters": [
+          {
+            "in": "query",
+            "name": "offset",
+            "required": false,
+            "schema": {
+              "description": "Zero-based number of records to skip.",
+              "examples": [
+                "0",
+                "25",
+              ],
+              "type": "string",
+            },
+          },
+          {
+            "in": "query",
+            "name": "limit",
+            "required": false,
+            "schema": {
+              "description": "Maximum number of records to return.",
+              "examples": [
+                "25",
+                "100",
+              ],
+              "type": "string",
+            },
+          },
+        ],
         "security": [
           {
             "ApiTokenAuth": [],
           },
         ],
+        "summary": "List entities",
+        "tags": [
+          "Entity Labeling",
+        ],
       },
       "post": {
+        "description": "Creates an investigation entity and optionally assigns existing risk tags.",
         "operationId": "postV1Entities",
         "requestBody": {
           "content": {
@@ -328,20 +542,38 @@ exports[`api integration > serves heartbeat and openapi 1`] = `
               "schema": {
                 "properties": {
                   "data": {
+                    "description": "Free-form metadata for the record.",
+                    "examples": [
+                      {
+                        "source": "case-note-123",
+                      },
+                    ],
                     "patternProperties": {
                       "^(.*)$": {},
                     },
                     "type": "object",
                   },
                   "description": {
+                    "description": "Investigator-facing entity description.",
+                    "examples": [
+                      "Exchange cluster from internal case notes.",
+                    ],
                     "type": "string",
                   },
                   "id": {
+                    "description": "Optional entity id. If omitted, OnlyDoge generates an \`ent_\` id.",
+                    "examples": [
+                      "ent_exchange",
+                    ],
                     "type": "string",
                   },
                   "name": {
                     "anyOf": [
                       {
+                        "description": "Optional display name.",
+                        "examples": [
+                          "Example Exchange",
+                        ],
                         "type": "string",
                       },
                       {
@@ -351,7 +583,12 @@ exports[`api integration > serves heartbeat and openapi 1`] = `
                     "nullable": true,
                   },
                   "tags": {
+                    "description": "Existing tags to assign to the entity.",
                     "items": {
+                      "description": "Tag id.",
+                      "examples": [
+                        "tag_sanctions",
+                      ],
                       "type": "string",
                     },
                     "type": "array",
@@ -367,20 +604,38 @@ exports[`api integration > serves heartbeat and openapi 1`] = `
               "schema": {
                 "properties": {
                   "data": {
+                    "description": "Free-form metadata for the record.",
+                    "examples": [
+                      {
+                        "source": "case-note-123",
+                      },
+                    ],
                     "patternProperties": {
                       "^(.*)$": {},
                     },
                     "type": "object",
                   },
                   "description": {
+                    "description": "Investigator-facing entity description.",
+                    "examples": [
+                      "Exchange cluster from internal case notes.",
+                    ],
                     "type": "string",
                   },
                   "id": {
+                    "description": "Optional entity id. If omitted, OnlyDoge generates an \`ent_\` id.",
+                    "examples": [
+                      "ent_exchange",
+                    ],
                     "type": "string",
                   },
                   "name": {
                     "anyOf": [
                       {
+                        "description": "Optional display name.",
+                        "examples": [
+                          "Example Exchange",
+                        ],
                         "type": "string",
                       },
                       {
@@ -390,7 +645,12 @@ exports[`api integration > serves heartbeat and openapi 1`] = `
                     "nullable": true,
                   },
                   "tags": {
+                    "description": "Existing tags to assign to the entity.",
                     "items": {
+                      "description": "Tag id.",
+                      "examples": [
+                        "tag_sanctions",
+                      ],
                       "type": "string",
                     },
                     "type": "array",
@@ -406,20 +666,38 @@ exports[`api integration > serves heartbeat and openapi 1`] = `
               "schema": {
                 "properties": {
                   "data": {
+                    "description": "Free-form metadata for the record.",
+                    "examples": [
+                      {
+                        "source": "case-note-123",
+                      },
+                    ],
                     "patternProperties": {
                       "^(.*)$": {},
                     },
                     "type": "object",
                   },
                   "description": {
+                    "description": "Investigator-facing entity description.",
+                    "examples": [
+                      "Exchange cluster from internal case notes.",
+                    ],
                     "type": "string",
                   },
                   "id": {
+                    "description": "Optional entity id. If omitted, OnlyDoge generates an \`ent_\` id.",
+                    "examples": [
+                      "ent_exchange",
+                    ],
                     "type": "string",
                   },
                   "name": {
                     "anyOf": [
                       {
+                        "description": "Optional display name.",
+                        "examples": [
+                          "Example Exchange",
+                        ],
                         "type": "string",
                       },
                       {
@@ -429,7 +707,12 @@ exports[`api integration > serves heartbeat and openapi 1`] = `
                     "nullable": true,
                   },
                   "tags": {
+                    "description": "Existing tags to assign to the entity.",
                     "items": {
+                      "description": "Tag id.",
+                      "examples": [
+                        "tag_sanctions",
+                      ],
                       "type": "string",
                     },
                     "type": "array",
@@ -449,10 +732,15 @@ exports[`api integration > serves heartbeat and openapi 1`] = `
             "ApiTokenAuth": [],
           },
         ],
+        "summary": "Create entity",
+        "tags": [
+          "Entity Labeling",
+        ],
       },
     },
     "/v1/entities/{id}": {
       "get": {
+        "description": "Returns one entity with related tags, addresses, and network summaries.",
         "operationId": "getV1EntitiesById",
         "parameters": [
           {
@@ -460,6 +748,10 @@ exports[`api integration > serves heartbeat and openapi 1`] = `
             "name": "id",
             "required": true,
             "schema": {
+              "description": "Entity id.",
+              "examples": [
+                "ent_exchange",
+              ],
               "type": "string",
             },
           },
@@ -469,8 +761,13 @@ exports[`api integration > serves heartbeat and openapi 1`] = `
             "ApiTokenAuth": [],
           },
         ],
+        "summary": "Get entity",
+        "tags": [
+          "Entity Labeling",
+        ],
       },
       "put": {
+        "description": "Updates entity metadata and optionally replaces its assigned tag list.",
         "operationId": "putV1EntitiesById",
         "parameters": [
           {
@@ -478,6 +775,10 @@ exports[`api integration > serves heartbeat and openapi 1`] = `
             "name": "id",
             "required": true,
             "schema": {
+              "description": "Entity id.",
+              "examples": [
+                "ent_exchange",
+              ],
               "type": "string",
             },
           },
@@ -488,17 +789,31 @@ exports[`api integration > serves heartbeat and openapi 1`] = `
               "schema": {
                 "properties": {
                   "data": {
+                    "description": "Free-form metadata for the record.",
+                    "examples": [
+                      {
+                        "source": "case-note-123",
+                      },
+                    ],
                     "patternProperties": {
                       "^(.*)$": {},
                     },
                     "type": "object",
                   },
                   "description": {
+                    "description": "Investigator-facing entity description.",
+                    "examples": [
+                      "Updated exchange cluster from internal case notes.",
+                    ],
                     "type": "string",
                   },
                   "name": {
                     "anyOf": [
                       {
+                        "description": "Optional display name. Send null to clear it.",
+                        "examples": [
+                          "Example Exchange",
+                        ],
                         "type": "string",
                       },
                       {
@@ -508,7 +823,12 @@ exports[`api integration > serves heartbeat and openapi 1`] = `
                     "nullable": true,
                   },
                   "tags": {
+                    "description": "Replacement list of tag ids assigned to the entity.",
                     "items": {
+                      "description": "Tag id.",
+                      "examples": [
+                        "tag_sanctions",
+                      ],
                       "type": "string",
                     },
                     "type": "array",
@@ -521,17 +841,31 @@ exports[`api integration > serves heartbeat and openapi 1`] = `
               "schema": {
                 "properties": {
                   "data": {
+                    "description": "Free-form metadata for the record.",
+                    "examples": [
+                      {
+                        "source": "case-note-123",
+                      },
+                    ],
                     "patternProperties": {
                       "^(.*)$": {},
                     },
                     "type": "object",
                   },
                   "description": {
+                    "description": "Investigator-facing entity description.",
+                    "examples": [
+                      "Updated exchange cluster from internal case notes.",
+                    ],
                     "type": "string",
                   },
                   "name": {
                     "anyOf": [
                       {
+                        "description": "Optional display name. Send null to clear it.",
+                        "examples": [
+                          "Example Exchange",
+                        ],
                         "type": "string",
                       },
                       {
@@ -541,7 +875,12 @@ exports[`api integration > serves heartbeat and openapi 1`] = `
                     "nullable": true,
                   },
                   "tags": {
+                    "description": "Replacement list of tag ids assigned to the entity.",
                     "items": {
+                      "description": "Tag id.",
+                      "examples": [
+                        "tag_sanctions",
+                      ],
                       "type": "string",
                     },
                     "type": "array",
@@ -554,17 +893,31 @@ exports[`api integration > serves heartbeat and openapi 1`] = `
               "schema": {
                 "properties": {
                   "data": {
+                    "description": "Free-form metadata for the record.",
+                    "examples": [
+                      {
+                        "source": "case-note-123",
+                      },
+                    ],
                     "patternProperties": {
                       "^(.*)$": {},
                     },
                     "type": "object",
                   },
                   "description": {
+                    "description": "Investigator-facing entity description.",
+                    "examples": [
+                      "Updated exchange cluster from internal case notes.",
+                    ],
                     "type": "string",
                   },
                   "name": {
                     "anyOf": [
                       {
+                        "description": "Optional display name. Send null to clear it.",
+                        "examples": [
+                          "Example Exchange",
+                        ],
                         "type": "string",
                       },
                       {
@@ -574,7 +927,12 @@ exports[`api integration > serves heartbeat and openapi 1`] = `
                     "nullable": true,
                   },
                   "tags": {
+                    "description": "Replacement list of tag ids assigned to the entity.",
                     "items": {
+                      "description": "Tag id.",
+                      "examples": [
+                        "tag_sanctions",
+                      ],
                       "type": "string",
                     },
                     "type": "array",
@@ -586,16 +944,25 @@ exports[`api integration > serves heartbeat and openapi 1`] = `
           },
           "required": true,
         },
+        "responses": {
+          "204": {
+            "description": "Entity updated.",
+          },
+        },
         "security": [
           {
             "ApiTokenAuth": [],
           },
         ],
+        "summary": "Update entity",
+        "tags": [
+          "Entity Labeling",
+        ],
       },
     },
     "/v1/explorer/addresses/{address}": {
       "get": {
-        "description": "Returns an address summary with investigation overlay data.",
+        "description": "Returns an address balance summary with investigation overlay data.",
         "operationId": "getV1ExplorerAddressesByAddress",
         "parameters": [
           {
@@ -603,6 +970,10 @@ exports[`api integration > serves heartbeat and openapi 1`] = `
             "name": "address",
             "required": true,
             "schema": {
+              "description": "Dogecoin address.",
+              "examples": [
+                "DTestAddress123",
+              ],
               "type": "string",
             },
           },
@@ -611,6 +982,10 @@ exports[`api integration > serves heartbeat and openapi 1`] = `
             "name": "network",
             "required": false,
             "schema": {
+              "description": "Network id. Omit when a single Dogecoin network is configured and should be used as the default.",
+              "examples": [
+                "net_dogecoin",
+              ],
               "type": "string",
             },
           },
@@ -619,6 +994,10 @@ exports[`api integration > serves heartbeat and openapi 1`] = `
           {
             "ApiTokenAuth": [],
           },
+        ],
+        "summary": "Get address",
+        "tags": [
+          "Explorer",
         ],
       },
     },
@@ -632,6 +1011,10 @@ exports[`api integration > serves heartbeat and openapi 1`] = `
             "name": "address",
             "required": true,
             "schema": {
+              "description": "Dogecoin address.",
+              "examples": [
+                "DTestAddress123",
+              ],
               "type": "string",
             },
           },
@@ -640,6 +1023,10 @@ exports[`api integration > serves heartbeat and openapi 1`] = `
             "name": "network",
             "required": false,
             "schema": {
+              "description": "Network id. Omit when a single Dogecoin network is configured and should be used as the default.",
+              "examples": [
+                "net_dogecoin",
+              ],
               "type": "string",
             },
           },
@@ -648,6 +1035,11 @@ exports[`api integration > serves heartbeat and openapi 1`] = `
             "name": "offset",
             "required": false,
             "schema": {
+              "description": "Zero-based number of records to skip.",
+              "examples": [
+                "0",
+                "25",
+              ],
               "type": "string",
             },
           },
@@ -656,6 +1048,11 @@ exports[`api integration > serves heartbeat and openapi 1`] = `
             "name": "limit",
             "required": false,
             "schema": {
+              "description": "Maximum number of records to return.",
+              "examples": [
+                "20",
+                "50",
+              ],
               "type": "string",
             },
           },
@@ -664,6 +1061,10 @@ exports[`api integration > serves heartbeat and openapi 1`] = `
           {
             "ApiTokenAuth": [],
           },
+        ],
+        "summary": "List address transactions",
+        "tags": [
+          "Explorer",
         ],
       },
     },
@@ -677,6 +1078,10 @@ exports[`api integration > serves heartbeat and openapi 1`] = `
             "name": "address",
             "required": true,
             "schema": {
+              "description": "Dogecoin address.",
+              "examples": [
+                "DTestAddress123",
+              ],
               "type": "string",
             },
           },
@@ -685,6 +1090,10 @@ exports[`api integration > serves heartbeat and openapi 1`] = `
             "name": "network",
             "required": false,
             "schema": {
+              "description": "Network id. Omit when a single Dogecoin network is configured and should be used as the default.",
+              "examples": [
+                "net_dogecoin",
+              ],
               "type": "string",
             },
           },
@@ -693,6 +1102,11 @@ exports[`api integration > serves heartbeat and openapi 1`] = `
             "name": "offset",
             "required": false,
             "schema": {
+              "description": "Zero-based number of records to skip.",
+              "examples": [
+                "0",
+                "25",
+              ],
               "type": "string",
             },
           },
@@ -701,6 +1115,11 @@ exports[`api integration > serves heartbeat and openapi 1`] = `
             "name": "limit",
             "required": false,
             "schema": {
+              "description": "Maximum number of records to return.",
+              "examples": [
+                "20",
+                "50",
+              ],
               "type": "string",
             },
           },
@@ -710,11 +1129,15 @@ exports[`api integration > serves heartbeat and openapi 1`] = `
             "ApiTokenAuth": [],
           },
         ],
+        "summary": "List address UTXOs",
+        "tags": [
+          "Explorer",
+        ],
       },
     },
     "/v1/explorer/blocks": {
       "get": {
-        "description": "Lists recent indexed Dogecoin blocks.",
+        "description": "Lists recent indexed Dogecoin blocks in descending chain order.",
         "operationId": "getV1ExplorerBlocks",
         "parameters": [
           {
@@ -722,6 +1145,10 @@ exports[`api integration > serves heartbeat and openapi 1`] = `
             "name": "network",
             "required": false,
             "schema": {
+              "description": "Network id. Omit when a single Dogecoin network is configured and should be used as the default.",
+              "examples": [
+                "net_dogecoin",
+              ],
               "type": "string",
             },
           },
@@ -730,6 +1157,11 @@ exports[`api integration > serves heartbeat and openapi 1`] = `
             "name": "offset",
             "required": false,
             "schema": {
+              "description": "Zero-based number of records to skip.",
+              "examples": [
+                "0",
+                "25",
+              ],
               "type": "string",
             },
           },
@@ -738,6 +1170,11 @@ exports[`api integration > serves heartbeat and openapi 1`] = `
             "name": "limit",
             "required": false,
             "schema": {
+              "description": "Maximum number of records to return.",
+              "examples": [
+                "20",
+                "50",
+              ],
               "type": "string",
             },
           },
@@ -747,11 +1184,15 @@ exports[`api integration > serves heartbeat and openapi 1`] = `
             "ApiTokenAuth": [],
           },
         ],
+        "summary": "List blocks",
+        "tags": [
+          "Explorer",
+        ],
       },
     },
     "/v1/explorer/blocks/{ref}": {
       "get": {
-        "description": "Returns a block by indexed height or block hash.",
+        "description": "Returns a block summary and transaction summaries by indexed height or block hash.",
         "operationId": "getV1ExplorerBlocksByRef",
         "parameters": [
           {
@@ -759,6 +1200,11 @@ exports[`api integration > serves heartbeat and openapi 1`] = `
             "name": "ref",
             "required": true,
             "schema": {
+              "description": "Block height or block hash.",
+              "examples": [
+                "123456",
+                "0000000000000000000000000000000000000000000000000000000000000000",
+              ],
               "type": "string",
             },
           },
@@ -767,6 +1213,10 @@ exports[`api integration > serves heartbeat and openapi 1`] = `
             "name": "network",
             "required": false,
             "schema": {
+              "description": "Network id. Omit when a single Dogecoin network is configured and should be used as the default.",
+              "examples": [
+                "net_dogecoin",
+              ],
               "type": "string",
             },
           },
@@ -776,16 +1226,24 @@ exports[`api integration > serves heartbeat and openapi 1`] = `
             "ApiTokenAuth": [],
           },
         ],
+        "summary": "Get block",
+        "tags": [
+          "Explorer",
+        ],
       },
     },
     "/v1/explorer/networks": {
       "get": {
-        "description": "Lists Dogecoin explorer networks and their indexing status.",
+        "description": "Lists Dogecoin explorer networks and their indexing status. Use this first to discover the default network id.",
         "operationId": "getV1ExplorerNetworks",
         "security": [
           {
             "ApiTokenAuth": [],
           },
+        ],
+        "summary": "List explorer networks",
+        "tags": [
+          "Explorer",
         ],
       },
     },
@@ -799,6 +1257,11 @@ exports[`api integration > serves heartbeat and openapi 1`] = `
             "name": "q",
             "required": false,
             "schema": {
+              "description": "Block height, block hash, transaction id, or Dogecoin address.",
+              "examples": [
+                "123456",
+                "DTestAddress123",
+              ],
               "type": "string",
             },
           },
@@ -807,6 +1270,10 @@ exports[`api integration > serves heartbeat and openapi 1`] = `
             "name": "network",
             "required": false,
             "schema": {
+              "description": "Network id. Omit when a single Dogecoin network is configured and should be used as the default.",
+              "examples": [
+                "net_dogecoin",
+              ],
               "type": "string",
             },
           },
@@ -815,6 +1282,10 @@ exports[`api integration > serves heartbeat and openapi 1`] = `
           {
             "ApiTokenAuth": [],
           },
+        ],
+        "summary": "Search explorer",
+        "tags": [
+          "Explorer",
         ],
       },
     },
@@ -828,6 +1299,10 @@ exports[`api integration > serves heartbeat and openapi 1`] = `
             "name": "txid",
             "required": true,
             "schema": {
+              "description": "Dogecoin transaction id.",
+              "examples": [
+                "doge-tx-2",
+              ],
               "type": "string",
             },
           },
@@ -836,6 +1311,10 @@ exports[`api integration > serves heartbeat and openapi 1`] = `
             "name": "network",
             "required": false,
             "schema": {
+              "description": "Network id. Omit when a single Dogecoin network is configured and should be used as the default.",
+              "examples": [
+                "net_dogecoin",
+              ],
               "type": "string",
             },
           },
@@ -845,16 +1324,30 @@ exports[`api integration > serves heartbeat and openapi 1`] = `
             "ApiTokenAuth": [],
           },
         ],
+        "summary": "Get transaction",
+        "tags": [
+          "Explorer",
+        ],
       },
     },
     "/v1/heartbeat/": {
       "get": {
+        "description": "Public lightweight health check for API dependencies used by uptime probes.",
         "operationId": "getV1Heartbeat",
+        "responses": {
+          "204": {
+            "description": "API dependencies are reachable.",
+          },
+        },
+        "summary": "Heartbeat",
+        "tags": [
+          "Health",
+        ],
       },
     },
     "/v1/info/": {
       "get": {
-        "description": "Looks up a blockchain address or an entity id and returns known balances, linked sources, tags, and related entities. Example searches: \`?q=DTestAddress123\`, \`?q=ent_exampleentity\`.",
+        "description": "Looks up a Dogecoin address or an entity id and returns known balances, linked sources, tags, risk summary, and related metadata. Example searches: \`?q=DTestAddress123\`, \`?q=ent_exampleentity\`.",
         "operationId": "getV1Info",
         "parameters": [
           {
@@ -958,10 +1451,15 @@ exports[`api integration > serves heartbeat and openapi 1`] = `
             "ApiTokenAuth": [],
           },
         ],
+        "summary": "Investigate address or entity",
+        "tags": [
+          "Investigation",
+        ],
       },
     },
     "/v1/keys/": {
       "delete": {
+        "description": "Deletes one or more API keys by id.",
         "operationId": "deleteV1Keys",
         "requestBody": {
           "content": {
@@ -969,7 +1467,12 @@ exports[`api integration > serves heartbeat and openapi 1`] = `
               "schema": {
                 "properties": {
                   "keys": {
+                    "description": "API key ids to delete.",
                     "items": {
+                      "description": "API key id.",
+                      "examples": [
+                        "key_operator",
+                      ],
                       "type": "string",
                     },
                     "type": "array",
@@ -985,7 +1488,12 @@ exports[`api integration > serves heartbeat and openapi 1`] = `
               "schema": {
                 "properties": {
                   "keys": {
+                    "description": "API key ids to delete.",
                     "items": {
+                      "description": "API key id.",
+                      "examples": [
+                        "key_operator",
+                      ],
                       "type": "string",
                     },
                     "type": "array",
@@ -1001,7 +1509,12 @@ exports[`api integration > serves heartbeat and openapi 1`] = `
               "schema": {
                 "properties": {
                   "keys": {
+                    "description": "API key ids to delete.",
                     "items": {
+                      "description": "API key id.",
+                      "examples": [
+                        "key_operator",
+                      ],
                       "type": "string",
                     },
                     "type": "array",
@@ -1016,22 +1529,64 @@ exports[`api integration > serves heartbeat and openapi 1`] = `
           },
           "required": true,
         },
+        "responses": {
+          "204": {
+            "description": "API keys deleted.",
+          },
+        },
         "security": [
           {
             "ApiTokenAuth": [],
           },
+        ],
+        "summary": "Delete API keys",
+        "tags": [
+          "Access Control",
         ],
       },
       "get": {
+        "description": "Lists API key metadata. Plaintext key secrets are only returned by \`POST /v1/keys\` and are omitted here.",
         "operationId": "getV1Keys",
+        "parameters": [
+          {
+            "in": "query",
+            "name": "offset",
+            "required": false,
+            "schema": {
+              "description": "Zero-based number of records to skip.",
+              "examples": [
+                "0",
+                "25",
+              ],
+              "type": "string",
+            },
+          },
+          {
+            "in": "query",
+            "name": "limit",
+            "required": false,
+            "schema": {
+              "description": "Maximum number of records to return.",
+              "examples": [
+                "25",
+                "100",
+              ],
+              "type": "string",
+            },
+          },
+        ],
         "security": [
           {
             "ApiTokenAuth": [],
           },
         ],
+        "summary": "List API keys",
+        "tags": [
+          "Access Control",
+        ],
       },
       "post": {
-        "description": "Creates the first API key without authentication. After the first key exists, this route also requires x-api-token.",
+        "description": "Creates an API key and returns the plaintext secret once. The first key can be created without authentication; after one key exists this route also requires \`x-api-token\`.",
         "operationId": "postV1Keys",
         "requestBody": {
           "content": {
@@ -1039,6 +1594,10 @@ exports[`api integration > serves heartbeat and openapi 1`] = `
               "schema": {
                 "properties": {
                   "id": {
+                    "description": "Optional key id. If omitted, OnlyDoge generates a \`key_\` id.",
+                    "examples": [
+                      "key_operator",
+                    ],
                     "type": "string",
                   },
                 },
@@ -1049,6 +1608,10 @@ exports[`api integration > serves heartbeat and openapi 1`] = `
               "schema": {
                 "properties": {
                   "id": {
+                    "description": "Optional key id. If omitted, OnlyDoge generates a \`key_\` id.",
+                    "examples": [
+                      "key_operator",
+                    ],
                     "type": "string",
                   },
                 },
@@ -1059,6 +1622,10 @@ exports[`api integration > serves heartbeat and openapi 1`] = `
               "schema": {
                 "properties": {
                   "id": {
+                    "description": "Optional key id. If omitted, OnlyDoge generates a \`key_\` id.",
+                    "examples": [
+                      "key_operator",
+                    ],
                     "type": "string",
                   },
                 },
@@ -1068,10 +1635,15 @@ exports[`api integration > serves heartbeat and openapi 1`] = `
           },
           "required": true,
         },
+        "summary": "Create API key",
+        "tags": [
+          "Access Control",
+        ],
       },
     },
     "/v1/keys/{id}": {
       "get": {
+        "description": "Returns metadata for one API key without exposing the plaintext secret.",
         "operationId": "getV1KeysById",
         "parameters": [
           {
@@ -1079,6 +1651,10 @@ exports[`api integration > serves heartbeat and openapi 1`] = `
             "name": "id",
             "required": true,
             "schema": {
+              "description": "API key id.",
+              "examples": [
+                "key_operator",
+              ],
               "type": "string",
             },
           },
@@ -1088,8 +1664,13 @@ exports[`api integration > serves heartbeat and openapi 1`] = `
             "ApiTokenAuth": [],
           },
         ],
+        "summary": "Get API key",
+        "tags": [
+          "Access Control",
+        ],
       },
       "put": {
+        "description": "Activates or deactivates an API key. Deactivated keys can no longer authenticate protected routes.",
         "operationId": "putV1KeysById",
         "parameters": [
           {
@@ -1097,6 +1678,10 @@ exports[`api integration > serves heartbeat and openapi 1`] = `
             "name": "id",
             "required": true,
             "schema": {
+              "description": "API key id.",
+              "examples": [
+                "key_operator",
+              ],
               "type": "string",
             },
           },
@@ -1107,6 +1692,10 @@ exports[`api integration > serves heartbeat and openapi 1`] = `
               "schema": {
                 "properties": {
                   "isActive": {
+                    "description": "Whether this key can authenticate requests.",
+                    "examples": [
+                      false,
+                    ],
                     "type": "boolean",
                   },
                 },
@@ -1117,6 +1706,10 @@ exports[`api integration > serves heartbeat and openapi 1`] = `
               "schema": {
                 "properties": {
                   "isActive": {
+                    "description": "Whether this key can authenticate requests.",
+                    "examples": [
+                      false,
+                    ],
                     "type": "boolean",
                   },
                 },
@@ -1127,6 +1720,10 @@ exports[`api integration > serves heartbeat and openapi 1`] = `
               "schema": {
                 "properties": {
                   "isActive": {
+                    "description": "Whether this key can authenticate requests.",
+                    "examples": [
+                      false,
+                    ],
                     "type": "boolean",
                   },
                 },
@@ -1136,15 +1733,25 @@ exports[`api integration > serves heartbeat and openapi 1`] = `
           },
           "required": true,
         },
+        "responses": {
+          "204": {
+            "description": "API key updated.",
+          },
+        },
         "security": [
           {
             "ApiTokenAuth": [],
           },
         ],
+        "summary": "Update API key",
+        "tags": [
+          "Access Control",
+        ],
       },
     },
     "/v1/networks/": {
       "delete": {
+        "description": "Soft-deletes one or more networks and their associated address labels.",
         "operationId": "deleteV1Networks",
         "requestBody": {
           "content": {
@@ -1152,7 +1759,12 @@ exports[`api integration > serves heartbeat and openapi 1`] = `
               "schema": {
                 "properties": {
                   "networks": {
+                    "description": "Network ids to delete.",
                     "items": {
+                      "description": "Network id.",
+                      "examples": [
+                        "net_dogecoin",
+                      ],
                       "type": "string",
                     },
                     "type": "array",
@@ -1168,7 +1780,12 @@ exports[`api integration > serves heartbeat and openapi 1`] = `
               "schema": {
                 "properties": {
                   "networks": {
+                    "description": "Network ids to delete.",
                     "items": {
+                      "description": "Network id.",
+                      "examples": [
+                        "net_dogecoin",
+                      ],
                       "type": "string",
                     },
                     "type": "array",
@@ -1184,7 +1801,12 @@ exports[`api integration > serves heartbeat and openapi 1`] = `
               "schema": {
                 "properties": {
                   "networks": {
+                    "description": "Network ids to delete.",
                     "items": {
+                      "description": "Network id.",
+                      "examples": [
+                        "net_dogecoin",
+                      ],
                       "type": "string",
                     },
                     "type": "array",
@@ -1199,21 +1821,64 @@ exports[`api integration > serves heartbeat and openapi 1`] = `
           },
           "required": true,
         },
+        "responses": {
+          "204": {
+            "description": "Networks deleted.",
+          },
+        },
         "security": [
           {
             "ApiTokenAuth": [],
           },
+        ],
+        "summary": "Delete networks",
+        "tags": [
+          "Network Catalog",
         ],
       },
       "get": {
+        "description": "Lists active configured networks.",
         "operationId": "getV1Networks",
+        "parameters": [
+          {
+            "in": "query",
+            "name": "offset",
+            "required": false,
+            "schema": {
+              "description": "Zero-based number of records to skip.",
+              "examples": [
+                "0",
+                "25",
+              ],
+              "type": "string",
+            },
+          },
+          {
+            "in": "query",
+            "name": "limit",
+            "required": false,
+            "schema": {
+              "description": "Maximum number of records to return.",
+              "examples": [
+                "25",
+                "100",
+              ],
+              "type": "string",
+            },
+          },
+        ],
         "security": [
           {
             "ApiTokenAuth": [],
           },
         ],
+        "summary": "List networks",
+        "tags": [
+          "Network Catalog",
+        ],
       },
       "post": {
+        "description": "Registers a Dogecoin network for indexing. The RPC endpoint is health-checked before the network is saved.",
         "operationId": "postV1Networks",
         "requestBody": {
           "content": {
@@ -1222,29 +1887,58 @@ exports[`api integration > serves heartbeat and openapi 1`] = `
                 "properties": {
                   "architecture": {
                     "const": "dogecoin",
+                    "description": "Network family. Only Dogecoin is currently supported.",
                     "type": "string",
                   },
                   "blockTime": {
+                    "description": "Expected block interval in seconds.",
+                    "examples": [
+                      60,
+                    ],
                     "type": "number",
                   },
                   "chainId": {
+                    "description": "Chain id namespace for this network.",
+                    "examples": [
+                      0,
+                    ],
                     "type": "number",
                   },
                   "id": {
+                    "description": "Optional network id. If omitted, OnlyDoge generates a \`net_\` id.",
+                    "examples": [
+                      "net_dogecoin",
+                    ],
                     "type": "string",
                   },
                   "name": {
+                    "description": "Human-readable network name.",
+                    "examples": [
+                      "Dogecoin Mainnet",
+                    ],
                     "type": "string",
                   },
                   "rpcEndpoint": {
+                    "description": "Dogecoin Core JSON-RPC endpoint. Credentials are accepted in the URL but are masked in responses and logs.",
+                    "examples": [
+                      "https://user:pass@doge.example/rpc",
+                    ],
                     "type": "string",
                   },
                   "rps": {
+                    "description": "RPC request-per-second budget for indexing work.",
+                    "examples": [
+                      100,
+                    ],
                     "type": "number",
                   },
                   "zmqBlockEndpoint": {
                     "anyOf": [
                       {
+                        "description": "Optional Dogecoin Core ZMQ block endpoint.",
+                        "examples": [
+                          "tcp://127.0.0.1:28332",
+                        ],
                         "type": "string",
                       },
                       {
@@ -1268,29 +1962,58 @@ exports[`api integration > serves heartbeat and openapi 1`] = `
                 "properties": {
                   "architecture": {
                     "const": "dogecoin",
+                    "description": "Network family. Only Dogecoin is currently supported.",
                     "type": "string",
                   },
                   "blockTime": {
+                    "description": "Expected block interval in seconds.",
+                    "examples": [
+                      60,
+                    ],
                     "type": "number",
                   },
                   "chainId": {
+                    "description": "Chain id namespace for this network.",
+                    "examples": [
+                      0,
+                    ],
                     "type": "number",
                   },
                   "id": {
+                    "description": "Optional network id. If omitted, OnlyDoge generates a \`net_\` id.",
+                    "examples": [
+                      "net_dogecoin",
+                    ],
                     "type": "string",
                   },
                   "name": {
+                    "description": "Human-readable network name.",
+                    "examples": [
+                      "Dogecoin Mainnet",
+                    ],
                     "type": "string",
                   },
                   "rpcEndpoint": {
+                    "description": "Dogecoin Core JSON-RPC endpoint. Credentials are accepted in the URL but are masked in responses and logs.",
+                    "examples": [
+                      "https://user:pass@doge.example/rpc",
+                    ],
                     "type": "string",
                   },
                   "rps": {
+                    "description": "RPC request-per-second budget for indexing work.",
+                    "examples": [
+                      100,
+                    ],
                     "type": "number",
                   },
                   "zmqBlockEndpoint": {
                     "anyOf": [
                       {
+                        "description": "Optional Dogecoin Core ZMQ block endpoint.",
+                        "examples": [
+                          "tcp://127.0.0.1:28332",
+                        ],
                         "type": "string",
                       },
                       {
@@ -1314,29 +2037,58 @@ exports[`api integration > serves heartbeat and openapi 1`] = `
                 "properties": {
                   "architecture": {
                     "const": "dogecoin",
+                    "description": "Network family. Only Dogecoin is currently supported.",
                     "type": "string",
                   },
                   "blockTime": {
+                    "description": "Expected block interval in seconds.",
+                    "examples": [
+                      60,
+                    ],
                     "type": "number",
                   },
                   "chainId": {
+                    "description": "Chain id namespace for this network.",
+                    "examples": [
+                      0,
+                    ],
                     "type": "number",
                   },
                   "id": {
+                    "description": "Optional network id. If omitted, OnlyDoge generates a \`net_\` id.",
+                    "examples": [
+                      "net_dogecoin",
+                    ],
                     "type": "string",
                   },
                   "name": {
+                    "description": "Human-readable network name.",
+                    "examples": [
+                      "Dogecoin Mainnet",
+                    ],
                     "type": "string",
                   },
                   "rpcEndpoint": {
+                    "description": "Dogecoin Core JSON-RPC endpoint. Credentials are accepted in the URL but are masked in responses and logs.",
+                    "examples": [
+                      "https://user:pass@doge.example/rpc",
+                    ],
                     "type": "string",
                   },
                   "rps": {
+                    "description": "RPC request-per-second budget for indexing work.",
+                    "examples": [
+                      100,
+                    ],
                     "type": "number",
                   },
                   "zmqBlockEndpoint": {
                     "anyOf": [
                       {
+                        "description": "Optional Dogecoin Core ZMQ block endpoint.",
+                        "examples": [
+                          "tcp://127.0.0.1:28332",
+                        ],
                         "type": "string",
                       },
                       {
@@ -1363,10 +2115,15 @@ exports[`api integration > serves heartbeat and openapi 1`] = `
             "ApiTokenAuth": [],
           },
         ],
+        "summary": "Create network",
+        "tags": [
+          "Network Catalog",
+        ],
       },
     },
     "/v1/networks/{id}": {
       "get": {
+        "description": "Returns one active network by id.",
         "operationId": "getV1NetworksById",
         "parameters": [
           {
@@ -1374,6 +2131,10 @@ exports[`api integration > serves heartbeat and openapi 1`] = `
             "name": "id",
             "required": true,
             "schema": {
+              "description": "Network id.",
+              "examples": [
+                "net_dogecoin",
+              ],
               "type": "string",
             },
           },
@@ -1383,8 +2144,13 @@ exports[`api integration > serves heartbeat and openapi 1`] = `
             "ApiTokenAuth": [],
           },
         ],
+        "summary": "Get network",
+        "tags": [
+          "Network Catalog",
+        ],
       },
       "put": {
+        "description": "Updates mutable network settings. Updated RPC endpoints are health-checked before saving.",
         "operationId": "putV1NetworksById",
         "parameters": [
           {
@@ -1392,6 +2158,10 @@ exports[`api integration > serves heartbeat and openapi 1`] = `
             "name": "id",
             "required": true,
             "schema": {
+              "description": "Network id.",
+              "examples": [
+                "net_dogecoin",
+              ],
               "type": "string",
             },
           },
@@ -1403,26 +2173,51 @@ exports[`api integration > serves heartbeat and openapi 1`] = `
                 "properties": {
                   "architecture": {
                     "const": "dogecoin",
+                    "description": "Network family. Only Dogecoin is currently supported.",
                     "type": "string",
                   },
                   "blockTime": {
+                    "description": "Expected block interval in seconds.",
+                    "examples": [
+                      60,
+                    ],
                     "type": "number",
                   },
                   "chainId": {
+                    "description": "Chain id namespace for this network.",
+                    "examples": [
+                      0,
+                    ],
                     "type": "number",
                   },
                   "name": {
+                    "description": "Human-readable network name.",
+                    "examples": [
+                      "Dogecoin Mainnet",
+                    ],
                     "type": "string",
                   },
                   "rpcEndpoint": {
+                    "description": "Dogecoin Core JSON-RPC endpoint. Credentials are accepted in the URL but are masked in responses and logs.",
+                    "examples": [
+                      "https://user:pass@doge.example/rpc",
+                    ],
                     "type": "string",
                   },
                   "rps": {
+                    "description": "RPC request-per-second budget for indexing work.",
+                    "examples": [
+                      100,
+                    ],
                     "type": "number",
                   },
                   "zmqBlockEndpoint": {
                     "anyOf": [
                       {
+                        "description": "Optional Dogecoin Core ZMQ block endpoint.",
+                        "examples": [
+                          "tcp://127.0.0.1:28332",
+                        ],
                         "type": "string",
                       },
                       {
@@ -1440,26 +2235,51 @@ exports[`api integration > serves heartbeat and openapi 1`] = `
                 "properties": {
                   "architecture": {
                     "const": "dogecoin",
+                    "description": "Network family. Only Dogecoin is currently supported.",
                     "type": "string",
                   },
                   "blockTime": {
+                    "description": "Expected block interval in seconds.",
+                    "examples": [
+                      60,
+                    ],
                     "type": "number",
                   },
                   "chainId": {
+                    "description": "Chain id namespace for this network.",
+                    "examples": [
+                      0,
+                    ],
                     "type": "number",
                   },
                   "name": {
+                    "description": "Human-readable network name.",
+                    "examples": [
+                      "Dogecoin Mainnet",
+                    ],
                     "type": "string",
                   },
                   "rpcEndpoint": {
+                    "description": "Dogecoin Core JSON-RPC endpoint. Credentials are accepted in the URL but are masked in responses and logs.",
+                    "examples": [
+                      "https://user:pass@doge.example/rpc",
+                    ],
                     "type": "string",
                   },
                   "rps": {
+                    "description": "RPC request-per-second budget for indexing work.",
+                    "examples": [
+                      100,
+                    ],
                     "type": "number",
                   },
                   "zmqBlockEndpoint": {
                     "anyOf": [
                       {
+                        "description": "Optional Dogecoin Core ZMQ block endpoint.",
+                        "examples": [
+                          "tcp://127.0.0.1:28332",
+                        ],
                         "type": "string",
                       },
                       {
@@ -1477,26 +2297,51 @@ exports[`api integration > serves heartbeat and openapi 1`] = `
                 "properties": {
                   "architecture": {
                     "const": "dogecoin",
+                    "description": "Network family. Only Dogecoin is currently supported.",
                     "type": "string",
                   },
                   "blockTime": {
+                    "description": "Expected block interval in seconds.",
+                    "examples": [
+                      60,
+                    ],
                     "type": "number",
                   },
                   "chainId": {
+                    "description": "Chain id namespace for this network.",
+                    "examples": [
+                      0,
+                    ],
                     "type": "number",
                   },
                   "name": {
+                    "description": "Human-readable network name.",
+                    "examples": [
+                      "Dogecoin Mainnet",
+                    ],
                     "type": "string",
                   },
                   "rpcEndpoint": {
+                    "description": "Dogecoin Core JSON-RPC endpoint. Credentials are accepted in the URL but are masked in responses and logs.",
+                    "examples": [
+                      "https://user:pass@doge.example/rpc",
+                    ],
                     "type": "string",
                   },
                   "rps": {
+                    "description": "RPC request-per-second budget for indexing work.",
+                    "examples": [
+                      100,
+                    ],
                     "type": "number",
                   },
                   "zmqBlockEndpoint": {
                     "anyOf": [
                       {
+                        "description": "Optional Dogecoin Core ZMQ block endpoint.",
+                        "examples": [
+                          "tcp://127.0.0.1:28332",
+                        ],
                         "type": "string",
                       },
                       {
@@ -1512,25 +2357,40 @@ exports[`api integration > serves heartbeat and openapi 1`] = `
           },
           "required": true,
         },
+        "responses": {
+          "204": {
+            "description": "Network updated.",
+          },
+        },
         "security": [
           {
             "ApiTokenAuth": [],
           },
         ],
+        "summary": "Update network",
+        "tags": [
+          "Network Catalog",
+        ],
       },
     },
     "/v1/stats/": {
       "get": {
+        "description": "Returns per-network indexing progress, online-tip visibility, stage, and latest error information.",
         "operationId": "getV1Stats",
         "security": [
           {
             "ApiTokenAuth": [],
           },
         ],
+        "summary": "Get indexing stats",
+        "tags": [
+          "Investigation",
+        ],
       },
     },
     "/v1/tags/": {
       "delete": {
+        "description": "Deletes one or more tags by id.",
         "operationId": "deleteV1Tags",
         "requestBody": {
           "content": {
@@ -1538,7 +2398,12 @@ exports[`api integration > serves heartbeat and openapi 1`] = `
               "schema": {
                 "properties": {
                   "tags": {
+                    "description": "Tag ids to delete.",
                     "items": {
+                      "description": "Tag id.",
+                      "examples": [
+                        "tag_sanctions",
+                      ],
                       "type": "string",
                     },
                     "type": "array",
@@ -1554,7 +2419,12 @@ exports[`api integration > serves heartbeat and openapi 1`] = `
               "schema": {
                 "properties": {
                   "tags": {
+                    "description": "Tag ids to delete.",
                     "items": {
+                      "description": "Tag id.",
+                      "examples": [
+                        "tag_sanctions",
+                      ],
                       "type": "string",
                     },
                     "type": "array",
@@ -1570,7 +2440,12 @@ exports[`api integration > serves heartbeat and openapi 1`] = `
               "schema": {
                 "properties": {
                   "tags": {
+                    "description": "Tag ids to delete.",
                     "items": {
+                      "description": "Tag id.",
+                      "examples": [
+                        "tag_sanctions",
+                      ],
                       "type": "string",
                     },
                     "type": "array",
@@ -1585,21 +2460,64 @@ exports[`api integration > serves heartbeat and openapi 1`] = `
           },
           "required": true,
         },
+        "responses": {
+          "204": {
+            "description": "Tags deleted.",
+          },
+        },
         "security": [
           {
             "ApiTokenAuth": [],
           },
+        ],
+        "summary": "Delete tags",
+        "tags": [
+          "Entity Labeling",
         ],
       },
       "get": {
+        "description": "Lists tags with related entities, address labels, and network summaries.",
         "operationId": "getV1Tags",
+        "parameters": [
+          {
+            "in": "query",
+            "name": "offset",
+            "required": false,
+            "schema": {
+              "description": "Zero-based number of records to skip.",
+              "examples": [
+                "0",
+                "25",
+              ],
+              "type": "string",
+            },
+          },
+          {
+            "in": "query",
+            "name": "limit",
+            "required": false,
+            "schema": {
+              "description": "Maximum number of records to return.",
+              "examples": [
+                "25",
+                "100",
+              ],
+              "type": "string",
+            },
+          },
+        ],
         "security": [
           {
             "ApiTokenAuth": [],
           },
         ],
+        "summary": "List tags",
+        "tags": [
+          "Entity Labeling",
+        ],
       },
       "post": {
+        "description": "Creates a reusable risk tag that can be assigned to investigation entities.",
         "operationId": "postV1Tags",
         "requestBody": {
           "content": {
@@ -1607,9 +2525,17 @@ exports[`api integration > serves heartbeat and openapi 1`] = `
               "schema": {
                 "properties": {
                   "id": {
+                    "description": "Optional tag id. If omitted, OnlyDoge generates a \`tag_\` id.",
+                    "examples": [
+                      "tag_sanctions",
+                    ],
                     "type": "string",
                   },
                   "name": {
+                    "description": "Tag display name.",
+                    "examples": [
+                      "Sanctions",
+                    ],
                     "type": "string",
                   },
                   "riskLevel": {
@@ -1631,9 +2557,17 @@ exports[`api integration > serves heartbeat and openapi 1`] = `
               "schema": {
                 "properties": {
                   "id": {
+                    "description": "Optional tag id. If omitted, OnlyDoge generates a \`tag_\` id.",
+                    "examples": [
+                      "tag_sanctions",
+                    ],
                     "type": "string",
                   },
                   "name": {
+                    "description": "Tag display name.",
+                    "examples": [
+                      "Sanctions",
+                    ],
                     "type": "string",
                   },
                   "riskLevel": {
@@ -1655,9 +2589,17 @@ exports[`api integration > serves heartbeat and openapi 1`] = `
               "schema": {
                 "properties": {
                   "id": {
+                    "description": "Optional tag id. If omitted, OnlyDoge generates a \`tag_\` id.",
+                    "examples": [
+                      "tag_sanctions",
+                    ],
                     "type": "string",
                   },
                   "name": {
+                    "description": "Tag display name.",
+                    "examples": [
+                      "Sanctions",
+                    ],
                     "type": "string",
                   },
                   "riskLevel": {
@@ -1683,10 +2625,15 @@ exports[`api integration > serves heartbeat and openapi 1`] = `
             "ApiTokenAuth": [],
           },
         ],
+        "summary": "Create tag",
+        "tags": [
+          "Entity Labeling",
+        ],
       },
     },
     "/v1/tags/{id}": {
       "get": {
+        "description": "Returns one risk tag with related entities, address labels, and network summaries.",
         "operationId": "getV1TagsById",
         "parameters": [
           {
@@ -1694,6 +2641,10 @@ exports[`api integration > serves heartbeat and openapi 1`] = `
             "name": "id",
             "required": true,
             "schema": {
+              "description": "Tag id.",
+              "examples": [
+                "tag_sanctions",
+              ],
               "type": "string",
             },
           },
@@ -1703,8 +2654,13 @@ exports[`api integration > serves heartbeat and openapi 1`] = `
             "ApiTokenAuth": [],
           },
         ],
+        "summary": "Get tag",
+        "tags": [
+          "Entity Labeling",
+        ],
       },
       "put": {
+        "description": "Updates the display name or risk level for a tag.",
         "operationId": "putV1TagsById",
         "parameters": [
           {
@@ -1712,6 +2668,10 @@ exports[`api integration > serves heartbeat and openapi 1`] = `
             "name": "id",
             "required": true,
             "schema": {
+              "description": "Tag id.",
+              "examples": [
+                "tag_sanctions",
+              ],
               "type": "string",
             },
           },
@@ -1722,6 +2682,10 @@ exports[`api integration > serves heartbeat and openapi 1`] = `
               "schema": {
                 "properties": {
                   "name": {
+                    "description": "Tag display name.",
+                    "examples": [
+                      "Sanctions",
+                    ],
                     "type": "string",
                   },
                   "riskLevel": {
@@ -1739,6 +2703,10 @@ exports[`api integration > serves heartbeat and openapi 1`] = `
               "schema": {
                 "properties": {
                   "name": {
+                    "description": "Tag display name.",
+                    "examples": [
+                      "Sanctions",
+                    ],
                     "type": "string",
                   },
                   "riskLevel": {
@@ -1756,6 +2724,10 @@ exports[`api integration > serves heartbeat and openapi 1`] = `
               "schema": {
                 "properties": {
                   "name": {
+                    "description": "Tag display name.",
+                    "examples": [
+                      "Sanctions",
+                    ],
                     "type": "string",
                   },
                   "riskLevel": {
@@ -1772,15 +2744,25 @@ exports[`api integration > serves heartbeat and openapi 1`] = `
           },
           "required": true,
         },
+        "responses": {
+          "204": {
+            "description": "Tag updated.",
+          },
+        },
         "security": [
           {
             "ApiTokenAuth": [],
           },
         ],
+        "summary": "Update tag",
+        "tags": [
+          "Entity Labeling",
+        ],
       },
     },
     "/v1/tokens/": {
       "delete": {
+        "description": "Deletes one or more token metadata records.",
         "operationId": "deleteV1Tokens",
         "requestBody": {
           "content": {
@@ -1788,7 +2770,12 @@ exports[`api integration > serves heartbeat and openapi 1`] = `
               "schema": {
                 "properties": {
                   "tokens": {
+                    "description": "Token ids to delete.",
                     "items": {
+                      "description": "Token id.",
+                      "examples": [
+                        "tok_wrapped_doge",
+                      ],
                       "type": "string",
                     },
                     "type": "array",
@@ -1804,7 +2791,12 @@ exports[`api integration > serves heartbeat and openapi 1`] = `
               "schema": {
                 "properties": {
                   "tokens": {
+                    "description": "Token ids to delete.",
                     "items": {
+                      "description": "Token id.",
+                      "examples": [
+                        "tok_wrapped_doge",
+                      ],
                       "type": "string",
                     },
                     "type": "array",
@@ -1820,7 +2812,12 @@ exports[`api integration > serves heartbeat and openapi 1`] = `
               "schema": {
                 "properties": {
                   "tokens": {
+                    "description": "Token ids to delete.",
                     "items": {
+                      "description": "Token id.",
+                      "examples": [
+                        "tok_wrapped_doge",
+                      ],
                       "type": "string",
                     },
                     "type": "array",
@@ -1835,136 +2832,48 @@ exports[`api integration > serves heartbeat and openapi 1`] = `
           },
           "required": true,
         },
+        "responses": {
+          "204": {
+            "description": "Tokens deleted.",
+          },
+        },
         "security": [
           {
             "ApiTokenAuth": [],
           },
         ],
+        "summary": "Delete tokens",
+        "tags": [
+          "Network Catalog",
+        ],
       },
       "get": {
+        "description": "Lists token metadata with related network summaries.",
         "operationId": "getV1Tokens",
-        "security": [
-          {
-            "ApiTokenAuth": [],
-          },
-        ],
-      },
-      "post": {
-        "operationId": "postV1Tokens",
-        "requestBody": {
-          "content": {
-            "application/json": {
-              "schema": {
-                "properties": {
-                  "address": {
-                    "type": "string",
-                  },
-                  "decimals": {
-                    "type": "number",
-                  },
-                  "id": {
-                    "type": "string",
-                  },
-                  "name": {
-                    "type": "string",
-                  },
-                  "network": {
-                    "type": "string",
-                  },
-                  "symbol": {
-                    "type": "string",
-                  },
-                },
-                "required": [
-                  "network",
-                  "name",
-                  "symbol",
-                  "decimals",
-                ],
-                "type": "object",
-              },
-            },
-            "application/x-www-form-urlencoded": {
-              "schema": {
-                "properties": {
-                  "address": {
-                    "type": "string",
-                  },
-                  "decimals": {
-                    "type": "number",
-                  },
-                  "id": {
-                    "type": "string",
-                  },
-                  "name": {
-                    "type": "string",
-                  },
-                  "network": {
-                    "type": "string",
-                  },
-                  "symbol": {
-                    "type": "string",
-                  },
-                },
-                "required": [
-                  "network",
-                  "name",
-                  "symbol",
-                  "decimals",
-                ],
-                "type": "object",
-              },
-            },
-            "multipart/form-data": {
-              "schema": {
-                "properties": {
-                  "address": {
-                    "type": "string",
-                  },
-                  "decimals": {
-                    "type": "number",
-                  },
-                  "id": {
-                    "type": "string",
-                  },
-                  "name": {
-                    "type": "string",
-                  },
-                  "network": {
-                    "type": "string",
-                  },
-                  "symbol": {
-                    "type": "string",
-                  },
-                },
-                "required": [
-                  "network",
-                  "name",
-                  "symbol",
-                  "decimals",
-                ],
-                "type": "object",
-              },
-            },
-          },
-          "required": true,
-        },
-        "security": [
-          {
-            "ApiTokenAuth": [],
-          },
-        ],
-      },
-    },
-    "/v1/tokens/{id}": {
-      "get": {
-        "operationId": "getV1TokensById",
         "parameters": [
           {
-            "in": "path",
-            "name": "id",
-            "required": true,
+            "in": "query",
+            "name": "offset",
+            "required": false,
             "schema": {
+              "description": "Zero-based number of records to skip.",
+              "examples": [
+                "0",
+                "25",
+              ],
+              "type": "string",
+            },
+          },
+          {
+            "in": "query",
+            "name": "limit",
+            "required": false,
+            "schema": {
+              "description": "Maximum number of records to return.",
+              "examples": [
+                "25",
+                "100",
+              ],
               "type": "string",
             },
           },
@@ -1974,8 +2883,256 @@ exports[`api integration > serves heartbeat and openapi 1`] = `
             "ApiTokenAuth": [],
           },
         ],
+        "summary": "List tokens",
+        "tags": [
+          "Network Catalog",
+        ],
+      },
+      "post": {
+        "description": "Registers token metadata for an existing network.",
+        "operationId": "postV1Tokens",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "properties": {
+                  "address": {
+                    "description": "Token contract or asset address when applicable.",
+                    "examples": [
+                      "DTokenAddress123",
+                    ],
+                    "type": "string",
+                  },
+                  "decimals": {
+                    "description": "Token decimal precision.",
+                    "examples": [
+                      8,
+                    ],
+                    "type": "number",
+                  },
+                  "id": {
+                    "description": "Optional token id. If omitted, OnlyDoge generates a \`tok_\` id.",
+                    "examples": [
+                      "tok_wrapped_doge",
+                    ],
+                    "type": "string",
+                  },
+                  "name": {
+                    "description": "Token display name.",
+                    "examples": [
+                      "Wrapped Dogecoin",
+                    ],
+                    "type": "string",
+                  },
+                  "network": {
+                    "description": "Network id this token belongs to.",
+                    "examples": [
+                      "net_dogecoin",
+                    ],
+                    "type": "string",
+                  },
+                  "symbol": {
+                    "description": "Token ticker or short symbol.",
+                    "examples": [
+                      "WDOGE",
+                    ],
+                    "type": "string",
+                  },
+                },
+                "required": [
+                  "network",
+                  "name",
+                  "symbol",
+                  "decimals",
+                ],
+                "type": "object",
+              },
+            },
+            "application/x-www-form-urlencoded": {
+              "schema": {
+                "properties": {
+                  "address": {
+                    "description": "Token contract or asset address when applicable.",
+                    "examples": [
+                      "DTokenAddress123",
+                    ],
+                    "type": "string",
+                  },
+                  "decimals": {
+                    "description": "Token decimal precision.",
+                    "examples": [
+                      8,
+                    ],
+                    "type": "number",
+                  },
+                  "id": {
+                    "description": "Optional token id. If omitted, OnlyDoge generates a \`tok_\` id.",
+                    "examples": [
+                      "tok_wrapped_doge",
+                    ],
+                    "type": "string",
+                  },
+                  "name": {
+                    "description": "Token display name.",
+                    "examples": [
+                      "Wrapped Dogecoin",
+                    ],
+                    "type": "string",
+                  },
+                  "network": {
+                    "description": "Network id this token belongs to.",
+                    "examples": [
+                      "net_dogecoin",
+                    ],
+                    "type": "string",
+                  },
+                  "symbol": {
+                    "description": "Token ticker or short symbol.",
+                    "examples": [
+                      "WDOGE",
+                    ],
+                    "type": "string",
+                  },
+                },
+                "required": [
+                  "network",
+                  "name",
+                  "symbol",
+                  "decimals",
+                ],
+                "type": "object",
+              },
+            },
+            "multipart/form-data": {
+              "schema": {
+                "properties": {
+                  "address": {
+                    "description": "Token contract or asset address when applicable.",
+                    "examples": [
+                      "DTokenAddress123",
+                    ],
+                    "type": "string",
+                  },
+                  "decimals": {
+                    "description": "Token decimal precision.",
+                    "examples": [
+                      8,
+                    ],
+                    "type": "number",
+                  },
+                  "id": {
+                    "description": "Optional token id. If omitted, OnlyDoge generates a \`tok_\` id.",
+                    "examples": [
+                      "tok_wrapped_doge",
+                    ],
+                    "type": "string",
+                  },
+                  "name": {
+                    "description": "Token display name.",
+                    "examples": [
+                      "Wrapped Dogecoin",
+                    ],
+                    "type": "string",
+                  },
+                  "network": {
+                    "description": "Network id this token belongs to.",
+                    "examples": [
+                      "net_dogecoin",
+                    ],
+                    "type": "string",
+                  },
+                  "symbol": {
+                    "description": "Token ticker or short symbol.",
+                    "examples": [
+                      "WDOGE",
+                    ],
+                    "type": "string",
+                  },
+                },
+                "required": [
+                  "network",
+                  "name",
+                  "symbol",
+                  "decimals",
+                ],
+                "type": "object",
+              },
+            },
+          },
+          "required": true,
+        },
+        "security": [
+          {
+            "ApiTokenAuth": [],
+          },
+        ],
+        "summary": "Create token",
+        "tags": [
+          "Network Catalog",
+        ],
+      },
+    },
+    "/v1/tokens/{id}": {
+      "get": {
+        "description": "Returns token metadata and its related network summary.",
+        "operationId": "getV1TokensById",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "description": "Token id.",
+              "examples": [
+                "tok_wrapped_doge",
+              ],
+              "type": "string",
+            },
+          },
+        ],
+        "security": [
+          {
+            "ApiTokenAuth": [],
+          },
+        ],
+        "summary": "Get token",
+        "tags": [
+          "Network Catalog",
+        ],
       },
     },
   },
+  "servers": [
+    {
+      "description": "Current API origin",
+      "url": "/",
+    },
+  ],
+  "tags": [
+    {
+      "description": "Bootstrap, inspect, rotate, deactivate, and delete API keys.",
+      "name": "Access Control",
+    },
+    {
+      "description": "Configure indexed Dogecoin networks and their token metadata.",
+      "name": "Network Catalog",
+    },
+    {
+      "description": "Maintain entities, labels, tagged addresses, and risk tags.",
+      "name": "Entity Labeling",
+    },
+    {
+      "description": "Read indexed Dogecoin blocks, transactions, addresses, UTXOs, and search results.",
+      "name": "Explorer",
+    },
+    {
+      "description": "Run address/entity lookups and inspect indexer health signals.",
+      "name": "Investigation",
+    },
+    {
+      "description": "Public runtime health checks.",
+      "name": "Health",
+    },
+  ],
 }
 `;

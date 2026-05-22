@@ -166,6 +166,47 @@ Managed deployment settings:
 
 In production, startup fails fast if database config, `ONLYDOGE_STORAGE`, or `ONLYDOGE_WAREHOUSE` are missing. Production will not silently fall back to local SQLite, file storage, or DuckDB.
 
+The default ClickHouse profile is tuned for stability over peak throughput.
+
+- Address-heavy explorer reads use address-oriented read tables instead of scanning write-optimized facts directly.
+- Current-state UTXO lookups avoid `FINAL` and use bounded `LIMIT 1 BY output_key` reads.
+- The ClickHouse server memory ratio is capped below total RAM to leave headroom for merges, the page cache, and the OS.
+- Default query and insert thread counts are capped to reduce memory spikes.
+- External sort and group-by thresholds spill earlier instead of holding large intermediates in RAM.
+
+The app boots ClickHouse with runtime-safe warehouse migrations. Existing deployments automatically create and backfill the address-oriented read tables on startup before serving explorer traffic.
+
+## Local Docker Workflow
+
+The local setup intentionally favors developer feedback over immutability.
+
+- The source tree is bind-mounted into the app container.
+- The app runs with `bun run --watch`.
+- Infrastructure is persisted in Docker volumes.
+- A MinIO bootstrap job creates the S3 bucket automatically.
+- ClickHouse is initialized with the Dogecoin warehouse schema, including the address-oriented explorer read models.
+- `/v1/heartbeat` stays open.
+- `POST /v1/keys` stays open only until the first API key is created.
+- Every other `/v1` route requires `x-api-token`.
+
+If you change dependency manifests, restart the local app container or rerun `bun run docker:local:up`.
+If you change ClickHouse credentials, run `bun run docker:local:reset` before bringing the stack up again so the ClickHouse volume is recreated with the new user setup.
+
+The local and bundled production Compose stacks mount the checked-in ClickHouse schema and memory tuning files:
+
+- `docker/clickhouse/init/001_schema.sql`
+- `docker/clickhouse/config.d/onlydoge-memory.xml`
+- `docker/clickhouse/users.d/onlydoge-memory.xml`
+
+The repository also includes ClickHouse host log-retention files for self-hosted ClickHouse operations:
+
+- `docker/clickhouse/config.d/onlydoge-log-retention.xml`
+- `docker/clickhouse/logrotate.d/clickhouse-server`
+- `docker/clickhouse/logrotate.d/rsyslog`
+- `docker/clickhouse/journald.conf.d/onlydoge-retention.conf`
+
+Those files codify the current memory and 3-day log-retention profile used for heavy Dogecoin backfills. The retention files are installed on the ClickHouse host with the commands in the production runbook; they are not mounted by `docker-compose.local.yml` or `docker-compose.prod.yml`.
+
 ## Dogecoin Runsheet
 
 Use the runsheet helper to create the first API key if needed, register Dogecoin, and verify stats:
@@ -200,7 +241,7 @@ The preferred production shape is Docker Compose with separate API and indexer c
 - PostgreSQL
 - S3-compatible raw block storage
 - ClickHouse
-- reverse proxy such as Caddy, Nginx, Traefik, or a cloud load balancer
+- Reverse proxy such as Caddy, Nginx, Traefik, or a cloud load balancer
 
 Self-hosted production-style stack:
 
@@ -253,6 +294,10 @@ Initialize the Buildx builder only:
 bun run image:builder:init
 ```
 
+The image push script uses a `docker-container` Buildx builder named `onlydoge-multiarch`, which avoids the multi-platform limitation of the default Docker driver on tools like OrbStack. You still need to be authenticated to `ghcr.io` before pushing.
+
+The production image defaults to `--mode=both` for compatibility, but production should run split API and indexer containers. The API container owns public HTTP health; the indexer container owns indexing progress and can restart independently.
+
 ## Rebuild And Benchmarks
 
 Benchmark the ClickHouse core backfill:
@@ -295,6 +340,12 @@ Current `/v1` route groups:
 - `/v1/addresses`
 - `/v1/tokens`
 - `/v1/tags`
+
+Error payload shape:
+
+```json
+{"error":"..."}
+```
 
 Explorer endpoints:
 
@@ -345,7 +396,7 @@ bun run test
 bun run ci
 ```
 
-GitHub Actions:
+GitHub Actions mirrors these gates:
 
 - `CI`: lint, typecheck, Vitest, and production Docker build.
 - `Security`: CodeQL, dependency review, secret scanning, and image vulnerability scanning.
@@ -354,9 +405,10 @@ GitHub Actions:
 
 ## Notes For Operators
 
-- Keep passwords URL-safe if you inject them directly into `ONLYDOGE_DATABASE`.
+- Keep passwords URL-safe if you inject them directly into `ONLYDOGE_DATABASE`. If you need special characters, URL-encode them.
 - The current ClickHouse schema supports Dogecoin current-state reads and core-backed history without a separate full transfer graph.
 - The local and production Compose stacks assume the warehouse database name is `onlydoge`.
 - Raw block storage is written to S3-compatible object storage in Dockerized environments.
-- The checked-in ClickHouse memory profile assumes a warehouse node in roughly the `16 GB RAM` class.
+- The checked-in ClickHouse memory profile assumes a warehouse node in roughly the `16 GB RAM` class. If you run a materially smaller box, lower the profile values before deployment.
 - ClickHouse log-retention files cap system logs, host syslog, ClickHouse file logs, and journald at 3 days.
+- The current checked-in indexer defaults are intentionally conservative for production backfill: `ONLYDOGE_CORE_BLOCK_TIMEOUT_MS=120000`, `ONLYDOGE_CORE_DB_STATEMENT_TIMEOUT_MS=30000`, `ONLYDOGE_CORE_SYNC_COMPLETE_DISTANCE=6`, `ONLYDOGE_CORE_PROCESS_LOAD_CONCURRENCY=8`, `ONLYDOGE_CORE_PROCESS_WINDOW=100`, `ONLYDOGE_CORE_PROGRESS_WATCHDOG_MS=180000`, `ONLYDOGE_CORE_RAW_STORAGE_TIMEOUT_MS=30000`, `ONLYDOGE_CORE_ONLINE_TIP_DISTANCE=6`, `ONLYDOGE_INDEXER_SYNC_WINDOW=32`, `ONLYDOGE_INDEXER_SYNC_CONCURRENCY=4`, and `ONLYDOGE_WAREHOUSE_REQUEST_TIMEOUT_MS=30000`.
