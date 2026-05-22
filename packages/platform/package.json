@@ -4,6 +4,7 @@
   "type": "module",
   "exports": "./src/index.ts",
   "dependencies": {
+    "@libsql/client": "^0.17.3",
     "@onlydoge/access-control": "workspace:*",
     "@onlydoge/entity-labeling": "workspace:*",
     "@onlydoge/explorer-query": "workspace:*",
@@ -11,9 +12,8 @@
     "@onlydoge/investigation-query": "workspace:*",
     "@onlydoge/network-catalog": "workspace:*",
     "@onlydoge/shared-kernel": "workspace:*",
-    "@libsql/client": "0.17.2",
     "drizzle-orm": "0.45.2",
-    "mysql2": "3.20.0",
-    "pg": "8.20.0"
+    "mysql2": "^3.22.3",
+    "pg": "^8.21.0"
   }
 }
