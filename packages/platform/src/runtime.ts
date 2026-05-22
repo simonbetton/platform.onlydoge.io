@@ -1,10 +1,7 @@
 import { AccessControlService } from '@onlydoge/access-control';
 import { EntityLabelingService } from '@onlydoge/entity-labeling';
 import { ExplorerQueryService } from '@onlydoge/explorer-query';
-import {
-  CoreDogecoinIndexerService,
-  type IndexingPipelineService,
-} from '@onlydoge/indexing-pipeline';
+import { CoreDogecoinIndexerService } from '@onlydoge/indexing-pipeline';
 import { InvestigationQueryService } from '@onlydoge/investigation-query';
 import { NetworkCatalogService } from '@onlydoge/network-catalog';
 
@@ -26,7 +23,7 @@ export interface Runtime {
   accessControl: AccessControlService;
   entityLabeling: EntityLabelingService;
   explorerQuery: ExplorerQueryService;
-  indexingPipeline: Pick<IndexingPipelineService, 'runOnce' | 'start'>;
+  indexingPipeline: Pick<CoreDogecoinIndexerService, 'runOnce' | 'start'>;
   investigationQuery: InvestigationQueryService;
   metadata: RelationalMetadataStore;
   networkCatalog: NetworkCatalogService;

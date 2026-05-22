@@ -3,6 +3,7 @@ import { join } from 'node:path';
 
 import {
   CoreDogecoinIndexerService,
+  type CoreDogecoinIndexerSettings,
   type CoreIndexerState,
   configKeyDogecoinCurrentStateReady,
   configKeyDogecoinHistoryReady,
@@ -10,7 +11,6 @@ import {
   configKeyIndexerProcessTail,
   configKeyIndexerStage,
   configKeyIndexerSyncTail,
-  type IndexingPipelineSettings,
 } from '@onlydoge/indexing-pipeline';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
@@ -509,10 +509,9 @@ async function runOnceAndGetDogecoinNetworkId(
 }
 
 function testIndexerSettings(
-  overrides: Partial<IndexingPipelineSettings> = {},
-): IndexingPipelineSettings {
+  overrides: Partial<CoreDogecoinIndexerSettings> = {},
+): CoreDogecoinIndexerSettings {
   return {
-    bootstrapTimeoutMs: 60_000,
     coreBlockTimeoutMs: 120_000,
     coreDbStatementTimeoutMs: 30_000,
     coreOnlineTipDistance: 6,
@@ -521,31 +520,8 @@ function testIndexerSettings(
     coreProgressWatchdogMs: 180_000,
     coreRawStorageTimeoutMs: 30_000,
     coreSyncCompleteDistance: 6,
-    dogecoinTransferMaxEdges: 1024,
-    dogecoinTransferMaxInputAddresses: 64,
-    factTimeoutMs: 300_000,
-    factWindow: 64,
-    leaseHeartbeatIntervalMs: 5_000,
-    networkConcurrency: 2,
-    projectTargetMs: 30_000,
-    projectTimeoutMs: 120_000,
-    projectWindow: 4,
-    projectWindowMax: 16,
-    projectWindowMin: 2,
-    relinkBacklogThreshold: 256,
-    relinkBatchSize: 16,
-    relinkConcurrency: 2,
-    relinkFrontierBatch: 32,
-    relinkTipDistance: 512,
-    relinkTimeoutMs: 120_000,
-    syncBacklogHighWatermark: 2048,
-    syncBacklogLowWatermark: 512,
     syncConcurrency: 4,
-    syncTargetMs: 15_000,
-    syncTimeoutMs: 120_000,
     syncWindow: 32,
-    syncWindowMax: 256,
-    syncWindowMin: 32,
     ...overrides,
   };
 }

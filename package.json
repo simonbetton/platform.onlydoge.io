@@ -37,18 +37,17 @@
     "docker:prod:logs": "docker compose --env-file .env.production -f docker-compose.prod.yml logs -f",
     "image:builder:init": "sh ./scripts/push-image.sh --init-only",
     "image:push": "sh ./scripts/push-image.sh",
-    "deploy:docker": "bun run scripts/deploy-docker.ts",
-    "deploy:once": "bun run scripts/deploy-once.ts"
+    "deploy:docker": "bun run scripts/deploy-docker.ts"
   },
   "dependencies": {
-    "@aws-sdk/client-s3": "3.1015.0",
+    "@aws-sdk/client-s3": "3.1050.0",
     "@clickhouse/client": "1.18.2",
-    "@elysiajs/openapi": "1.4.14",
+    "@elysiajs/openapi": "1.4.15",
     "@libsql/client": "0.17.2",
     "commander": "14.0.3",
     "dotenv": "17.3.1",
-    "drizzle-orm": "0.45.1",
-    "elysia": "1.4.14",
+    "drizzle-orm": "0.45.2",
+    "elysia": "1.4.28",
     "mysql2": "3.20.0",
     "pg": "8.20.0",
     "pino": "10.3.1"

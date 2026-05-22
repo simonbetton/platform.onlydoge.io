@@ -25,8 +25,8 @@ Minimum managed deployment settings:
 
 - `ONLYDOGE_IMAGE`
 - `ONLYDOGE_PUBLIC_HOST`
-- `ONCE_SSH_TARGET`
-- `ONCE_SSH_JUMP`, if the host is reachable only through a bastion
+- `ONLYDOGE_SSH_TARGET`
+- `ONLYDOGE_SSH_JUMP`, if the host is reachable only through a bastion
 - `ONLYDOGE_DATABASE`
 - `ONLYDOGE_STORAGE`
 - `ONLYDOGE_S3_ACCESS_KEY_ID`

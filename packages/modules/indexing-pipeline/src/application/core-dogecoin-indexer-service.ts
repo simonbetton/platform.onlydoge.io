@@ -34,7 +34,7 @@ import type {
   ProjectionUtxoOutput,
 } from '../domain/projection-models';
 import { mapWithConcurrency, range } from './concurrency';
-import type { IndexingPipelineSettings } from './indexing-pipeline-service';
+import type { CoreDogecoinIndexerSettings } from './core-dogecoin-indexer-settings';
 
 interface PrimaryLease {
   heartbeatAt: string;
@@ -114,7 +114,7 @@ export class CoreDogecoinIndexerService {
     private readonly rawBlocks: RawBlockStoragePort,
     private readonly rpc: BlockchainRpcPort,
     private readonly stateStore: CoreDogecoinStateStorePort,
-    private readonly settings: IndexingPipelineSettings,
+    private readonly settings: CoreDogecoinIndexerSettings,
     private readonly options: CoreDogecoinIndexerServiceOptions = {},
   ) {}
 
@@ -192,9 +192,9 @@ export class CoreDogecoinIndexerService {
       return current;
     }
 
-    const legacySyncTail =
+    const storedSyncTail =
       (await this.configs.getJsonValue<number>(configKeyIndexerSyncTail(network.networkId))) ?? -1;
-    const syncTail = Math.min(legacySyncTail, latest);
+    const syncTail = Math.min(storedSyncTail, latest);
     const state = await this.stateStore.upsertCoreIndexerState({
       networkId: network.networkId,
       stage: 'sync_backfill',
