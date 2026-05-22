@@ -1,0 +1,5 @@
+# Placeholder credentials in checked-in agent documentation examples.
+43f82f7f992cfbb0261a1655a5ef27eccf962aec:.agents/skills/clickhouse-best-practices/rules/agent-connect-mcp.md:curl-auth-header:86
+43f82f7f992cfbb0261a1655a5ef27eccf962aec:.agents/skills/clickhouse-best-practices/AGENTS.md:curl-auth-header:1754
+48eb051c875bcaa5923d0e8c501829ae8a847869:.agents/skills/clickhouse-best-practices/rules/agent-connect-mcp.md:curl-auth-header:86
+48eb051c875bcaa5923d0e8c501829ae8a847869:.agents/skills/clickhouse-best-practices/AGENTS.md:curl-auth-header:1754

@@ -1,0 +1,11 @@
+{
+  "name": "@onlydoge/network-catalog",
+  "private": true,
+  "type": "module",
+  "exports": "./src/index.ts",
+  "dependencies": {
+    "@onlydoge/access-control": "workspace:*",
+    "@onlydoge/shared-kernel": "workspace:*",
+    "elysia": "1.4.28"
+  }
+}

@@ -1,0 +1,50 @@
+services:
+  caddy:
+    image: caddy:2-alpine
+    restart: unless-stopped
+    depends_on:
+      onlydoge-api:
+        condition: service_healthy
+    ports:
+      - '80:80'
+      - '443:443'
+    volumes:
+      - ./docker/caddy/Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+
+  onlydoge-api:
+    image: ${ONLYDOGE_IMAGE}
+    restart: unless-stopped
+    command: ['--mode=http', '--ip=0.0.0.0', '--port=2277']
+    env_file:
+      - ${ONLYDOGE_CONTAINER_ENV_FILE:-.env}
+    healthcheck:
+      test:
+        [
+          'CMD',
+          'bun',
+          '-e',
+          "const response = await fetch('http://127.0.0.1:2277/v1/heartbeat'); if (response.status !== 204) process.exit(1);",
+        ]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 15s
+
+  onlydoge-indexer:
+    image: ${ONLYDOGE_IMAGE}
+    restart: unless-stopped
+    command: ['--mode=indexer']
+    env_file:
+      - ${ONLYDOGE_CONTAINER_ENV_FILE:-.env}
+    healthcheck:
+      test: ['CMD', 'bun', 'run', 'scripts/indexer-health.ts']
+      interval: 30s
+      timeout: 15s
+      retries: 3
+      start_period: 60s
+
+volumes:
+  caddy_data:
+  caddy_config:

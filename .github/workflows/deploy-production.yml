@@ -1,0 +1,116 @@
+name: Deploy Production
+
+on:
+  workflow_dispatch:
+    inputs:
+      image:
+        description: 'Image tag or digest to deploy. Defaults to the repository latest image.'
+        required: false
+        type: string
+      skip_e2e:
+        default: false
+        description: 'Deploy without running the production E2E teardown suite.'
+        required: false
+        type: boolean
+
+permissions:
+  contents: read
+  packages: read
+
+concurrency:
+  group: production
+  cancel-in-progress: false
+
+env:
+  BUN_VERSION: 1.3.6
+
+jobs:
+  deploy:
+    name: Production Deploy
+    runs-on: ubuntu-latest
+    environment:
+      name: production
+      url: ${{ vars.PROD_BASE_URL }}
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v6
+
+      - name: Set up Bun
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: ${{ env.BUN_VERSION }}
+
+      - name: Install dependencies
+        run: bun install --frozen-lockfile
+
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: Resolve deployment image
+        id: image
+        env:
+          INPUT_IMAGE: ${{ inputs.image }}
+        run: |
+          set -euo pipefail
+          image="${INPUT_IMAGE:-ghcr.io/${{ github.repository_owner }}/onlydoge-indexer:latest}"
+          if [[ "$image" == *@sha256:* ]]; then
+            digest="${image##*@}"
+          else
+            digest="$(docker buildx imagetools inspect "$image" | awk '/^Digest:/ {print $2; exit}')"
+          fi
+          if [[ -z "$digest" ]]; then
+            echo "Could not resolve image digest for $image" >&2
+            exit 1
+          fi
+          echo "image=$image" >> "$GITHUB_OUTPUT"
+          echo "digest=$digest" >> "$GITHUB_OUTPUT"
+
+      - name: Configure SSH
+        env:
+          PROD_SSH_PRIVATE_KEY: ${{ secrets.PROD_SSH_PRIVATE_KEY }}
+        run: |
+          set -euo pipefail
+          install -m 700 -d ~/.ssh
+          printf '%s\n' "$PROD_SSH_PRIVATE_KEY" > ~/.ssh/id_ed25519
+          chmod 600 ~/.ssh/id_ed25519
+
+      - name: Write production env file
+        env:
+          PROD_ENV_FILE: ${{ secrets.PROD_ENV_FILE }}
+        run: |
+          set -euo pipefail
+          printf '%s\n' "$PROD_ENV_FILE" > .env.managed
+          chmod 600 .env.managed
+
+      - name: Deploy production image
+        env:
+          PROD_BASE_URL: ${{ vars.PROD_BASE_URL }}
+          PROD_HOST: ${{ vars.PROD_HOST }}
+          PROD_SSH_JUMP: ${{ secrets.PROD_SSH_JUMP }}
+          PROD_SSH_TARGET: ${{ secrets.PROD_SSH_TARGET }}
+        run: |
+          set -euo pipefail
+          host="$PROD_HOST"
+          if [[ -z "$host" ]]; then
+            host="$(bun -e 'console.log(new URL(process.env.PROD_BASE_URL).host)')"
+          fi
+          args=(
+            --envFile .env.managed
+            --host "$host"
+            --image "${{ steps.image.outputs.image }}"
+            --sshTarget "$PROD_SSH_TARGET"
+          )
+          if [[ -n "$PROD_SSH_JUMP" ]]; then
+            args+=(--sshJump "$PROD_SSH_JUMP")
+          fi
+          bun run deploy:docker -- "${args[@]}"
+
+      - name: Run production E2E
+        if: ${{ !inputs.skip_e2e }}
+        env:
+          EXPECTED_IMAGE_DIGEST: ${{ steps.image.outputs.digest }}
+          PROD_ADMIN_API_TOKEN: ${{ secrets.PROD_ADMIN_API_TOKEN }}
+          PROD_BASE_URL: ${{ vars.PROD_BASE_URL }}
+          PROD_SSH_JUMP: ${{ secrets.PROD_SSH_JUMP }}
+          PROD_SSH_TARGET: ${{ secrets.PROD_SSH_TARGET }}
+        run: bun run e2e:production

@@ -1,0 +1,59 @@
+<clickhouse>
+  <query_log>
+    <ttl>event_date + INTERVAL 3 DAY DELETE</ttl>
+  </query_log>
+  <trace_log>
+    <ttl>event_date + INTERVAL 3 DAY DELETE</ttl>
+  </trace_log>
+  <query_thread_log>
+    <ttl>event_date + INTERVAL 3 DAY DELETE</ttl>
+  </query_thread_log>
+  <query_views_log>
+    <ttl>event_date + INTERVAL 3 DAY DELETE</ttl>
+  </query_views_log>
+  <part_log>
+    <ttl>event_date + INTERVAL 3 DAY DELETE</ttl>
+  </part_log>
+  <background_schedule_pool_log>
+    <ttl>event_date + INTERVAL 3 DAY DELETE</ttl>
+  </background_schedule_pool_log>
+  <text_log>
+    <ttl>event_date + INTERVAL 3 DAY DELETE</ttl>
+  </text_log>
+  <metric_log>
+    <ttl>event_date + INTERVAL 3 DAY DELETE</ttl>
+  </metric_log>
+  <error_log>
+    <ttl>event_date + INTERVAL 3 DAY DELETE</ttl>
+  </error_log>
+  <instrumentation_trace_log>
+    <ttl>event_date + INTERVAL 3 DAY DELETE</ttl>
+  </instrumentation_trace_log>
+  <query_metric_log>
+    <ttl>event_date + INTERVAL 3 DAY DELETE</ttl>
+  </query_metric_log>
+  <asynchronous_metric_log>
+    <ttl>event_date + INTERVAL 3 DAY DELETE</ttl>
+  </asynchronous_metric_log>
+  <asynchronous_insert_log>
+    <ttl>event_date + INTERVAL 3 DAY DELETE</ttl>
+  </asynchronous_insert_log>
+  <processors_profile_log>
+    <ttl>event_date + INTERVAL 3 DAY DELETE</ttl>
+  </processors_profile_log>
+  <backup_log>
+    <ttl>event_date + INTERVAL 3 DAY DELETE</ttl>
+  </backup_log>
+  <s3queue_log>
+    <ttl>event_date + INTERVAL 3 DAY DELETE</ttl>
+  </s3queue_log>
+  <blob_storage_log>
+    <ttl>event_date + INTERVAL 3 DAY DELETE</ttl>
+  </blob_storage_log>
+  <aggregated_zookeeper_log>
+    <ttl>event_date + INTERVAL 3 DAY DELETE</ttl>
+  </aggregated_zookeeper_log>
+  <zookeeper_connection_log>
+    <ttl>event_date + INTERVAL 3 DAY DELETE</ttl>
+  </zookeeper_connection_log>
+</clickhouse>

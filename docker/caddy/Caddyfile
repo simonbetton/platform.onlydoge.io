@@ -1,0 +1,3 @@
+platform.onlydoge.io {
+	reverse_proxy onlydoge-api:2277
+}

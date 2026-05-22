@@ -1,0 +1,149 @@
+{
+  "version": 1,
+  "skills": {
+    "caveman": {
+      "source": "mattpocock/skills",
+      "sourceType": "github",
+      "skillPath": "skills/productivity/caveman/SKILL.md",
+      "computedHash": "934433479903febc585bf6deb5f0cebc63137e3f86b7babe0aab1ecb94d6d7a4"
+    },
+    "chdb-datastore": {
+      "source": "clickhouse/agent-skills",
+      "sourceType": "github",
+      "skillPath": "skills/chdb-datastore/SKILL.md",
+      "computedHash": "1d08ca756983b607ff97d1342089e301c98fd7d94ffc9786e89cedb6ca3a1217"
+    },
+    "chdb-sql": {
+      "source": "clickhouse/agent-skills",
+      "sourceType": "github",
+      "skillPath": "skills/chdb-sql/SKILL.md",
+      "computedHash": "6377a15564a7ec4fc4ded081728bf1be3eac6e5b72a5a07ce5cb21e7595ff02d"
+    },
+    "clickhouse-architecture-advisor": {
+      "source": "clickhouse/agent-skills",
+      "sourceType": "github",
+      "skillPath": "skills/clickhouse-architecture-advisor/SKILL.md",
+      "computedHash": "5cecc53a1aa47ff41f84b7f984c1242d70af09b8bbce4f52d423dd5a06f5ae0b"
+    },
+    "clickhouse-best-practices": {
+      "source": "clickhouse/agent-skills",
+      "sourceType": "github",
+      "skillPath": "skills/clickhouse-best-practices/SKILL.md",
+      "computedHash": "4523a31bd5911ec70b68533d7d15bc445bca2e77b1bd6f649d5a36d52bdcc099"
+    },
+    "clickhouse-js-node-coding": {
+      "source": "clickhouse/agent-skills",
+      "sourceType": "github",
+      "skillPath": "skills/clickhouse-js-node-coding/SKILL.md",
+      "computedHash": "8e87bf6ce52d48d605897edf17e6cca377cd9f6c55c1624e210be0ae0a80e103"
+    },
+    "clickhouse-js-node-troubleshooting": {
+      "source": "clickhouse/agent-skills",
+      "sourceType": "github",
+      "skillPath": "skills/clickhouse-js-node-troubleshooting/SKILL.md",
+      "computedHash": "18dcebb208d257ccf5cfaabaee0b115583193362f77b554945cf686592417bcb"
+    },
+    "clickhousectl-local-dev": {
+      "source": "clickhouse/agent-skills",
+      "sourceType": "github",
+      "skillPath": "skills/clickhousectl-local-dev/SKILL.md",
+      "computedHash": "a6f5a83166eabe0888ecf04dacac4ed5c422a08b3f2cc2c0e143cc9c7d29321b"
+    },
+    "diagnose": {
+      "source": "mattpocock/skills",
+      "sourceType": "github",
+      "skillPath": "skills/engineering/diagnose/SKILL.md",
+      "computedHash": "15939a26f86edec2d4862042b8564e5a062cb81d04e047a0cea6305c8830b5f5"
+    },
+    "elysiajs": {
+      "source": "elysiajs/skills",
+      "sourceType": "github",
+      "skillPath": "elysia/SKILL.md",
+      "computedHash": "55268e69a2c766ed67e56a0db57544f60cc52dba0c7f024a974baf965e525e1b"
+    },
+    "fallow": {
+      "source": "fallow-rs/fallow-skills",
+      "sourceType": "github",
+      "skillPath": "fallow/skills/fallow/SKILL.md",
+      "computedHash": "30aacc4b41b2b86ccb013c0f17c2a7f743847e946958d620e68e4c84a9920c2c"
+    },
+    "grill-me": {
+      "source": "mattpocock/skills",
+      "sourceType": "github",
+      "skillPath": "skills/productivity/grill-me/SKILL.md",
+      "computedHash": "784f0dbb7403b0f00324bce9a112f715342777a0daee7bbb7385f9c6f0a170ea"
+    },
+    "grill-with-docs": {
+      "source": "mattpocock/skills",
+      "sourceType": "github",
+      "skillPath": "skills/engineering/grill-with-docs/SKILL.md",
+      "computedHash": "a5c65e76275008b469962f7bee8b34866f1c9b0709f4886e71c8e731735640e4"
+    },
+    "handoff": {
+      "source": "mattpocock/skills",
+      "sourceType": "github",
+      "skillPath": "skills/productivity/handoff/SKILL.md",
+      "computedHash": "1a78d774f8a59db5daa6e65e20a6596872fa8cde769f9a6e3a09b678dd5ae8cc"
+    },
+    "improve-codebase-architecture": {
+      "source": "mattpocock/skills",
+      "sourceType": "github",
+      "skillPath": "skills/engineering/improve-codebase-architecture/SKILL.md",
+      "computedHash": "ef32aea0a8fab9b365ff9e08a95f8d353e20ca21ea46ec2e73587c86dd341351"
+    },
+    "prototype": {
+      "source": "mattpocock/skills",
+      "sourceType": "github",
+      "skillPath": "skills/engineering/prototype/SKILL.md",
+      "computedHash": "e4d0c8f8cb3fc096ee99405a15491da466545cf4a3694bee5a0c9db2fa621a43"
+    },
+    "setup-matt-pocock-skills": {
+      "source": "mattpocock/skills",
+      "sourceType": "github",
+      "skillPath": "skills/engineering/setup-matt-pocock-skills/SKILL.md",
+      "computedHash": "0164a8b1ef998abca426056c6ed8a7716a9d4692fc6daa5378f68381a6dafd24"
+    },
+    "tdd": {
+      "source": "mattpocock/skills",
+      "sourceType": "github",
+      "skillPath": "skills/engineering/tdd/SKILL.md",
+      "computedHash": "15a7b5e36383ebadb2dec5e586679e55e9663d292da418926b8da6fc0ef27d84"
+    },
+    "to-issues": {
+      "source": "mattpocock/skills",
+      "sourceType": "github",
+      "skillPath": "skills/engineering/to-issues/SKILL.md",
+      "computedHash": "47f648f3414848ccfc62cb41d2828b7e575fb5e7cbd6c4bdf630c063b5dc5e82"
+    },
+    "to-prd": {
+      "source": "mattpocock/skills",
+      "sourceType": "github",
+      "skillPath": "skills/engineering/to-prd/SKILL.md",
+      "computedHash": "6d741474efd4bc3db55fabc2722ed78ca9c374cabcb6212936d79d4fd4a30fcb"
+    },
+    "triage": {
+      "source": "mattpocock/skills",
+      "sourceType": "github",
+      "skillPath": "skills/engineering/triage/SKILL.md",
+      "computedHash": "2b6efb6da12d92551772fcc04acf331f4e0e6f7bd9d4cb23ce0b301e0b128feb"
+    },
+    "turborepo": {
+      "source": "vercel/turborepo",
+      "sourceType": "github",
+      "skillPath": "skills/turborepo/SKILL.md",
+      "computedHash": "6a23ee82918e35f8848b6fc2ccbea699d740a30fee65f288201adb4e98bf3827"
+    },
+    "write-a-skill": {
+      "source": "mattpocock/skills",
+      "sourceType": "github",
+      "skillPath": "skills/productivity/write-a-skill/SKILL.md",
+      "computedHash": "b44d8aab2ead83c716e01af4c9a24ccc4575ce70ad58ec4f1749fb88c9cc82ba"
+    },
+    "zoom-out": {
+      "source": "mattpocock/skills",
+      "sourceType": "github",
+      "skillPath": "skills/engineering/zoom-out/SKILL.md",
+      "computedHash": "8357aeaece3b709c442eab67e64b86844e05e2f1ea95b109565eba50b6def36e"
+    }
+  }
+}
