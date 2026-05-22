@@ -1,0 +1,22 @@
+# Extend the default gitleaks rules. Global [[allowlists]] are not applied when
+# useDefault = true in gitleaks 8.24.x; allowlist per rule instead.
+[extend]
+useDefault = true
+
+[[rules]]
+id = "curl-auth-header"
+
+[[rules.allowlists]]
+description = "Agent skill documentation with placeholder curl credential examples"
+paths = [
+  '''\.agents/skills/''',
+]
+
+[[rules]]
+id = "curl-auth-user"
+
+[[rules.allowlists]]
+description = "Agent skill documentation with placeholder curl credential examples"
+paths = [
+  '''\.agents/skills/''',
+]

@@ -1,0 +1,12 @@
+{
+  "name": "@onlydoge/onlydoge",
+  "private": true,
+  "type": "module",
+  "exports": "./src/index.ts",
+  "dependencies": {
+    "@onlydoge/api": "workspace:*",
+    "@onlydoge/indexer-app": "workspace:*",
+    "@onlydoge/platform": "workspace:*",
+    "commander": "14.0.3"
+  }
+}

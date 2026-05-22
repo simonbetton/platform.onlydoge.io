@@ -1,0 +1,7 @@
+node_modules
+coverage
+.git
+.DS_Store
+.env.local
+.env.production
+docker-compose.override.yml

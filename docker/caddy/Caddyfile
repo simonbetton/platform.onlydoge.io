@@ -1,0 +1,3 @@
+{$ONLYDOGE_PUBLIC_HOST} {
+	reverse_proxy onlydoge-api:2277
+}

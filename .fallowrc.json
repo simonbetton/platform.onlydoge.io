@@ -1,0 +1,138 @@
+{
+  "$schema": "https://raw.githubusercontent.com/fallow-rs/fallow/main/schema.json",
+  "entry": ["apps/*/src/index.ts", "scripts/*.ts", "drizzle.config.ts", "vitest.config.ts"],
+  "ignorePatterns": [
+    ".agents/**",
+    ".cursor/**",
+    ".fallow/**",
+    "coverage/**",
+    "dist/**",
+    "build/**",
+    "**/*.d.ts",
+    "**/*.generated.ts"
+  ],
+  "workspaces": {
+    "patterns": ["apps/*", "packages/*", "packages/modules/*"]
+  },
+  "ignoreExportsUsedInFile": true,
+  "rules": {
+    "unused-files": "warn",
+    "unused-exports": "warn",
+    "unused-types": "warn",
+    "private-type-leaks": "warn",
+    "unused-dependencies": "warn",
+    "unused-dev-dependencies": "warn",
+    "unused-optional-dependencies": "warn",
+    "unused-enum-members": "warn",
+    "unused-class-members": "warn",
+    "unresolved-imports": "error",
+    "unlisted-dependencies": "error",
+    "duplicate-exports": "error",
+    "type-only-dependencies": "warn",
+    "test-only-dependencies": "warn",
+    "circular-dependencies": "error",
+    "boundary-violation": "warn",
+    "coverage-gaps": "off",
+    "feature-flags": "off",
+    "stale-suppressions": "warn"
+  },
+  "duplicates": {
+    "enabled": true,
+    "mode": "mild",
+    "minTokens": 80,
+    "minLines": 8,
+    "threshold": 8,
+    "ignore": ["coverage/**", "tests/fixtures/**", "**/*.generated.ts"],
+    "skipLocal": false,
+    "crossLanguage": false,
+    "ignoreImports": true
+  },
+  "health": {
+    "maxCyclomatic": 20,
+    "maxCognitive": 15,
+    "maxCrap": 30,
+    "ignore": ["coverage/**", "tests/fixtures/**", "**/*.generated.ts"],
+    "suggestInlineSuppression": true
+  },
+  "boundaries": {
+    "zones": [
+      { "name": "apps", "patterns": ["apps/*/src/**"] },
+      { "name": "platform", "patterns": ["packages/platform/src/**"] },
+      { "name": "module-public", "patterns": ["packages/modules/*/src/index.ts"] },
+      { "name": "module-adapters", "patterns": ["packages/modules/*/src/infrastructure/**"] },
+      { "name": "module-application", "patterns": ["packages/modules/*/src/application/**"] },
+      { "name": "module-ports", "patterns": ["packages/modules/*/src/contracts/**"] },
+      { "name": "module-domain", "patterns": ["packages/modules/*/src/domain/**"] },
+      { "name": "shared-kernel", "patterns": ["packages/shared-kernel/src/**"] }
+    ],
+    "rules": [
+      { "from": "apps", "allow": ["platform", "module-public", "shared-kernel"] },
+      {
+        "from": "platform",
+        "allow": [
+          "module-public",
+          "module-application",
+          "module-ports",
+          "module-domain",
+          "shared-kernel"
+        ]
+      },
+      {
+        "from": "module-public",
+        "allow": [
+          "module-adapters",
+          "module-application",
+          "module-ports",
+          "module-domain",
+          "shared-kernel"
+        ]
+      },
+      {
+        "from": "module-adapters",
+        "allow": [
+          "module-public",
+          "module-application",
+          "module-ports",
+          "module-domain",
+          "shared-kernel"
+        ]
+      },
+      {
+        "from": "module-application",
+        "allow": ["module-public", "module-ports", "module-domain", "shared-kernel"]
+      },
+      { "from": "module-ports", "allow": ["module-public", "module-domain", "shared-kernel"] },
+      { "from": "module-domain", "allow": ["module-public", "shared-kernel"] },
+      { "from": "shared-kernel", "allow": [] }
+    ]
+  },
+  "production": {
+    "deadCode": false,
+    "health": true,
+    "dupes": false
+  },
+  "resolve": {
+    "conditions": ["bun"]
+  },
+  "flags": {
+    "envPrefixes": ["ONLYDOGE_FEATURE_", "FEATURE_", "ENABLE_"],
+    "configObjectHeuristics": false
+  },
+  "overrides": [
+    {
+      "files": ["tests/**", "**/*.test.ts", "**/*.spec.ts"],
+      "rules": {
+        "unused-exports": "off",
+        "unused-types": "off",
+        "private-type-leaks": "off",
+        "unused-class-members": "off"
+      }
+    },
+    {
+      "files": ["scripts/**", "drizzle.config.ts", "vitest.config.ts"],
+      "rules": {
+        "unused-exports": "off"
+      }
+    }
+  ]
+}

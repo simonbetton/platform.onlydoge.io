@@ -1,0 +1,10 @@
+{
+  "name": "@onlydoge/access-control",
+  "private": true,
+  "type": "module",
+  "exports": "./src/index.ts",
+  "dependencies": {
+    "@onlydoge/shared-kernel": "workspace:*",
+    "elysia": "1.4.28"
+  }
+}

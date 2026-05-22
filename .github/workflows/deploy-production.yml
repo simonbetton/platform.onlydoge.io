@@ -1,0 +1,135 @@
+name: Deploy Production
+
+on:
+  workflow_dispatch:
+    inputs:
+      skip_e2e:
+        default: false
+        description: 'Deploy without running the production E2E teardown suite.'
+        required: false
+        type: boolean
+
+permissions:
+  contents: read
+  id-token: write
+  packages: write
+
+concurrency:
+  group: production
+  cancel-in-progress: false
+
+env:
+  BUN_VERSION: 1.3.6
+
+jobs:
+  deploy:
+    name: Production Deploy
+    runs-on: ubuntu-latest
+    environment:
+      name: production
+      url: ${{ vars.PROD_BASE_URL }}
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v6
+
+      - name: Set up Bun
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: ${{ env.BUN_VERSION }}
+
+      - name: Install dependencies
+        run: bun install --frozen-lockfile
+
+      - name: Lint
+        run: bun run lint
+
+      - name: Typecheck
+        run: bun run typecheck
+
+      - name: Test
+        run: bun run test
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v4
+
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Generate image metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ghcr.io/${{ github.repository_owner }}/onlydoge-indexer
+          tags: |
+            type=raw,value=latest
+            type=sha,prefix=sha-
+
+      - name: Build and push production image
+        id: build
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          provenance: true
+          sbom: true
+          target: production
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+
+      - name: Configure SSH
+        env:
+          PROD_SSH_PRIVATE_KEY: ${{ secrets.PROD_SSH_PRIVATE_KEY }}
+        run: |
+          set -euo pipefail
+          install -m 700 -d ~/.ssh
+          printf '%s\n' "$PROD_SSH_PRIVATE_KEY" > ~/.ssh/id_ed25519
+          chmod 600 ~/.ssh/id_ed25519
+
+      - name: Write production env file
+        env:
+          PROD_ENV_FILE: ${{ secrets.PROD_ENV_FILE }}
+        run: |
+          set -euo pipefail
+          printf '%s\n' "$PROD_ENV_FILE" > .env.managed
+          chmod 600 .env.managed
+
+      - name: Deploy production image
+        env:
+          PROD_BASE_URL: ${{ vars.PROD_BASE_URL }}
+          PROD_HOST: ${{ vars.PROD_HOST }}
+          PROD_SSH_JUMP: ${{ secrets.PROD_SSH_JUMP }}
+          PROD_SSH_TARGET: ${{ secrets.PROD_SSH_TARGET }}
+        run: |
+          set -euo pipefail
+          host="$PROD_HOST"
+          if [[ -z "$host" ]]; then
+            host="$(bun -e 'console.log(new URL(process.env.PROD_BASE_URL).host)')"
+          fi
+          args=(
+            --envFile .env.managed
+            --host "$host"
+            --image "ghcr.io/${{ github.repository_owner }}/onlydoge-indexer@${{ steps.build.outputs.digest }}"
+            --sshTarget "$PROD_SSH_TARGET"
+          )
+          if [[ -n "$PROD_SSH_JUMP" ]]; then
+            args+=(--sshJump "$PROD_SSH_JUMP")
+          fi
+          bun run deploy:docker -- "${args[@]}"
+
+      - name: Run production E2E
+        if: ${{ !inputs.skip_e2e }}
+        env:
+          EXPECTED_IMAGE_DIGEST: ${{ steps.build.outputs.digest }}
+          PROD_ADMIN_API_TOKEN: ${{ secrets.PROD_ADMIN_API_TOKEN }}
+          PROD_BASE_URL: ${{ vars.PROD_BASE_URL }}
+          PROD_SSH_JUMP: ${{ secrets.PROD_SSH_JUMP }}
+          PROD_SSH_TARGET: ${{ secrets.PROD_SSH_TARGET }}
+        run: bun run e2e:production
