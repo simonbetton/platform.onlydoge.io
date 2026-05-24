@@ -5,7 +5,7 @@
     "": {
       "name": "onlydoge",
       "dependencies": {
-        "@aws-sdk/client-s3": "3.1052.0",
+        "@aws-sdk/client-s3": "3.1053.0",
         "@clickhouse/client": "1.18.5",
         "@elysiajs/openapi": "1.4.15",
         "@libsql/client": "0.17.3",
@@ -26,7 +26,7 @@
         "@types/pg": "^8.20.0",
         "bun-types": "1.3.14",
         "drizzle-kit": "0.31.10",
-        "fallow": "^2.77.0",
+        "fallow": "^2.80.0",
         "typescript": "6.0.3",
         "vitest": "4.1.7",
       },
@@ -142,7 +142,7 @@
 
     "@aws-crypto/util": ["@aws-crypto/util@5.2.0", "", { "dependencies": { "@aws-sdk/types": "^3.222.0", "@smithy/util-utf8": "^2.0.0", "tslib": "^2.6.2" } }, "sha512-4RkU9EsI6ZpBve5fseQlGNUWKMa1RLPQ1dnjnQoe07ldfIzcsGb5hC5W0Dm7u423KWzawlrpbjXBrXCEv9zazQ=="],
 
-    "@aws-sdk/client-s3": ["@aws-sdk/client-s3@3.1052.0", "", { "dependencies": { "@aws-crypto/sha1-browser": "5.2.0", "@aws-crypto/sha256-browser": "5.2.0", "@aws-crypto/sha256-js": "5.2.0", "@aws-sdk/core": "^3.974.13", "@aws-sdk/credential-provider-node": "^3.972.44", "@aws-sdk/middleware-bucket-endpoint": "^3.972.15", "@aws-sdk/middleware-expect-continue": "^3.972.13", "@aws-sdk/middleware-flexible-checksums": "^3.974.21", "@aws-sdk/middleware-location-constraint": "^3.972.11", "@aws-sdk/middleware-sdk-s3": "^3.972.42", "@aws-sdk/middleware-ssec": "^3.972.11", "@aws-sdk/signature-v4-multi-region": "^3.996.28", "@aws-sdk/types": "^3.973.9", "@smithy/core": "^3.24.3", "@smithy/fetch-http-handler": "^5.4.3", "@smithy/node-http-handler": "^4.7.3", "@smithy/types": "^4.14.2", "tslib": "^2.6.2" } }, "sha512-8fgQHfk1WjGUyowyqtMwq9HzZvIQQ86cqn9IZW5Qkq8kaolVjMmZez60qVYxKYvKhVRYUP5hWYPVCyraoud0AA=="],
+    "@aws-sdk/client-s3": ["@aws-sdk/client-s3@3.1053.0", "", { "dependencies": { "@aws-crypto/sha1-browser": "5.2.0", "@aws-crypto/sha256-browser": "5.2.0", "@aws-crypto/sha256-js": "5.2.0", "@aws-sdk/core": "^3.974.13", "@aws-sdk/credential-provider-node": "^3.972.44", "@aws-sdk/middleware-bucket-endpoint": "^3.972.15", "@aws-sdk/middleware-expect-continue": "^3.972.13", "@aws-sdk/middleware-flexible-checksums": "^3.974.21", "@aws-sdk/middleware-location-constraint": "^3.972.11", "@aws-sdk/middleware-sdk-s3": "^3.972.42", "@aws-sdk/middleware-ssec": "^3.972.11", "@aws-sdk/signature-v4-multi-region": "^3.996.28", "@aws-sdk/types": "^3.973.9", "@smithy/core": "^3.24.3", "@smithy/fetch-http-handler": "^5.4.3", "@smithy/node-http-handler": "^4.7.3", "@smithy/types": "^4.14.2", "tslib": "^2.6.2" } }, "sha512-/oGxoB6p1Nqs935Blt+v1o+anSCEf2n3RjIrcLz84i4cn2Gr+Z7JpDdUkG5+74r5ctqEPG7k/phTGbJ9fNKnHg=="],
 
     "@aws-sdk/core": ["@aws-sdk/core@3.974.13", "", { "dependencies": { "@aws-sdk/types": "^3.973.9", "@aws-sdk/xml-builder": "^3.972.25", "@aws/lambda-invoke-store": "^0.2.2", "@smithy/core": "^3.24.3", "@smithy/signature-v4": "^5.4.2", "@smithy/types": "^4.14.2", "bowser": "^2.11.0", "tslib": "^2.6.2" } }, "sha512-+Y5/4tHki0uYgyx8eun146DegRVQBpdKGK5RbV0FTKJPpaKTchvqVxrrRFK6Wk0JksO4iAZKw3eqxGEIwtO98w=="],
 
@@ -280,21 +280,21 @@
 
     "@esbuild/win32-x64": ["@esbuild/win32-x64@0.25.12", "", { "os": "win32", "cpu": "x64" }, "sha512-alJC0uCZpTFrSL0CCDjcgleBXPnCrEAhTBILpeAp7M/OFgoqtAetfBzX0xM00MUsVVPpVjlPuMbREqnZCXaTnA=="],
 
-    "@fallow-cli/darwin-arm64": ["@fallow-cli/darwin-arm64@2.77.0", "", { "os": "darwin", "cpu": "arm64" }, "sha512-bkEutZynY8DFEDrrSGQpTMSO723nijYTa4WHVdyjd3Ltb3Al7AgsMyGzk1GmKMN0CDzZAmwa8Ys6TPpCpiqB8w=="],
+    "@fallow-cli/darwin-arm64": ["@fallow-cli/darwin-arm64@2.80.0", "", { "os": "darwin", "cpu": "arm64" }, "sha512-+wRfU4YlOoPEqOA6Usc4w5O4r4xiQSS6lpFN5j9gA+0ZbcHn9JvizXh+91trfIDqXt0CYRvSwjTURiUzsrAQOg=="],
 
-    "@fallow-cli/darwin-x64": ["@fallow-cli/darwin-x64@2.77.0", "", { "os": "darwin", "cpu": "x64" }, "sha512-JIXDYUpFx3aVAW4ZqP3bWktIk1nwyyP8o3Ly01WQiohlhwen3Rerb3AE9fcx6XJq8jMHy+90XmEqDzfGoI+02w=="],
+    "@fallow-cli/darwin-x64": ["@fallow-cli/darwin-x64@2.80.0", "", { "os": "darwin", "cpu": "x64" }, "sha512-6ZLStpogktaAJQzRcLllTRlYbrSJYktN+RsHzR1cb/aa3Iw4mmgoT6PFBnvvu009K/q8jHkQkCf9194NwdkNow=="],
 
-    "@fallow-cli/linux-arm64-gnu": ["@fallow-cli/linux-arm64-gnu@2.77.0", "", { "os": "linux", "cpu": "arm64" }, "sha512-IkyJakGe4OC90AmVSVNzQ3yVI6BWvCO9oLBr1M/5X1bRvcBRqP7n3GkWtLjs66M28DqCNnW/eVaoP7afJaWn2g=="],
+    "@fallow-cli/linux-arm64-gnu": ["@fallow-cli/linux-arm64-gnu@2.80.0", "", { "os": "linux", "cpu": "arm64" }, "sha512-/3hqjlSDi7EO90tefuIde2n1wV3MoN8YPYX2SfeKa0iulOh0xVplZw4QHyVV+lCQQnogqzdM2y8mh1zISpJ70g=="],
 
-    "@fallow-cli/linux-arm64-musl": ["@fallow-cli/linux-arm64-musl@2.77.0", "", { "os": "linux", "cpu": "arm64" }, "sha512-XIdmqrDxVObxnQQ7ljaB71WEeunW11P6TiLZS+Idn2dk+rd4HF+XWDcriN+q/CrzFP4agTdh0ym7JJ8+4szh/w=="],
+    "@fallow-cli/linux-arm64-musl": ["@fallow-cli/linux-arm64-musl@2.80.0", "", { "os": "linux", "cpu": "arm64" }, "sha512-qv29jC+eOAKCpFnfnhc/ZyO50RfGhNt96Jlt8iw5Y3MwfDqMRzvtA5E8p6t6Ymau6wCJuhCrcphPpjVBIEOcqQ=="],
 
-    "@fallow-cli/linux-x64-gnu": ["@fallow-cli/linux-x64-gnu@2.77.0", "", { "os": "linux", "cpu": "x64" }, "sha512-v6xezo8DF5JEo8nWVbqnk7flINY4Yz53GmkVZS7qF/mTKvALff/5tn2VQ65rJPy8xkvm4Nx7pVeK7z9xd1rskg=="],
+    "@fallow-cli/linux-x64-gnu": ["@fallow-cli/linux-x64-gnu@2.80.0", "", { "os": "linux", "cpu": "x64" }, "sha512-NyYciuZQyBNaiz8hvNJgPpYjZuBAHpzp+AjRPGlbcUCSJEov5Nqmrv6cSFRFITa6JmzQ5Vbg64X+Iq2OuiFMEg=="],
 
-    "@fallow-cli/linux-x64-musl": ["@fallow-cli/linux-x64-musl@2.77.0", "", { "os": "linux", "cpu": "x64" }, "sha512-snSlL4w9r45naAODzWEAZeie07dzFg2SgCvz3RFKnZCPMzMxmm5p9Dpbvoup3glETIDfkjyzOqFvMlEKggr9Ow=="],
+    "@fallow-cli/linux-x64-musl": ["@fallow-cli/linux-x64-musl@2.80.0", "", { "os": "linux", "cpu": "x64" }, "sha512-BBH1PJgJGzGrdLk/0Nl9CsVr1GzovtSvZlpQ2XJndXEqNaaEEBJHdlQFcJM4AGePjzsvriKVjPqDpyZ5uMICTQ=="],
 
-    "@fallow-cli/win32-arm64-msvc": ["@fallow-cli/win32-arm64-msvc@2.77.0", "", { "os": "win32", "cpu": "arm64" }, "sha512-5GfNibKxm/GlZvQJmCbe6/QHQZ/FD8WndPFIkWJbmthPHX01YArW0wSAKWTsDMZ8eYFuHdvGwiHHakK3ukhgZg=="],
+    "@fallow-cli/win32-arm64-msvc": ["@fallow-cli/win32-arm64-msvc@2.80.0", "", { "os": "win32", "cpu": "arm64" }, "sha512-2N9itgnTYS6VB8VL5PlwSuHloZoj86NfR6IbvpdYQ6v1ciPOjpC54hbgJEvMnCQCuKD/zEc9+U8+pOXGS/iLfQ=="],
 
-    "@fallow-cli/win32-x64-msvc": ["@fallow-cli/win32-x64-msvc@2.77.0", "", { "os": "win32", "cpu": "x64" }, "sha512-IjzuhBT8KXv3HXo4s+vVKKESuxRW7Me+Hb9Kc8WyySsxuRMGoE1D4vECOZSnYQJ6tMLU4osOVhgVRs2Mk3sTrw=="],
+    "@fallow-cli/win32-x64-msvc": ["@fallow-cli/win32-x64-msvc@2.80.0", "", { "os": "win32", "cpu": "x64" }, "sha512-vbk/bA7EFqR2ECz/mYup7+D2zwv5MVUlKhm/6/n6V+9eeyFW2ZwyTQXYdfzsby/3r/w/uZ+OHjVo9/WANBZMMg=="],
 
     "@jridgewell/sourcemap-codec": ["@jridgewell/sourcemap-codec@1.5.5", "", {}, "sha512-cYQ9310grqxueWbl+WuIUIaiUaDcj7WOq5fVhEljNVgRfOUhY9fy2zTvfoqWsnebh8Sl70VScFbICvJnLKB0Og=="],
 
@@ -486,7 +486,7 @@
 
     "expect-type": ["expect-type@1.3.0", "", {}, "sha512-knvyeauYhqjOYvQ66MznSMs83wmHrCycNEN6Ao+2AeYEfxUIkuiVxdEa1qlGEPK+We3n0THiDciYSsCcgW/DoA=="],
 
-    "fallow": ["fallow@2.77.0", "", { "dependencies": { "detect-libc": "2.1.2" }, "optionalDependencies": { "@fallow-cli/darwin-arm64": "2.77.0", "@fallow-cli/darwin-x64": "2.77.0", "@fallow-cli/linux-arm64-gnu": "2.77.0", "@fallow-cli/linux-arm64-musl": "2.77.0", "@fallow-cli/linux-x64-gnu": "2.77.0", "@fallow-cli/linux-x64-musl": "2.77.0", "@fallow-cli/win32-arm64-msvc": "2.77.0", "@fallow-cli/win32-x64-msvc": "2.77.0" }, "bin": { "fallow": "bin/fallow", "fallow-lsp": "bin/fallow-lsp", "fallow-mcp": "bin/fallow-mcp" } }, "sha512-NFZxvTyseVBsxqwOIQbVisKa1YjyYqV4A/d3LEbJELBko0CndNbh+hFX1fO4ApiZ+YETyRZ3Rk0hAHXo49382g=="],
+    "fallow": ["fallow@2.80.0", "", { "dependencies": { "detect-libc": "2.1.2" }, "optionalDependencies": { "@fallow-cli/darwin-arm64": "2.80.0", "@fallow-cli/darwin-x64": "2.80.0", "@fallow-cli/linux-arm64-gnu": "2.80.0", "@fallow-cli/linux-arm64-musl": "2.80.0", "@fallow-cli/linux-x64-gnu": "2.80.0", "@fallow-cli/linux-x64-musl": "2.80.0", "@fallow-cli/win32-arm64-msvc": "2.80.0", "@fallow-cli/win32-x64-msvc": "2.80.0" }, "bin": { "fallow": "bin/fallow", "fallow-lsp": "bin/fallow-lsp", "fallow-mcp": "bin/fallow-mcp" } }, "sha512-TnBj6P/UF7DgaKjZFz1e69DkGyvlYABE7V9n98cbUmEq+Y+RsOq/rQVBnvbw+8jj7MhNuRRleheULCPQg4GgZA=="],
 
     "fast-decode-uri-component": ["fast-decode-uri-component@1.0.1", "", {}, "sha512-WKgKWg5eUxvRZGwW8FvfbaH7AXSh2cL+3j5fMGzUMCxWBJ3dV3a7Wz8y2f/uQ0e3B6WmodD3oS54jTQ9HVTIIg=="],
 
