@@ -645,7 +645,7 @@ describe('clickhouse warehouse adapter', () => {
         return { json: async () => [] };
       }
 
-      if (statement.includes('WITH address_outputs')) {
+      if (statement.includes('address_outputs AS')) {
         return {
           json: async () => [
             {
@@ -677,6 +677,13 @@ describe('clickhouse warehouse adapter', () => {
     expect(
       statements.some((statement) =>
         statement.includes('ORDER BY block_height DESC, max(tx_index) DESC, txid DESC'),
+      ),
+    ).toBe(true);
+    expect(
+      statements.some(
+        (statement) =>
+          statement.includes('address_spends AS') &&
+          statement.includes('block_height IN (SELECT spent_in_block FROM address_spends)'),
       ),
     ).toBe(true);
   });

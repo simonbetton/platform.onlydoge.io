@@ -1895,7 +1895,8 @@ export class ClickHouseWarehouseAdapter
       txid: string;
     }>({
       query: `
-          WITH address_outputs AS (
+          WITH
+          address_outputs AS (
             SELECT
               block_height,
               block_hash,
@@ -1911,6 +1912,30 @@ export class ClickHouseWarehouseAdapter
               AND is_spendable = 1
             ORDER BY output_key ASC, version DESC
             LIMIT 1 BY output_key
+          ),
+          address_spends AS (
+            SELECT
+              spent_output_key,
+              spent_by_txid,
+              spent_in_block
+            FROM ${coreUtxoSpendsTable}
+            WHERE
+              network_id = {networkId:UInt64}
+              AND spent_output_key IN (SELECT output_key FROM address_outputs)
+            ORDER BY spent_output_key ASC, version DESC
+            LIMIT 1 BY spent_output_key
+          ),
+          spend_blocks AS (
+            SELECT
+              block_height,
+              block_hash,
+              block_time
+            FROM ${coreProcessedBlocksTable}
+            WHERE
+              network_id = {networkId:UInt64}
+              AND block_height IN (SELECT spent_in_block FROM address_spends)
+            ORDER BY block_height ASC, version DESC
+            LIMIT 1 BY block_height
           )
           SELECT
             block_height AS "blockHeight",
@@ -1940,29 +1965,9 @@ export class ClickHouseWarehouseAdapter
               toInt256(c.value_base) AS amount_base_i256,
               'debit' AS direction
             FROM address_outputs AS c
-            INNER JOIN (
-              SELECT
-                spent_output_key,
-                spent_by_txid,
-                spent_in_block
-              FROM ${coreUtxoSpendsTable}
-              WHERE
-                network_id = {networkId:UInt64}
-                AND spent_output_key IN (SELECT output_key FROM address_outputs)
-              ORDER BY spent_output_key ASC, version DESC
-              LIMIT 1 BY spent_output_key
-            ) AS s
+            INNER JOIN address_spends AS s
             ON c.output_key = s.spent_output_key
-            INNER JOIN (
-              SELECT
-                block_height,
-                block_hash,
-                block_time
-              FROM ${coreProcessedBlocksTable}
-              WHERE network_id = {networkId:UInt64}
-              ORDER BY block_height ASC, version DESC
-              LIMIT 1 BY block_height
-            ) AS b
+            INNER JOIN spend_blocks AS b
             ON b.block_height = s.spent_in_block
           )
           GROUP BY block_height, txid
