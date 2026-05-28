@@ -1175,11 +1175,42 @@ export class ClickHouseWarehouseAdapter
       spendRows.map((spend) => toCoreUtxoSpendInsertRow(networkId, spend)),
       requestContext,
     );
+    await this.insertCoreAddressMovements(networkId, pending, requestContext);
     await this.applyCoreCurrentStateWindowIfEnabled(networkId, pending, context, requestContext);
     await this.insertRows(
       coreProcessedBlocksTable,
       pending.map(toCoreProcessedBlockInsertRow),
       requestContext,
+    );
+  }
+
+  private async insertCoreAddressMovements(
+    networkId: PrimaryId,
+    pending: CoreDogecoinBlockApplication[],
+    requestContext: ClickHouseRequestContext,
+  ): Promise<void> {
+    const movements = await this.buildCoreAddressMovements(networkId, pending, requestContext);
+    await this.insertRows(
+      'address_movements_v2',
+      movements.map(toAddressMovementInsertRow),
+      requestContext,
+    );
+  }
+
+  private async buildCoreAddressMovements(
+    networkId: PrimaryId,
+    pending: CoreDogecoinBlockApplication[],
+    requestContext: ClickHouseRequestContext,
+  ): Promise<AddressMovement[]> {
+    const createdOutputs = coreCreatedOutputsByKey(pending);
+    const currentOutputs = await this.getCurrentUtxoOutputMap(
+      networkId,
+      externalCoreSpendKeys(pending),
+      requestContext,
+    );
+
+    return pending.flatMap((application) =>
+      coreApplicationAddressMovements(application, createdOutputs, currentOutputs),
     );
   }
 
@@ -4115,6 +4146,89 @@ function externalCoreSpendKeys(applications: CoreDogecoinBlockApplication[]): st
         .filter((outputKey) => !createdInWindow.has(outputKey)),
     ),
   ];
+}
+
+function coreCreatedOutputsByKey(
+  applications: CoreDogecoinBlockApplication[],
+): Map<string, ProjectionUtxoOutput> {
+  return new Map(
+    applications
+      .flatMap((application) => application.utxoCreates)
+      .map((output) => [output.outputKey, output]),
+  );
+}
+
+function coreApplicationAddressMovements(
+  application: CoreDogecoinBlockApplication,
+  createdOutputs: Map<string, ProjectionUtxoOutput>,
+  currentOutputs: Map<string, ProjectionUtxoOutput>,
+): AddressMovement[] {
+  return [
+    ...application.utxoCreates.flatMap(coreCreateAddressMovement),
+    ...application.utxoSpends.flatMap((spend) =>
+      coreSpendAddressMovement(application, spend, createdOutputs, currentOutputs),
+    ),
+  ];
+}
+
+function coreCreateAddressMovement(output: ProjectionUtxoOutput): AddressMovement[] {
+  if (!isCoreAddressMovementOutput(output)) {
+    return [];
+  }
+
+  return [
+    {
+      movementId: `core-credit:${output.networkId}:${output.outputKey}`,
+      networkId: output.networkId,
+      blockHeight: output.blockHeight,
+      blockHash: output.blockHash,
+      blockTime: output.blockTime,
+      txid: output.txid,
+      txIndex: output.txIndex,
+      entryIndex: output.vout,
+      address: output.address,
+      assetAddress: '',
+      direction: 'credit',
+      amountBase: output.valueBase,
+      outputKey: output.outputKey,
+      derivationMethod: 'core_utxo',
+    },
+  ];
+}
+
+function coreSpendAddressMovement(
+  application: CoreDogecoinBlockApplication,
+  spend: CoreDogecoinSpend,
+  createdOutputs: Map<string, ProjectionUtxoOutput>,
+  currentOutputs: Map<string, ProjectionUtxoOutput>,
+): AddressMovement[] {
+  const output = createdOutputs.get(spend.outputKey) ?? currentOutputs.get(spend.outputKey);
+  if (!output || !isCoreAddressMovementOutput(output)) {
+    return [];
+  }
+
+  return [
+    {
+      movementId: `core-debit:${application.networkId}:${spend.outputKey}:${spend.spentByTxid}:${spend.spentInputIndex}`,
+      networkId: application.networkId,
+      blockHeight: application.blockHeight,
+      blockHash: application.blockHash,
+      blockTime: application.blockTime,
+      txid: spend.spentByTxid,
+      txIndex: 0,
+      entryIndex: spend.spentInputIndex,
+      address: output.address,
+      assetAddress: '',
+      direction: 'debit',
+      amountBase: output.valueBase,
+      outputKey: spend.outputKey,
+      derivationMethod: 'core_utxo',
+    },
+  ];
+}
+
+function isCoreAddressMovementOutput(output: ProjectionUtxoOutput): boolean {
+  return output.isSpendable && output.address.length > 0;
 }
 
 function assertCorePrevoutsExist(

@@ -715,6 +715,7 @@ describe('clickhouse warehouse adapter', () => {
     expect(insertedTables).toEqual([
       'core_utxo_creates_v1',
       'core_utxo_spends_v1',
+      'address_movements_v2',
       'core_processed_blocks_v1',
     ]);
     expect(insert).toHaveBeenCalledWith(
@@ -728,6 +729,25 @@ describe('clickhouse warehouse adapter', () => {
             spent_in_block: 2,
           }),
         ],
+      }),
+    );
+    expect(insert).toHaveBeenCalledWith(
+      expect.objectContaining({
+        table: 'address_movements_v2',
+        values: expect.arrayContaining([
+          expect.objectContaining({
+            movement_id: 'core-credit:7:coinbase-tx:0',
+            address: 'DAddress0',
+            direction: 'credit',
+            amount_base: '100000000',
+          }),
+          expect.objectContaining({
+            movement_id: 'core-debit:7:coinbase-tx:0:tx-2:0',
+            address: 'DAddress0',
+            direction: 'debit',
+            amount_base: '100000000',
+          }),
+        ]),
       }),
     );
   });
@@ -794,6 +814,7 @@ describe('clickhouse warehouse adapter', () => {
     expect(insertedTables).toEqual([
       'core_utxo_creates_v1',
       'core_utxo_spends_v1',
+      'address_movements_v2',
       'utxo_outputs_current_v2',
       'balances_v2',
       'applied_blocks_v2',
@@ -829,6 +850,23 @@ describe('clickhouse warehouse adapter', () => {
             address: 'DAddress0',
             balance: '100000000',
             version: 5,
+          }),
+        ]),
+      }),
+    );
+    expect(insert).toHaveBeenCalledWith(
+      expect.objectContaining({
+        table: 'address_movements_v2',
+        values: expect.arrayContaining([
+          expect.objectContaining({
+            movement_id: 'core-debit:7:prev-tx:0:tx-2:0',
+            address: 'DPrevAddress',
+            direction: 'debit',
+          }),
+          expect.objectContaining({
+            movement_id: 'core-credit:7:new-tx:0',
+            address: 'DAddress0',
+            direction: 'credit',
           }),
         ]),
       }),
