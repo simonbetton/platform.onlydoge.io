@@ -295,6 +295,16 @@ export class CoreDogecoinIndexerService {
     }
 
     const end = Math.min(latest, state.syncTail + this.settings.syncWindow);
+    return this.syncRawBlockWindow(network, latest, state, end, 'sync_backfill');
+  }
+
+  private async syncRawBlockWindow(
+    network: CoreDogecoinNetwork,
+    latest: number,
+    state: CoreIndexerState,
+    end: number,
+    stage: CoreIndexerState['stage'],
+  ): Promise<boolean> {
     const heights = range(state.syncTail + 1, end);
     await mapWithConcurrency(heights, this.settings.syncConcurrency, async (height) => {
       const snapshot = await this.rpc.getBlockSnapshot(network, height);
@@ -317,7 +327,7 @@ export class CoreDogecoinIndexerService {
 
     const nextState = await this.stateStore.upsertCoreIndexerState({
       networkId: network.networkId,
-      stage: 'sync_backfill',
+      stage,
       syncTail: end,
       onlineTip: latest,
       lastError: null,
@@ -419,11 +429,12 @@ export class CoreDogecoinIndexerService {
     latest: number,
     state: CoreIndexerState,
     currentStateReady: boolean,
+    stage: CoreIndexerState['stage'] = 'process_backfill',
   ): Promise<boolean> {
     const end = Math.min(state.syncTail, state.processTail + this.settings.coreProcessWindow);
     const heights = range(state.processTail + 1, end);
     const metrics = await this.processWindow(network, latest, heights, currentStateReady);
-    await this.publishWindowProgress(network, latest, metrics);
+    await this.publishWindowProgress(network, latest, metrics, stage);
 
     console.info(
       `[onlydoge] core processed network=${network.id} blocks=${metrics.start}-${metrics.end} sync_tail=${state.syncTail} latest=${latest}`,
@@ -573,6 +584,7 @@ export class CoreDogecoinIndexerService {
     network: CoreDogecoinNetwork,
     latest: number,
     metrics: CoreWindowMetrics,
+    stage: CoreIndexerState['stage'] = 'process_backfill',
   ): Promise<void> {
     let nextState: CoreIndexerState;
     let publishMs: number;
@@ -588,7 +600,7 @@ export class CoreDogecoinIndexerService {
         async () => {
           const state = await this.stateStore.upsertCoreIndexerState({
             networkId: network.networkId,
-            stage: 'process_backfill',
+            stage,
             processTail: metrics.end,
             onlineTip: latest,
             lastError: null,
@@ -657,6 +669,7 @@ export class CoreDogecoinIndexerService {
     state: CoreIndexerState,
   ): Promise<boolean> {
     return (
+      state.syncTail >= latest &&
       (await this.isDogecoinCurrentStateReady(network.networkId)) &&
       isWithinOnlineTipDistance(state.processTail, latest, this.settings.coreOnlineTipDistance)
     );
@@ -736,7 +749,7 @@ export class CoreDogecoinIndexerService {
       return;
     }
 
-    await this.syncBackfill(network, latest, { ...state, stage: 'sync_backfill' });
+    await this.syncRawBlockWindow(network, latest, state, syncEnd, 'online');
   }
 
   private async refreshedOnlineBacklogState(
@@ -757,11 +770,21 @@ export class CoreDogecoinIndexerService {
     latest: number,
     state: CoreIndexerState,
   ): Promise<void> {
-    if (state.processTail >= state.syncTail) {
+    const processTarget = Math.min(
+      state.syncTail,
+      onlineProcessTarget(latest, this.settings.coreOnlineTipDistance),
+    );
+    if (state.processTail >= processTarget) {
       return;
     }
 
-    await this.processBackfill(network, latest, { ...state, stage: 'process_backfill' });
+    await this.processBackfillWindow(
+      network,
+      latest,
+      { ...state, syncTail: processTarget },
+      await this.isDogecoinCurrentStateReady(network.networkId),
+      'online',
+    );
   }
 
   private async publishProgress(
@@ -871,7 +894,14 @@ export class CoreDogecoinIndexerService {
     latest: number,
     observation: ProgressObservation,
   ): number | null {
-    if (!hasCoreWorkBacklog(state, latest, this.settings.coreSyncCompleteDistance)) {
+    if (
+      !hasCoreWorkBacklog(
+        state,
+        latest,
+        this.settings.coreSyncCompleteDistance,
+        this.settings.coreOnlineTipDistance,
+      )
+    ) {
       return null;
     }
 
@@ -1086,7 +1116,11 @@ function isWithinOnlineTipDistance(
   latest: number,
   coreOnlineTipDistance: number,
 ): boolean {
-  return processTail >= latest - coreOnlineTipDistance;
+  return processTail >= onlineProcessTarget(latest, coreOnlineTipDistance);
+}
+
+function onlineProcessTarget(latest: number, coreOnlineTipDistance: number): number {
+  return latest - coreOnlineTipDistance;
 }
 
 function isCoreStateAtLatest(state: CoreIndexerState, latest: number): boolean {
@@ -1175,11 +1209,16 @@ function hasCoreWorkBacklog(
   state: CoreIndexerState,
   latest: number,
   coreSyncCompleteDistance: number,
+  coreOnlineTipDistance: number,
 ): boolean {
   const checks: Record<CoreIndexerState['stage'], () => boolean> = {
     sync_backfill: () => state.syncTail < latest - coreSyncCompleteDistance,
     process_backfill: () => state.processTail < state.syncTail,
-    online: () => [state.syncTail < latest, state.processTail < latest].includes(true),
+    online: () =>
+      [
+        state.syncTail < latest,
+        state.processTail < onlineProcessTarget(latest, coreOnlineTipDistance),
+      ].includes(true),
   };
   return checks[state.stage]();
 }

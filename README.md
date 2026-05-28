@@ -392,7 +392,7 @@ Explorer routes require `x-api-token`. Public unauthenticated routes are `/up`, 
 
 `GET /v1/explorer/mempool` reads the node's current set of unconfirmed transactions through live Dogecoin RPC and returns a bounded, normalized page of metadata. The HTTP response is `no-store`; the API keeps a one-second in-process snapshot cache to keep repeated refreshes snappy.
 
-History-dependent routes return `425` until Dogecoin history readiness is marked true. Processed-tip lag is measured against the Dogecoin node's confirmed chain tip, not against the mempool.
+History-dependent routes return `425` until Dogecoin history readiness is marked true. Raw block sync can follow the Dogecoin node's confirmed chain tip while current-state processing remains behind the configured confirmation distance; this processing lag is separate from the mempool.
 
 ## Production E2E
 

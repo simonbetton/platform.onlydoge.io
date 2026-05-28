@@ -189,10 +189,11 @@ Healthy Dogecoin current-state production looks like:
 - `lastError = null`
 - `dogecoin_current_state_ready_n1 = true`
 - `dogecoin_history_ready_n1 = true`
+- `syncTail` aligned with `block_height_n1` once online raw sync catches the node tip
 - `processTail` within `ONLYDOGE_CORE_ONLINE_TIP_DISTANCE` blocks of `block_height_n1`
 - `factTail` aligned with `processTail` when core-backed history is enabled
 
-`processTail` lag is measured against the node's confirmed chain tip. The mempool is the node's current set of unconfirmed transactions, so it is separate from this block-processing lag.
+Raw block sync can be at the node tip while `processTail` remains behind the confirmation buffer. The mempool is the node's current set of unconfirmed transactions, so it is separate from this block-processing lag.
 
 ## OnlyDoge Production Notes
 

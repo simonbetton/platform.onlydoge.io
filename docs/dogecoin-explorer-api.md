@@ -28,7 +28,7 @@ Explorer reads use stored data, except `GET /v1/explorer/mempool`, which calls l
 - `core_processed_blocks_v1` stores block identity for processed core windows.
 - `utxo_outputs_current_v2` and `utxo_outputs_current_by_address_v2` provide current spendable UTXO reads.
 - `balances_v2` provides current native DOGE balances.
-- `applied_blocks_v2` provides explorer block identity after current-state materialization.
+- Raw sync tail (`indexer_sync_tail_n{networkId}`) drives recent block listing from stored raw snapshots.
 - Dogecoin RPC provides the node's current mempool: the set of unconfirmed transactions currently visible to that node.
 
 Older projection tables may still exist for compatibility and investigation graph reads, but the current production Dogecoin indexer does not rebuild a full transfer/direct-link graph.
@@ -45,7 +45,7 @@ Current-state reads depend on the current UTXO and balance read models. A labele
 - `GET /v1/explorer/addresses/:address`
 - `GET /v1/explorer/addresses/:address/utxos`
 
-Indexed block listing uses stored applied-block identity and raw block snapshots, but it is not gated by the history-ready flag:
+Indexed block listing uses stored raw block snapshots up to the raw sync tail, but it is not gated by the history-ready flag:
 
 - `GET /v1/explorer/blocks`
 
@@ -58,7 +58,7 @@ History-dependent reads require `dogecoin_history_ready_n{networkId} = true`:
 
 When history is not ready, those routes return a `425` response with a clear `dogecoin history index is not ready` error.
 
-Processed-tip lag is measured against the Dogecoin node's confirmed chain tip. It is not caused by transactions remaining in the mempool.
+Raw block sync is allowed to follow the Dogecoin node's confirmed chain tip. Current-state and history reads stay behind the configured processing confirmation distance, so `processTail` can lag while recent raw blocks are already visible. Processed-tip lag is not caused by transactions remaining in the mempool.
 
 ## Response Notes
 

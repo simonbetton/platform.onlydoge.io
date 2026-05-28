@@ -1266,7 +1266,7 @@ exports[`api integration > serves heartbeat and openapi 1`] = `
     },
     "/v1/explorer/blocks": {
       "get": {
-        "description": "Lists recent indexed Dogecoin blocks in descending chain order.",
+        "description": "Lists recent raw-synced Dogecoin blocks in descending chain order.",
         "operationId": "getV1ExplorerBlocks",
         "parameters": [
           {
@@ -1321,7 +1321,7 @@ exports[`api integration > serves heartbeat and openapi 1`] = `
     },
     "/v1/explorer/blocks/{ref}": {
       "get": {
-        "description": "Returns a block summary and transaction summaries by indexed height or block hash.",
+        "description": "Returns a block summary and transaction summaries by raw-synced height or indexed block hash.",
         "operationId": "getV1ExplorerBlocksByRef",
         "parameters": [
           {

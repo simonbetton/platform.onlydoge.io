@@ -814,6 +814,9 @@ async function expectExplorerNetworks({ ctx, headers, network }: ExplorerScenari
   const networksBody = await readJsonObject(networks);
   const [networkSummary] = readObjectArrayField(networksBody, 'networks');
   expect(requireStringField(networkSummary ?? {}, 'id')).toBe(network.id);
+  expect(requireNumberField(networkSummary ?? {}, 'syncTail')).toBe(2);
+  expect(requireNumberField(networkSummary ?? {}, 'processTail')).toBe(2);
+  expect(requireNumberField(networkSummary ?? {}, 'tipLagBlocks')).toBe(0);
 }
 
 async function expectExplorerSearch({ ctx, headers }: ExplorerScenario): Promise<void> {
@@ -840,7 +843,8 @@ async function expectExplorerSearch({ ctx, headers }: ExplorerScenario): Promise
 
 async function expectExplorerBlocks({ ctx, headers }: ExplorerScenario): Promise<void> {
   const blocks = await request(ctx.app, '/v1/explorer/blocks', { headers });
-  expect(readObjectArrayField(await readJsonObject(blocks), 'blocks')).toEqual([]);
+  const [latestBlock] = readObjectArrayField(await readJsonObject(blocks), 'blocks');
+  expect(requireNumberField(latestBlock ?? {}, 'height')).toBe(2);
 
   const blockDetail = await request(ctx.app, '/v1/explorer/blocks/2', { headers });
   const blockDetailBody = await readJsonObject(blockDetail);

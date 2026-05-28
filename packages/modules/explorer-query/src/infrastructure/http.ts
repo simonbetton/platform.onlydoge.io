@@ -107,7 +107,7 @@ export function buildExplorerQueryHttp(
       {
         detail: describeProtected(
           'List blocks',
-          'Lists recent indexed Dogecoin blocks in descending chain order.',
+          'Lists recent raw-synced Dogecoin blocks in descending chain order.',
         ),
         query: paginatedNetworkQuerySchema,
       },
@@ -129,7 +129,7 @@ export function buildExplorerQueryHttp(
     .get('/blocks/:ref', ({ params, query }) => service.getBlock(params.ref, query.network), {
       detail: describeProtected(
         'Get block',
-        'Returns a block summary and transaction summaries by indexed height or block hash.',
+        'Returns a block summary and transaction summaries by raw-synced height or indexed block hash.',
       ),
       params: t.Object({
         ref: t.String({

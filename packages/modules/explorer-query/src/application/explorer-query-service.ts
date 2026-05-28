@@ -1,5 +1,10 @@
 import type { AuthenticatedApiKey } from '@onlydoge/access-control';
 import {
+  configKeyBlockHeight,
+  configKeyIndexerProcessProgress,
+  configKeyIndexerProcessTail,
+  configKeyIndexerSyncProgress,
+  configKeyIndexerSyncTail,
   type DogecoinTransaction,
   type DogecoinVin,
   type DogecoinVout,
@@ -120,21 +125,40 @@ export class ExplorerQueryService {
     network: Awaited<ReturnType<ExplorerActiveNetworkPort['listActiveNetworks']>>[number],
     isSingleNetwork: boolean,
   ): Promise<ExplorerNetworkSummary> {
+    const blockHeight = await this.configNumberOrDefault(
+      configKeyBlockHeight(network.networkId),
+      0,
+    );
+    const processTail = await this.configNumberOrDefault(
+      configKeyIndexerProcessTail(network.networkId),
+      -1,
+    );
+    const syncTail = await this.configNumberOrDefault(
+      configKeyIndexerSyncTail(network.networkId),
+      -1,
+    );
+
     return {
       id: network.id,
       name: network.name,
       chainId: network.chainId,
       blockTime: network.blockTime,
-      blockHeight: await this.configNumberOrZero(`block_height_n${network.networkId}`),
-      synced: await this.configNumberOrZero(`indexer_sync_progress_n${network.networkId}`),
-      processed: await this.configNumberOrZero(`indexer_process_progress_n${network.networkId}`),
+      blockHeight,
+      syncTail,
+      processTail,
+      tipLagBlocks: Math.max(0, blockHeight - processTail),
+      synced: await this.configNumberOrDefault(configKeyIndexerSyncProgress(network.networkId), 0),
+      processed: await this.configNumberOrDefault(
+        configKeyIndexerProcessProgress(network.networkId),
+        0,
+      ),
       isDefault: isSingleNetwork,
     };
   }
 
-  private async configNumberOrZero(key: string): Promise<number> {
+  private async configNumberOrDefault(key: string, fallback: number): Promise<number> {
     const value = await this.configs.getJsonValue<number>(key);
-    return value ?? 0;
+    return value ?? fallback;
   }
 
   public async search(
@@ -234,6 +258,29 @@ export class ExplorerQueryService {
     blocks: ExplorerBlockSummary[];
   }> {
     const network = await this.resolveNetwork(networkId);
+    const syncTail = await this.configNumberOrDefault(
+      configKeyIndexerSyncTail(network.networkId),
+      -1,
+    );
+    if (syncTail < 0) {
+      return this.listAppliedBlocks(network, offset, limit);
+    }
+
+    const heights = descendingBlockHeights(syncTail, offset ?? 0, limit ?? 20);
+    const blocks = await Promise.all(
+      heights.map(async (height) => this.getBlockByHeight(network.networkId, network.id, height)),
+    );
+
+    return {
+      blocks: blocks.filter((block): block is ExplorerBlockSummary => Boolean(block)),
+    };
+  }
+
+  private async listAppliedBlocks(
+    network: ExplorerNetworkRef,
+    offset?: number,
+    limit?: number,
+  ): Promise<{ blocks: ExplorerBlockSummary[] }> {
     const refs = await this.warehouse.listAppliedBlocks(network.networkId, offset, limit ?? 20);
     const blocks = await Promise.all(
       refs.map(async (ref) =>
@@ -1021,6 +1068,20 @@ function normalizeRequiredQuery(query: string | undefined): string {
   }
 
   return q;
+}
+
+function descendingBlockHeights(tail: number, offset: number, limit: number): number[] {
+  if (tail < 0 || limit <= 0) {
+    return [];
+  }
+
+  const start = tail - offset;
+  if (start < 0) {
+    return [];
+  }
+
+  const count = Math.min(limit, start + 1);
+  return Array.from({ length: count }, (_value, index) => start - index);
 }
 
 function trimOptionalString(value: string | undefined): string {

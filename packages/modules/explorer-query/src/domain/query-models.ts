@@ -16,8 +16,11 @@ export interface ExplorerNetworkSummary {
   id: string;
   isDefault: boolean;
   name: string;
+  processTail: number;
   processed: number;
+  syncTail: number;
   synced: number;
+  tipLagBlocks: number;
 }
 
 export interface ExplorerBlockSummary {
