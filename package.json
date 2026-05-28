@@ -42,6 +42,7 @@
     "deploy:production": "bun run scripts/deploy-production.ts"
   },
   "dependencies": {
+    "@aws-sdk/client-s3": "3.1052.0",
     "@clickhouse/client": "1.18.5",
     "@elysiajs/openapi": "1.4.15",
     "@libsql/client": "0.17.3",
@@ -50,7 +51,8 @@
     "drizzle-orm": "0.45.2",
     "elysia": "1.4.28",
     "mysql2": "3.22.3",
-    "pg": "8.21.0"
+    "pg": "8.21.0",
+    "pino": "10.3.1"
   },
   "devDependencies": {
     "@biomejs/biome": "2.4.15",
