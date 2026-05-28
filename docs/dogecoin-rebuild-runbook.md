@@ -161,12 +161,13 @@ Required validation:
 - `dogecoin_current_state_ready_n1 = true`
 - `dogecoin_history_ready_n1 = true`
 - `syncTail` aligned with the node tip after online raw sync catches up
-- `processTail` within the configured online tip distance
+- `processTail` aligned with the node tip after online processing catches up
+- `finalizedTail` behind `processTail` by `indexer_reprocess_depth_n1`
 - balance sum equals spendable current UTXO sum
 - sampled transaction search/detail works
 - sampled address summary/history/UTXO reads work
 
-Raw block sync can run at the Dogecoin node's confirmed chain tip while `processTail` stays behind the configured confirmation distance. Mempool transactions are unconfirmed transactions and do not explain a healthy processing lag of a few blocks.
+Raw block sync and processing can run at the Dogecoin node's confirmed chain tip. The configured reprocess depth is the recent canonicality window; mempool transactions are unconfirmed transactions and do not explain block-processing freshness.
 
 Example in-container stats check:
 

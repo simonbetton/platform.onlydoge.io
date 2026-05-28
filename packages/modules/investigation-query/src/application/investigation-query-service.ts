@@ -13,12 +13,14 @@ type InvestigationNetwork = Awaited<
 export type InvestigationNetworkStats = {
   blockHeight: number;
   factTail: number | null;
+  finalizedTail: number;
   lastError: string | null;
   lastUpdatedAt: string | null;
   name: string;
   onlineTip: number | null;
   processTail: number;
   processed: number;
+  reprocessDepth: number;
   stage: string | null;
   syncTail: number;
   synced: number;
@@ -74,6 +76,8 @@ export class InvestigationQueryService {
       stage: await this.stringConfig(`indexer_stage_n${networkId}`),
       syncTail: await this.numberConfig(`indexer_sync_tail_n${networkId}`, -1),
       processTail: await this.numberConfig(`indexer_process_tail_n${networkId}`, -1),
+      finalizedTail: await this.numberConfig(`indexer_finalized_tail_n${networkId}`, -1),
+      reprocessDepth: await this.numberConfig(`indexer_reprocess_depth_n${networkId}`, 0),
       factTail: await this.optionalNumberConfig(`indexer_fact_tail_n${networkId}`),
       synced: await this.numberConfig(`indexer_sync_progress_n${networkId}`, 0),
       processed: await this.numberConfig(`indexer_process_progress_n${networkId}`, 0),
@@ -191,8 +195,10 @@ type CoreInvestigationState = Awaited<
 type LegacyNetworkStats = {
   blockHeight: number;
   factTail: number | null;
+  finalizedTail: number;
   processTail: number;
   processed: number;
+  reprocessDepth: number;
   stage: string | null;
   syncTail: number;
   synced: number;
@@ -209,6 +215,8 @@ function networkStatsResponse(
     stage: coreStage(coreState, legacy.stage),
     syncTail: coreNumber(coreState, 'syncTail', legacy.syncTail),
     processTail: coreNumber(coreState, 'processTail', legacy.processTail),
+    finalizedTail: legacy.finalizedTail,
+    reprocessDepth: legacy.reprocessDepth,
     onlineTip: coreNumberOrNull(coreState, 'onlineTip'),
     lastError: coreStringOrNull(coreState, 'lastError'),
     lastUpdatedAt: coreStringOrNull(coreState, 'updatedAt'),

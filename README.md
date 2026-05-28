@@ -154,6 +154,7 @@ Current Dogecoin indexer tuning:
 - `ONLYDOGE_CORE_PROCESS_WINDOW`
 - `ONLYDOGE_CORE_PROGRESS_WATCHDOG_MS`
 - `ONLYDOGE_CORE_RAW_STORAGE_TIMEOUT_MS`
+- `ONLYDOGE_CORE_REPROCESS_DEPTH`
 - `ONLYDOGE_CORE_ONLINE_TIP_DISTANCE`
 
 Managed deployment settings:
@@ -392,7 +393,7 @@ Explorer routes require `x-api-token`. Public unauthenticated routes are `/up`, 
 
 `GET /v1/explorer/mempool` reads the node's current set of unconfirmed transactions through live Dogecoin RPC and returns a bounded, normalized page of metadata. The HTTP response is `no-store`; the API keeps a one-second in-process snapshot cache to keep repeated refreshes snappy.
 
-History-dependent routes return `425` until Dogecoin history readiness is marked true. Raw block sync can follow the Dogecoin node's confirmed chain tip while current-state processing remains behind the configured confirmation distance; this processing lag is separate from the mempool.
+History-dependent routes return `425` until Dogecoin history readiness is marked true. In online mode, raw sync and processing follow the Dogecoin node's confirmed chain tip, while the last `ONLYDOGE_CORE_REPROCESS_DEPTH` processed blocks remain reorg-active and are refreshed/replayed on tip updates. That reorg window is separate from the mempool.
 
 ## Production E2E
 
@@ -443,4 +444,4 @@ GitHub Actions mirrors these gates:
 - Raw block storage is written to S3-compatible object storage in Dockerized environments.
 - The checked-in ClickHouse memory profile assumes a warehouse node in roughly the `16 GB RAM` class. If you run a materially smaller box, lower the profile values before deployment.
 - ClickHouse log-retention files cap system logs, host syslog, ClickHouse file logs, and journald at 3 days.
-- The current checked-in indexer defaults are intentionally conservative for production backfill: `ONLYDOGE_CORE_BLOCK_TIMEOUT_MS=120000`, `ONLYDOGE_CORE_DB_STATEMENT_TIMEOUT_MS=30000`, `ONLYDOGE_CORE_SYNC_COMPLETE_DISTANCE=6`, `ONLYDOGE_CORE_PROCESS_LOAD_CONCURRENCY=8`, `ONLYDOGE_CORE_PROCESS_WINDOW=100`, `ONLYDOGE_CORE_PROGRESS_WATCHDOG_MS=180000`, `ONLYDOGE_CORE_RAW_STORAGE_TIMEOUT_MS=30000`, `ONLYDOGE_CORE_ONLINE_TIP_DISTANCE=6`, `ONLYDOGE_INDEXER_SYNC_WINDOW=32`, `ONLYDOGE_INDEXER_SYNC_CONCURRENCY=4`, and `ONLYDOGE_WAREHOUSE_REQUEST_TIMEOUT_MS=30000`.
+- The current checked-in indexer defaults are intentionally conservative for production backfill: `ONLYDOGE_CORE_BLOCK_TIMEOUT_MS=120000`, `ONLYDOGE_CORE_DB_STATEMENT_TIMEOUT_MS=30000`, `ONLYDOGE_CORE_SYNC_COMPLETE_DISTANCE=6`, `ONLYDOGE_CORE_PROCESS_LOAD_CONCURRENCY=8`, `ONLYDOGE_CORE_PROCESS_WINDOW=100`, `ONLYDOGE_CORE_PROGRESS_WATCHDOG_MS=180000`, `ONLYDOGE_CORE_RAW_STORAGE_TIMEOUT_MS=30000`, `ONLYDOGE_CORE_REPROCESS_DEPTH=10`, `ONLYDOGE_CORE_ONLINE_TIP_DISTANCE=6`, `ONLYDOGE_INDEXER_SYNC_WINDOW=32`, `ONLYDOGE_INDEXER_SYNC_CONCURRENCY=4`, and `ONLYDOGE_WAREHOUSE_REQUEST_TIMEOUT_MS=30000`.

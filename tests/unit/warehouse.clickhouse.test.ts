@@ -969,37 +969,87 @@ describe('clickhouse warehouse adapter', () => {
     expect(insert).not.toHaveBeenCalled();
   });
 
-  it('rejects core Dogecoin block hash mismatches on replay', async () => {
+  it('rewinds and replays the core Dogecoin tail on a block hash mismatch', async () => {
     const adapter = new ClickHouseWarehouseAdapter({
       driver: 'clickhouse',
       location: 'http://clickhouse:8123',
     });
-    const query = vi.fn(async ({ query: statement }: { query: string }) => {
-      if (statement.includes('FROM core_processed_blocks_v1')) {
-        return {
-          json: async () => [
-            {
-              blockHeight: 2,
-              blockHash: 'old-block-2',
-            },
-          ],
-        };
-      }
-      return { json: async () => [] };
-    });
-    const { insert } = installClickHouseClient(adapter, query);
+    const query = vi.fn(
+      async ({
+        query: statement,
+        query_params: params,
+      }: {
+        query: string;
+        query_params?: Record<string, unknown>;
+      }) => {
+        if (statement.includes('FROM core_processed_blocks_v1')) {
+          if (statement.includes('block_height = {blockHeight:UInt64}')) {
+            return {
+              json: async () => [
+                {
+                  blockHeight: params?.blockHeight,
+                  blockHash: 'block-1',
+                },
+              ],
+            };
+          }
+          return {
+            json: async () => [
+              {
+                blockHeight: 2,
+                blockHash: 'old-block-2',
+              },
+            ],
+          };
+        }
+        return { json: async () => [] };
+      },
+    );
+    const { command, insert } = installClickHouseClient(adapter, query);
 
     await expect(
-      adapter.applyCoreDogecoinWindow([
-        coreApplication({
-          blockHeight: 2,
-          blockHash: 'new-block-2',
-        }),
+      adapter.applyCoreDogecoinWindow(
+        [
+          coreApplication({
+            blockHeight: 2,
+            blockHash: 'new-block-2',
+            previousBlockHash: 'block-1',
+            creates: ['new-tx:0'],
+          }),
+        ],
+        { updateCurrentState: true, validatePrevouts: false, statementTimeoutMs: 30000 },
+      ),
+    ).resolves.toEqual({
+      applied: true,
+      processTail: 2,
+    });
+
+    const commandStatements = command.mock.calls.map(([parameters]) => parameters.query);
+    expect(commandStatements).toEqual(
+      expect.arrayContaining([
+        'ALTER TABLE core_utxo_creates_v1 DELETE WHERE network_id = {networkId:UInt64} AND block_height >= {fromBlockHeight:UInt64}',
+        'ALTER TABLE core_utxo_spends_v1 DELETE WHERE network_id = {networkId:UInt64} AND spent_in_block >= {fromBlockHeight:UInt64}',
+        'ALTER TABLE core_processed_blocks_v1 DELETE WHERE network_id = {networkId:UInt64} AND block_height >= {fromBlockHeight:UInt64}',
+        'ALTER TABLE address_movements_v2 DELETE WHERE network_id = {networkId:UInt64} AND block_height >= {fromBlockHeight:UInt64}',
+        'ALTER TABLE address_movements_by_address_v2 DELETE WHERE network_id = {networkId:UInt64} AND block_height >= {fromBlockHeight:UInt64}',
       ]),
-    ).rejects.toThrow(
-      'core block hash mismatch network=7 height=2 existing=old-block-2 next=new-block-2',
     );
-    expect(insert).not.toHaveBeenCalled();
+    expect(
+      command.mock.calls
+        .map(([parameters]) => parameters)
+        .filter((parameters) => parameters.query.includes('fromBlockHeight'))
+        .every(
+          (parameters) =>
+            parameters.query_params?.fromBlockHeight === 2 &&
+            parameters.clickhouse_settings?.mutations_sync === '2',
+        ),
+    ).toBe(true);
+    expect(insert).toHaveBeenCalledWith(
+      expect.objectContaining({
+        table: 'core_processed_blocks_v1',
+        values: [expect.objectContaining({ block_hash: 'new-block-2', block_height: 2 })],
+      }),
+    );
   });
 
   it('materializes core Dogecoin current state per network and in bounded output-key ranges', async () => {

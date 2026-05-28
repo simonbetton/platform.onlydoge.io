@@ -6,6 +6,7 @@ export interface CoreDogecoinIndexerSettings {
   coreProcessWindow: number;
   coreProgressWatchdogMs: number;
   coreRawStorageTimeoutMs: number;
+  coreReprocessDepth: number;
   coreSyncCompleteDistance: number;
   syncConcurrency: number;
   syncWindow: number;

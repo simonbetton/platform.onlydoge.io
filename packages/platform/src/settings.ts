@@ -437,6 +437,7 @@ function parseIndexerSettings(env: NodeJS.ProcessEnv): IndexerSettings {
     coreProcessWindow: parsePositiveInteger(env.ONLYDOGE_CORE_PROCESS_WINDOW, 100),
     coreProgressWatchdogMs: parsePositiveInteger(env.ONLYDOGE_CORE_PROGRESS_WATCHDOG_MS, 180_000),
     coreRawStorageTimeoutMs: parsePositiveInteger(env.ONLYDOGE_CORE_RAW_STORAGE_TIMEOUT_MS, 30_000),
+    coreReprocessDepth: parsePositiveInteger(env.ONLYDOGE_CORE_REPROCESS_DEPTH, 10),
     coreSyncCompleteDistance: parsePositiveInteger(env.ONLYDOGE_CORE_SYNC_COMPLETE_DISTANCE, 6),
     syncWindow: parsePositiveInteger(env.ONLYDOGE_INDEXER_SYNC_WINDOW, 32),
     syncConcurrency: parsePositiveInteger(env.ONLYDOGE_INDEXER_SYNC_CONCURRENCY, 4),

@@ -32,6 +32,14 @@ export function configKeyIndexerProcessTail(networkId: PrimaryId): string {
   return `indexer_process_tail_n${networkId}`;
 }
 
+export function configKeyIndexerFinalizedTail(networkId: PrimaryId): string {
+  return `indexer_finalized_tail_n${networkId}`;
+}
+
+export function configKeyIndexerReprocessDepth(networkId: PrimaryId): string {
+  return `indexer_reprocess_depth_n${networkId}`;
+}
+
 export function configKeyIndexerProcessProgress(networkId: PrimaryId): string {
   return `indexer_process_progress_n${networkId}`;
 }

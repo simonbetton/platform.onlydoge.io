@@ -241,6 +241,7 @@ describe('core dogecoin indexer integration', () => {
         coreOnlineTipDistance: 0,
         coreProcessWindow: 1,
         coreProgressWatchdogMs: 0,
+        coreReprocessDepth: 1,
         coreSyncCompleteDistance: 0,
         syncWindow: 1,
       }),
@@ -273,13 +274,15 @@ describe('core dogecoin indexer integration', () => {
     expect(values.get(configKeyIndexerFactTail(7))).toBe(3);
   });
 
-  it('syncs raw online blocks to the tip without processing inside the confirmation buffer', async () => {
+  it('refreshes and processes the online reorg window to the node tip', async () => {
     const values = new Map<string, unknown>([
       [configKeyDogecoinCurrentStateReady(7), true],
       [configKeyDogecoinHistoryReady(7), true],
       ['primary', null],
     ]);
     const errors: string[] = [];
+    const appliedWindows: number[][] = [];
+    const applyContexts: unknown[] = [];
     const rawBlocks = new Map<number, Record<string, unknown>>([[2, testDogecoinBlockSnapshot(2)]]);
     let state: CoreIndexerState = {
       lastError: null,
@@ -313,8 +316,10 @@ describe('core dogecoin indexer integration', () => {
         async applyCoreDogecoinBlock() {
           throw new Error('online split should not use single-block core processing');
         },
-        async applyCoreDogecoinWindow() {
-          throw new Error('blocks inside the confirmation buffer should not be processed');
+        async applyCoreDogecoinWindow(input, context) {
+          appliedWindows.push(input.map((application) => application.blockHeight));
+          applyContexts.push(context);
+          return { applied: true, processTail: input.at(-1)?.blockHeight ?? state.processTail };
         },
         async getCoreIndexerState() {
           return state;
@@ -341,24 +346,32 @@ describe('core dogecoin indexer integration', () => {
       testIndexerSettings({
         coreOnlineTipDistance: 6,
         coreProgressWatchdogMs: 0,
+        coreReprocessDepth: 10,
         syncWindow: 10,
       }),
     );
 
     await expect(service.runOnce()).resolves.toBe(true);
     expect([...rawBlocks.keys()].sort((left, right) => left - right)).toEqual([
-      2, 3, 4, 5, 6, 7, 8,
+      0, 1, 2, 3, 4, 5, 6, 7, 8,
     ]);
+    expect(appliedWindows).toEqual([[0, 1, 2, 3, 4, 5, 6, 7, 8]]);
+    expect(applyContexts).toContainEqual(
+      expect.objectContaining({
+        updateCurrentState: true,
+        validatePrevouts: false,
+      }),
+    );
     expect(errors).toEqual([]);
     expect(state).toMatchObject({
       lastError: null,
       onlineTip: 8,
-      processTail: 2,
+      processTail: 8,
       stage: 'online',
       syncTail: 8,
     });
     expect(values.get(configKeyIndexerSyncTail(7))).toBe(8);
-    expect(values.get(configKeyIndexerProcessTail(7))).toBe(2);
+    expect(values.get(configKeyIndexerProcessTail(7))).toBe(8);
   });
 
   it('fails fast when a core block step exceeds the deadline', async () => {
@@ -522,6 +535,7 @@ function testIndexerSettings(
     coreProcessWindow: 100,
     coreProgressWatchdogMs: 180_000,
     coreRawStorageTimeoutMs: 30_000,
+    coreReprocessDepth: 10,
     coreSyncCompleteDistance: 6,
     syncConcurrency: 4,
     syncWindow: 32,

@@ -816,6 +816,8 @@ async function expectExplorerNetworks({ ctx, headers, network }: ExplorerScenari
   expect(requireStringField(networkSummary ?? {}, 'id')).toBe(network.id);
   expect(requireNumberField(networkSummary ?? {}, 'syncTail')).toBe(2);
   expect(requireNumberField(networkSummary ?? {}, 'processTail')).toBe(2);
+  expect(requireNumberField(networkSummary ?? {}, 'finalizedBlockHeight')).toBe(-1);
+  expect(requireNumberField(networkSummary ?? {}, 'reprocessDepth')).toBe(10);
   expect(requireNumberField(networkSummary ?? {}, 'tipLagBlocks')).toBe(0);
 }
 

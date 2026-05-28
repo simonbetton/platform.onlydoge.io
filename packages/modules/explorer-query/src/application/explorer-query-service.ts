@@ -1,8 +1,10 @@
 import type { AuthenticatedApiKey } from '@onlydoge/access-control';
 import {
   configKeyBlockHeight,
+  configKeyIndexerFinalizedTail,
   configKeyIndexerProcessProgress,
   configKeyIndexerProcessTail,
+  configKeyIndexerReprocessDepth,
   configKeyIndexerSyncProgress,
   configKeyIndexerSyncTail,
   type DogecoinTransaction,
@@ -137,6 +139,14 @@ export class ExplorerQueryService {
       configKeyIndexerSyncTail(network.networkId),
       -1,
     );
+    const finalizedBlockHeight = await this.configNumberOrDefault(
+      configKeyIndexerFinalizedTail(network.networkId),
+      -1,
+    );
+    const reprocessDepth = await this.configNumberOrDefault(
+      configKeyIndexerReprocessDepth(network.networkId),
+      0,
+    );
 
     return {
       id: network.id,
@@ -144,8 +154,10 @@ export class ExplorerQueryService {
       chainId: network.chainId,
       blockTime: network.blockTime,
       blockHeight,
+      finalizedBlockHeight,
       syncTail,
       processTail,
+      reprocessDepth,
       tipLagBlocks: Math.max(0, blockHeight - processTail),
       synced: await this.configNumberOrDefault(configKeyIndexerSyncProgress(network.networkId), 0),
       processed: await this.configNumberOrDefault(

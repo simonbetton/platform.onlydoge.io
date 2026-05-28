@@ -13,11 +13,13 @@ export interface ExplorerNetworkSummary {
   blockHeight: number;
   blockTime: number;
   chainId: number;
+  finalizedBlockHeight: number;
   id: string;
   isDefault: boolean;
   name: string;
   processTail: number;
   processed: number;
+  reprocessDepth: number;
   syncTail: number;
   synced: number;
   tipLagBlocks: number;

@@ -1103,7 +1103,12 @@ export class ClickHouseWarehouseAdapter
     context?: CoreDogecoinApplyContext,
   ): Promise<CoreDogecoinApplyResult> {
     const networkId = coreWindowNetworkId(input);
-    const pending = await this.pendingCoreWindowApplications(networkId, input, requestContext);
+    const pending = await this.pendingCoreWindowApplications(
+      networkId,
+      input,
+      context,
+      requestContext,
+    );
 
     if (pending.length === 0) {
       return unappliedCoreWindowResult(input);
@@ -1117,6 +1122,7 @@ export class ClickHouseWarehouseAdapter
   private async pendingCoreWindowApplications(
     networkId: PrimaryId,
     input: CoreDogecoinBlockApplication[],
+    context: CoreDogecoinApplyContext | undefined,
     requestContext: ClickHouseRequestContext,
   ): Promise<CoreDogecoinBlockApplication[]> {
     const processedBlocks = await this.getCoreProcessedBlocks(
@@ -1124,6 +1130,12 @@ export class ClickHouseWarehouseAdapter
       input.map((application) => application.blockHeight),
       requestContext,
     );
+    const reorgHeight = firstCoreReorgHeight(input, processedBlocks);
+    if (reorgHeight !== null) {
+      await this.rewindCoreDogecoinWindow(networkId, reorgHeight, context);
+      return input.filter((application) => application.blockHeight >= reorgHeight);
+    }
+
     return input.filter((application) =>
       isPendingCoreApplication(
         networkId,
@@ -1131,6 +1143,95 @@ export class ClickHouseWarehouseAdapter
         processedBlocks.get(application.blockHeight),
       ),
     );
+  }
+
+  private async rewindCoreDogecoinWindow(
+    networkId: PrimaryId,
+    fromBlockHeight: number,
+    context: CoreDogecoinApplyContext | undefined,
+  ): Promise<void> {
+    await this.deleteCoreDogecoinTail(networkId, fromBlockHeight, context);
+    if (!shouldUpdateCoreCurrentState(context)) {
+      return;
+    }
+
+    await this.rematerializeCoreCurrentStateAt(networkId, fromBlockHeight - 1, context);
+  }
+
+  private async deleteCoreDogecoinTail(
+    networkId: PrimaryId,
+    fromBlockHeight: number,
+    context: CoreDogecoinApplyContext | undefined,
+  ): Promise<void> {
+    const settings = {
+      ...clickHouseCoreMaterializationSettings(context),
+      mutations_sync: '2',
+    };
+    const deletes = [
+      {
+        table: coreUtxoCreatesTable,
+        heightColumn: 'block_height',
+      },
+      {
+        table: coreUtxoSpendsTable,
+        heightColumn: 'spent_in_block',
+      },
+      {
+        table: coreProcessedBlocksTable,
+        heightColumn: 'block_height',
+      },
+      {
+        table: 'address_movements_v2',
+        heightColumn: 'block_height',
+      },
+      {
+        table: addressMovementsByAddressTable,
+        heightColumn: 'block_height',
+      },
+      {
+        table: appliedBlocksTable,
+        heightColumn: 'block_height',
+      },
+    ];
+
+    for (const deletion of deletes) {
+      await this.executeCommand({
+        query: `ALTER TABLE ${deletion.table} DELETE WHERE network_id = {networkId:UInt64} AND ${deletion.heightColumn} >= {fromBlockHeight:UInt64}`,
+        query_params: { networkId, fromBlockHeight },
+        clickhouse_settings: settings,
+      });
+    }
+  }
+
+  private async rematerializeCoreCurrentStateAt(
+    networkId: PrimaryId,
+    asOfBlockHeight: number,
+    context: CoreDogecoinApplyContext | undefined,
+  ): Promise<void> {
+    await this.clearCoreDogecoinCurrentStateForNetwork({
+      networkId,
+      currentUtxosTable: utxoCurrentStateTable,
+      currentUtxosByAddressTable: utxoCurrentStateByAddressTable,
+      balancesTable,
+      appliedBlocksTable,
+      ...coreApplyContextOption(context),
+    });
+    if (asOfBlockHeight < 0) {
+      return;
+    }
+
+    await this.insertCoreCurrentStateMaterialization({
+      networkId,
+      asOfBlockHeight,
+      createsTable: coreUtxoCreatesTable,
+      spendsTable: coreUtxoSpendsTable,
+      currentUtxosTable: utxoCurrentStateTable,
+      currentUtxosByAddressTable: utxoCurrentStateByAddressTable,
+      balancesTable,
+      appliedBlocksTable,
+      processedBlocksTable: coreProcessedBlocksTable,
+      ...coreApplyContextOption(context),
+    });
   }
 
   private async validatePendingCoreWindow(
@@ -4102,6 +4203,20 @@ function isPendingCoreApplication(
 
   assertPendingCoreApplicationHash(networkId, application, existing);
   return false;
+}
+
+function firstCoreReorgHeight(
+  applications: CoreDogecoinBlockApplication[],
+  processedBlocks: Map<number, CoreProcessedBlockRow>,
+): number | null {
+  for (const application of applications) {
+    const existing = processedBlocks.get(application.blockHeight);
+    if (existing && existing.blockHash !== application.blockHash) {
+      return application.blockHeight;
+    }
+  }
+
+  return null;
 }
 
 function assertPendingCoreApplicationHash(

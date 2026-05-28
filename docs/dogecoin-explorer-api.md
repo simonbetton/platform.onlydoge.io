@@ -58,7 +58,7 @@ History-dependent reads require `dogecoin_history_ready_n{networkId} = true`:
 
 When history is not ready, those routes return a `425` response with a clear `dogecoin history index is not ready` error.
 
-Raw block sync is allowed to follow the Dogecoin node's confirmed chain tip. Current-state and history reads stay behind the configured processing confirmation distance, so `processTail` can lag while recent raw blocks are already visible. Processed-tip lag is not caused by transactions remaining in the mempool.
+In online mode, raw block sync and processing follow the Dogecoin node's confirmed chain tip. The last `indexer_reprocess_depth_n{networkId}` processed blocks remain reorg-active; on tip updates, the indexer refreshes and replays that window, rewinding from the first changed hash when needed. This reorg window is separate from transactions remaining in the mempool.
 
 ## Response Notes
 
