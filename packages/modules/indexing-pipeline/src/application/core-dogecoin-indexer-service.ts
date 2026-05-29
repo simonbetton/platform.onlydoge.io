@@ -319,6 +319,26 @@ export class CoreDogecoinIndexerService {
     syncTail: number,
     stage: CoreIndexerState['stage'],
   ): Promise<boolean> {
+    await this.storeRawBlockHeights(network, heights);
+
+    const nextState = await this.stateStore.upsertCoreIndexerState({
+      networkId: network.networkId,
+      stage,
+      syncTail,
+      onlineTip: latest,
+      lastError: null,
+    });
+    await this.publishProgress(network.networkId, latest, nextState);
+    console.info(
+      `[onlydoge] core synced network=${network.id} blocks=${heights.at(0) ?? state.syncTail + 1}-${heights.at(-1) ?? syncTail} latest=${latest}`,
+    );
+    return true;
+  }
+
+  private async storeRawBlockHeights(
+    network: CoreDogecoinNetwork,
+    heights: number[],
+  ): Promise<void> {
     await mapWithConcurrency(heights, this.settings.syncConcurrency, async (height) => {
       const snapshot = await this.rpc.getBlockSnapshot(network, height);
       await this.rawBlocks.putPart(network.networkId, height, rawBlockPart, snapshot, {
@@ -337,19 +357,6 @@ export class CoreDogecoinIndexerService {
         processedAt: null,
       });
     });
-
-    const nextState = await this.stateStore.upsertCoreIndexerState({
-      networkId: network.networkId,
-      stage,
-      syncTail,
-      onlineTip: latest,
-      lastError: null,
-    });
-    await this.publishProgress(network.networkId, latest, nextState);
-    console.info(
-      `[onlydoge] core synced network=${network.id} blocks=${heights.at(0) ?? state.syncTail + 1}-${heights.at(-1) ?? syncTail} latest=${latest}`,
-    );
-    return true;
   }
 
   private async processBackfill(
@@ -815,13 +822,13 @@ export class CoreDogecoinIndexerService {
     processTarget: number,
     currentStateReady: boolean,
   ): Promise<boolean> {
-    const start = onlineProcessWindowStart(
+    const heights = onlineProcessHeights(
       state.processTail,
       processTarget,
       this.settings.coreReprocessDepth,
+      this.settings.coreProcessWindow,
     );
-    const end = Math.min(processTarget, state.processTail + this.settings.coreProcessWindow);
-    const heights = range(start, end);
+    await this.storeRawBlockHeights(network, heights);
     const metrics = await this.processWindow(network, latest, heights, currentStateReady);
     await this.publishWindowProgress(network, latest, metrics, 'online');
 
@@ -1176,10 +1183,22 @@ function onlineProcessWindowStart(
   processTarget: number,
   coreReprocessDepth: number,
 ): number {
+  const reprocessTip = Math.min(processTail, processTarget);
   return Math.max(
     0,
-    Math.min(processTail + 1, reprocessWindowStart(processTarget, coreReprocessDepth)),
+    Math.min(processTail + 1, reprocessWindowStart(reprocessTip, coreReprocessDepth)),
   );
+}
+
+function onlineProcessHeights(
+  processTail: number,
+  processTarget: number,
+  coreReprocessDepth: number,
+  coreProcessWindow: number,
+): number[] {
+  const start = onlineProcessWindowStart(processTail, processTarget, coreReprocessDepth);
+  const end = Math.min(processTarget, processTail + coreProcessWindow);
+  return range(start, end);
 }
 
 function reprocessWindowStart(tip: number, coreReprocessDepth: number): number {

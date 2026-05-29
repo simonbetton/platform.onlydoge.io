@@ -179,31 +179,8 @@ describe('core dogecoin indexer integration', () => {
         async getBlockHeight() {
           return 3;
         },
-        async getBlockSnapshot() {
-          return {
-            block: {
-              hash: 'doge-block-3',
-              height: 3,
-              previousblockhash: 'doge-block-2',
-              time: 1_700_000_180,
-              tx: [
-                {
-                  txid: 'doge-tx-3',
-                  vin: [{ coinbase: 'coinbase' }],
-                  vout: [
-                    {
-                      n: 0,
-                      value: '10.00000000',
-                      scriptPubKey: {
-                        type: 'pubkeyhash',
-                        addresses: ['DNewTail11111111111111111111111111'],
-                      },
-                    },
-                  ],
-                },
-              ],
-            },
-          };
+        async getBlockSnapshot(_network, blockHeight) {
+          return testDogecoinBlockSnapshot(blockHeight);
         },
       },
       {
@@ -372,6 +349,104 @@ describe('core dogecoin indexer integration', () => {
     });
     expect(values.get(configKeyIndexerSyncTail(7))).toBe(8);
     expect(values.get(configKeyIndexerProcessTail(7))).toBe(8);
+  });
+
+  it('replays a stale online process tail even when raw sync already reached the tip', async () => {
+    const values = new Map<string, unknown>([
+      [configKeyDogecoinCurrentStateReady(7), true],
+      [configKeyDogecoinHistoryReady(7), true],
+      ['primary', null],
+    ]);
+    const errors: string[] = [];
+    const fetchedHeights: number[] = [];
+    const appliedWindows: number[][] = [];
+    const appliedHashes: string[][] = [];
+    const rawBlocks = new Map<number, Record<string, unknown>>(
+      rangeForTest(3, 12).map((height) => [
+        height,
+        testDogecoinBlockSnapshot(height, 'stale-doge-block'),
+      ]),
+    );
+    let state: CoreIndexerState = {
+      lastError:
+        'non-contiguous core dogecoin chain previous_height=5 previous_hash=stale-doge-block-5 next_height=6 next_previous=doge-block-5',
+      networkId: 7,
+      onlineTip: 12,
+      processTail: 5,
+      stage: 'online',
+      syncTail: 12,
+      updatedAt: new Date().toISOString(),
+    };
+    const service = new CoreDogecoinIndexerService(
+      memoryCoordinator(values),
+      dogecoinNetworkReader(),
+      {
+        async getPart<T extends Record<string, unknown>>(_networkId: number, blockHeight: number) {
+          return (rawBlocks.get(blockHeight) as T | undefined) ?? null;
+        },
+        async putPart(_networkId, blockHeight, _part, payload) {
+          rawBlocks.set(blockHeight, payload);
+        },
+      },
+      {
+        async getBlockHeight() {
+          return 12;
+        },
+        async getBlockSnapshot(_network, blockHeight) {
+          fetchedHeights.push(blockHeight);
+          return testDogecoinBlockSnapshot(blockHeight);
+        },
+      },
+      {
+        async applyCoreDogecoinBlock() {
+          throw new Error('online split should not use single-block core processing');
+        },
+        async applyCoreDogecoinWindow(input) {
+          appliedWindows.push(input.map((application) => application.blockHeight));
+          appliedHashes.push(input.map((application) => application.blockHash));
+          return { applied: true, processTail: input.at(-1)?.blockHeight ?? state.processTail };
+        },
+        async getCoreIndexerState() {
+          return state;
+        },
+        async getCoreUtxoOutputs() {
+          return new Map();
+        },
+        async materializeCoreDogecoinCurrentState() {},
+        async setCoreIndexerError(_networkId, error) {
+          errors.push(error ?? '');
+        },
+        async setCoreIndexerStage() {},
+        async upsertCoreBlock() {},
+        async upsertCoreIndexerState(input) {
+          state = {
+            ...state,
+            ...input,
+            lastError: input.lastError === undefined ? state.lastError : input.lastError,
+            updatedAt: new Date().toISOString(),
+          };
+          return state;
+        },
+      },
+      testIndexerSettings({
+        coreProgressWatchdogMs: 0,
+        coreReprocessDepth: 3,
+        syncWindow: 10,
+      }),
+    );
+
+    await expect(service.runOnce()).resolves.toBe(true);
+    expect([...fetchedHeights].sort((left, right) => left - right)).toEqual(rangeForTest(3, 12));
+    expect(appliedWindows).toEqual([rangeForTest(3, 12)]);
+    expect(appliedHashes).toEqual([rangeForTest(3, 12).map((height) => `doge-block-${height}`)]);
+    expect(errors).toEqual([]);
+    expect(state).toMatchObject({
+      lastError: null,
+      onlineTip: 12,
+      processTail: 12,
+      stage: 'online',
+      syncTail: 12,
+    });
   });
 
   it('fails fast when a core block step exceeds the deadline', async () => {
@@ -562,12 +637,15 @@ function memoryCoordinator(values: Map<string, unknown>) {
   };
 }
 
-function testDogecoinBlockSnapshot(blockHeight: number): Record<string, unknown> {
+function testDogecoinBlockSnapshot(
+  blockHeight: number,
+  hashPrefix = 'doge-block',
+): Record<string, unknown> {
   return {
     block: {
-      hash: `doge-block-${blockHeight}`,
+      hash: `${hashPrefix}-${blockHeight}`,
       height: blockHeight,
-      previousblockhash: blockHeight > 0 ? `doge-block-${blockHeight - 1}` : null,
+      previousblockhash: blockHeight > 0 ? `${hashPrefix}-${blockHeight - 1}` : null,
       time: 1_700_000_000 + blockHeight * 60,
       tx: [
         {
@@ -587,6 +665,10 @@ function testDogecoinBlockSnapshot(blockHeight: number): Record<string, unknown>
       ],
     },
   };
+}
+
+function rangeForTest(start: number, end: number): number[] {
+  return Array.from({ length: end - start + 1 }, (_value, index) => start + index);
 }
 
 function dogecoinNetworkReader() {
