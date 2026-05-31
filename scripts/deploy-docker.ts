@@ -359,6 +359,8 @@ async function runSsh(plan: DeployPlan, command: string): Promise<string> {
   return runCommand('ssh', [
     '-o',
     'BatchMode=yes',
+    '-o',
+    'StrictHostKeyChecking=accept-new',
     ...sshJumpArgs(plan.sshJump),
     plan.sshTarget,
     `sh -lc ${shellEscape(command)}`,
