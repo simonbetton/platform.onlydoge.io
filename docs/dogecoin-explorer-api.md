@@ -81,3 +81,5 @@ Coverage is split across:
 - warehouse tests for core ClickHouse reads and current-state materialization,
 - indexer integration tests for raw snapshot persistence and core UTXO state,
 - production E2E tests for deployed API behavior and teardown.
+
+See `docs/ai-analytics-api.md` for the guarded AI analytics SQL surface built on top of finalized transaction facts.

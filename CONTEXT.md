@@ -28,9 +28,25 @@ _Avoid_: API token, API key
 The request allowance assigned to one API key for a time window.
 _Avoid_: User limit, token limit
 
+**Analytics rate-limit budget**:
+The separate request and concurrency allowance assigned to one API key for guarded analytics SQL queries. It protects heavier ClickHouse reads without changing the API key's ordinary route budget.
+_Avoid_: SQL user limit, chat user budget, token analytics limit
+
 **Audit event**:
 An activity record for a protected request after it has resolved to an active API key. An audit event identifies the acting API key without storing the API token or request body.
 _Avoid_: Access log, user event, token log
+
+**AI analytics query**:
+A guarded read-only ClickHouse query generated for the AI chat application against OnlyDoge's curated analytics schema. An AI analytics query is not free-form access to internal warehouse tables.
+_Avoid_: Raw SQL endpoint, warehouse query, admin SQL
+
+**Transaction fact**:
+A confirmed Dogecoin transaction summary stored for analytics, including block position, input/output counts, resolved input value, gross output value, and fee when resolvable.
+_Avoid_: Raw transaction, transfer, UTXO
+
+**Gross output value**:
+The sum of all outputs in a transaction, including change outputs. Gross output value is used for "biggest transaction" analytics and is not a change-adjusted economic transfer amount.
+_Avoid_: Transfer value, sent amount, economic value
 
 ## Example Dialogue
 

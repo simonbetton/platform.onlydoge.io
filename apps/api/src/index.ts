@@ -9,6 +9,7 @@ import {
   type CreateAuditEventInput,
   enforceApiTokenAuth,
 } from '@onlydoge/access-control';
+import { buildAnalyticsQueryHttp } from '@onlydoge/analytics-query';
 import { buildEntityLabelingHttp } from '@onlydoge/entity-labeling';
 import { buildExplorerQueryHttp } from '@onlydoge/explorer-query';
 import { buildInvestigationQueryHttp } from '@onlydoge/investigation-query';
@@ -87,6 +88,7 @@ export function buildApiApp(runtime: Runtime) {
     )
     .use(buildNetworkCatalogHttp(runtime.networkCatalog, resolveAuthenticatedApiKey))
     .use(buildEntityLabelingHttp(runtime.entityLabeling, resolveAuthenticatedApiKey))
+    .use(buildAnalyticsQueryHttp(runtime.analyticsQuery, resolveAuthenticatedApiKey))
     .use(buildExplorerQueryHttp(runtime.explorerQuery, resolveAuthenticatedApiKey))
     .use(buildInvestigationQueryHttp(runtime.investigationQuery, resolveAuthenticatedApiKey))
     .use(
@@ -127,6 +129,11 @@ export function buildApiApp(runtime: Runtime) {
               name: 'Explorer',
               description:
                 'Read indexed Dogecoin blocks, transactions, addresses, UTXOs, and search results.',
+            },
+            {
+              name: 'Analytics',
+              description:
+                'Run guarded AI-generated ClickHouse SQL against curated Dogecoin analytics facts.',
             },
             {
               name: 'Investigation',

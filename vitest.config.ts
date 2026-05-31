@@ -11,6 +11,10 @@ export default defineConfig({
       '@onlydoge/api': resolve(import.meta.dirname, 'apps/api/src/index.ts'),
       '@onlydoge/indexer-app': resolve(import.meta.dirname, 'apps/indexer/src/index.ts'),
       '@onlydoge/platform': resolve(import.meta.dirname, 'packages/platform/src/index.ts'),
+      '@onlydoge/analytics-query': resolve(
+        import.meta.dirname,
+        'packages/modules/analytics-query/src/index.ts',
+      ),
       '@onlydoge/access-control': resolve(
         import.meta.dirname,
         'packages/modules/access-control/src/index.ts',

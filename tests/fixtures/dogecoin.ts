@@ -11,6 +11,7 @@ type DogecoinFixture = {
 type DogecoinFixtureBlock = {
   hash: string;
   height: number;
+  previousblockhash: string | null;
   time: number;
   tx: DogecoinFixtureTransaction[];
 };
@@ -69,6 +70,7 @@ export const dogecoinFixture = {
     0: {
       hash: 'doge-block-0',
       height: 0,
+      previousblockhash: null,
       time: 1_700_000_000,
       tx: [
         {
@@ -90,6 +92,7 @@ export const dogecoinFixture = {
     1: {
       hash: 'doge-block-1',
       height: 1,
+      previousblockhash: 'doge-block-0',
       time: 1_700_000_060,
       tx: [
         {
@@ -119,6 +122,7 @@ export const dogecoinFixture = {
     2: {
       hash: 'doge-block-2',
       height: 2,
+      previousblockhash: 'doge-block-1',
       time: 1_700_000_120,
       tx: [
         {

@@ -5,6 +5,8 @@ import {
   CoreDogecoinIndexerService,
   type CoreDogecoinIndexerSettings,
   type CoreIndexerState,
+  configKeyDogecoinAnalyticsFactsReady,
+  configKeyDogecoinAnalyticsFactsTail,
   configKeyDogecoinCurrentStateReady,
   configKeyDogecoinHistoryReady,
   configKeyIndexerFactTail,
@@ -146,6 +148,7 @@ describe('core dogecoin indexer integration', () => {
 
   it('catches up current-state tail without rerunning destructive materialization', async () => {
     const values = new Map<string, unknown>([
+      [configKeyDogecoinAnalyticsFactsReady(7), true],
       [configKeyDogecoinCurrentStateReady(7), true],
       [configKeyDogecoinHistoryReady(7), true],
       ['primary', null],
@@ -249,6 +252,7 @@ describe('core dogecoin indexer integration', () => {
       }),
     );
     expect(values.get(configKeyIndexerFactTail(7))).toBe(3);
+    expect(values.get(configKeyDogecoinAnalyticsFactsTail(7))).toBe(2);
   });
 
   it('refreshes and processes the online reorg window to the node tip', async () => {

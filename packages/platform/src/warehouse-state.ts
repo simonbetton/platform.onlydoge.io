@@ -1,3 +1,4 @@
+import type { AnalyticsTransactionFact } from '@onlydoge/analytics-query';
 import {
   type AddressMovement,
   type BlockProjectionBatch,
@@ -43,6 +44,7 @@ export interface WarehouseState {
     symbol: string;
   }>;
   transfers: BlockProjectionBatch['transfers'];
+  transactionFacts: AnalyticsTransactionFact[];
   utxoOutputs: ProjectionUtxoOutput[];
 }
 
@@ -86,6 +88,7 @@ export const emptyWarehouseState = (): WarehouseState => ({
   utxoOutputs: [],
   addressMovements: [],
   transfers: [],
+  transactionFacts: [],
   balances: [],
   directLinks: [],
   sourceLinks: [],
@@ -104,6 +107,7 @@ export function mergeWarehouseState(
     utxoOutputs: rowsOrEmpty(source.utxoOutputs),
     addressMovements: rowsOrEmpty(source.addressMovements),
     transfers: rowsOrEmpty(source.transfers),
+    transactionFacts: rowsOrEmpty(source.transactionFacts),
     balances: rowsOrEmpty(source.balances),
     directLinks: rowsOrEmpty(source.directLinks),
     sourceLinks: rowsOrEmpty(source.sourceLinks),

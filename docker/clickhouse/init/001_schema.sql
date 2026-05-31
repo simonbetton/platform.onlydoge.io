@@ -372,3 +372,26 @@ CREATE TABLE IF NOT EXISTS onlydoge.core_processed_blocks_v1
 )
 ENGINE = ReplacingMergeTree(version)
 ORDER BY (network_id, block_height);
+
+CREATE TABLE IF NOT EXISTS onlydoge.analytics_transactions_v1
+(
+  network_id UInt64,
+  block_height UInt64,
+  block_hash String,
+  block_time UInt64,
+  txid String,
+  tx_index UInt64,
+  is_coinbase UInt8,
+  input_count UInt64,
+  output_count UInt64,
+  total_input_base String,
+  gross_output_base String,
+  fee_base Nullable(String),
+  total_input_base_i256 Int256 MATERIALIZED toInt256(total_input_base),
+  gross_output_base_i256 Int256 MATERIALIZED toInt256(gross_output_base),
+  fee_base_i256 Nullable(Int256) MATERIALIZED if(isNull(fee_base), NULL, toInt256(fee_base)),
+  version UInt64
+)
+ENGINE = ReplacingMergeTree(version)
+ORDER BY (network_id, block_time, block_height, tx_index, txid)
+SETTINGS old_parts_lifetime = 0;

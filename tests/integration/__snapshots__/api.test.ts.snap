@@ -405,6 +405,173 @@ exports[`api integration > serves heartbeat and openapi 1`] = `
         ],
       },
     },
+    "/v1/analytics/query": {
+      "post": {
+        "description": "Executes generated SQL against the curated finalized Dogecoin analytics surface after validation, preflight, rate limiting, and ClickHouse resource limits.",
+        "operationId": "postV1AnalyticsQuery",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "properties": {
+                  "from": {
+                    "description": "Inclusive window start as ISO-8601 or Unix seconds.",
+                    "examples": [
+                      "2026-05-30T00:00:00.000Z",
+                    ],
+                    "type": "string",
+                  },
+                  "limit": {
+                    "description": "Server-bound result limit placeholder value. Maximum 1000.",
+                    "examples": [
+                      100,
+                    ],
+                    "type": "number",
+                  },
+                  "network": {
+                    "description": "Network id. Omit when a single Dogecoin network is configured and should be used as the default.",
+                    "examples": [
+                      "net_dogecoin",
+                    ],
+                    "type": "string",
+                  },
+                  "sql": {
+                    "description": "Generated SQL. It must be a single SELECT against the curated analytics schema and use OnlyDoge placeholders.",
+                    "type": "string",
+                  },
+                  "to": {
+                    "description": "Exclusive window end as ISO-8601 or Unix seconds.",
+                    "examples": [
+                      "2026-05-31T00:00:00.000Z",
+                    ],
+                    "type": "string",
+                  },
+                },
+                "required": [
+                  "sql",
+                  "from",
+                  "to",
+                ],
+                "type": "object",
+              },
+            },
+            "application/x-www-form-urlencoded": {
+              "schema": {
+                "properties": {
+                  "from": {
+                    "description": "Inclusive window start as ISO-8601 or Unix seconds.",
+                    "examples": [
+                      "2026-05-30T00:00:00.000Z",
+                    ],
+                    "type": "string",
+                  },
+                  "limit": {
+                    "description": "Server-bound result limit placeholder value. Maximum 1000.",
+                    "examples": [
+                      100,
+                    ],
+                    "type": "number",
+                  },
+                  "network": {
+                    "description": "Network id. Omit when a single Dogecoin network is configured and should be used as the default.",
+                    "examples": [
+                      "net_dogecoin",
+                    ],
+                    "type": "string",
+                  },
+                  "sql": {
+                    "description": "Generated SQL. It must be a single SELECT against the curated analytics schema and use OnlyDoge placeholders.",
+                    "type": "string",
+                  },
+                  "to": {
+                    "description": "Exclusive window end as ISO-8601 or Unix seconds.",
+                    "examples": [
+                      "2026-05-31T00:00:00.000Z",
+                    ],
+                    "type": "string",
+                  },
+                },
+                "required": [
+                  "sql",
+                  "from",
+                  "to",
+                ],
+                "type": "object",
+              },
+            },
+            "multipart/form-data": {
+              "schema": {
+                "properties": {
+                  "from": {
+                    "description": "Inclusive window start as ISO-8601 or Unix seconds.",
+                    "examples": [
+                      "2026-05-30T00:00:00.000Z",
+                    ],
+                    "type": "string",
+                  },
+                  "limit": {
+                    "description": "Server-bound result limit placeholder value. Maximum 1000.",
+                    "examples": [
+                      100,
+                    ],
+                    "type": "number",
+                  },
+                  "network": {
+                    "description": "Network id. Omit when a single Dogecoin network is configured and should be used as the default.",
+                    "examples": [
+                      "net_dogecoin",
+                    ],
+                    "type": "string",
+                  },
+                  "sql": {
+                    "description": "Generated SQL. It must be a single SELECT against the curated analytics schema and use OnlyDoge placeholders.",
+                    "type": "string",
+                  },
+                  "to": {
+                    "description": "Exclusive window end as ISO-8601 or Unix seconds.",
+                    "examples": [
+                      "2026-05-31T00:00:00.000Z",
+                    ],
+                    "type": "string",
+                  },
+                },
+                "required": [
+                  "sql",
+                  "from",
+                  "to",
+                ],
+                "type": "object",
+              },
+            },
+          },
+          "required": true,
+        },
+        "security": [
+          {
+            "ApiTokenAuth": [],
+          },
+        ],
+        "summary": "Run guarded AI analytics SQL",
+        "tags": [
+          "Analytics",
+        ],
+      },
+    },
+    "/v1/analytics/schema": {
+      "get": {
+        "description": "Returns the curated ClickHouse analytics schema, required placeholders, constraints, and examples for AI SQL generation.",
+        "operationId": "getV1AnalyticsSchema",
+        "security": [
+          {
+            "ApiTokenAuth": [],
+          },
+        ],
+        "summary": "Get AI analytics schema",
+        "tags": [
+          "Analytics",
+        ],
+      },
+    },
     "/v1/audit/events": {
       "get": {
         "description": "Lists audit events. Admin API keys can read all events; member API keys can read only their own actor events.",
@@ -3350,6 +3517,10 @@ exports[`api integration > serves heartbeat and openapi 1`] = `
     {
       "description": "Read indexed Dogecoin blocks, transactions, addresses, UTXOs, and search results.",
       "name": "Explorer",
+    },
+    {
+      "description": "Run guarded AI-generated ClickHouse SQL against curated Dogecoin analytics facts.",
+      "name": "Analytics",
     },
     {
       "description": "Run address/entity lookups and inspect indexer health signals.",

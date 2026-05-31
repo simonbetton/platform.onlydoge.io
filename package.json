@@ -20,8 +20,10 @@
     "health:indexer": "bun run scripts/indexer-health.ts",
     "rebuild:clickhouse-core": "bun run scripts/rebuild-clickhouse-core-state.ts",
     "materialize:clickhouse-core": "bun run scripts/materialize-clickhouse-core-current-state.ts",
+    "backfill:analytics-transactions": "bun run scripts/backfill-analytics-transaction-facts.ts",
     "benchmark:clickhouse-core": "bun run scripts/benchmark-clickhouse-core-backfill.ts",
     "test": "vitest run",
+    "test:clickhouse-smoke": "env ONLYDOGE_RUN_CLICKHOUSE_SMOKE=1 vitest run tests/integration/clickhouse-analytics-smoke.test.ts --testTimeout=180000",
     "test:watch": "vitest",
     "e2e:production": "env ONLYDOGE_RUN_PRODUCTION_E2E=1 vitest run tests/e2e/production.test.ts --testTimeout=180000",
     "e2e:production:deploy": "bun run deploy:production",
@@ -57,6 +59,7 @@
   "devDependencies": {
     "@biomejs/biome": "2.4.15",
     "@onlydoge/access-control": "workspace:*",
+    "@onlydoge/analytics-query": "workspace:*",
     "@onlydoge/api": "workspace:*",
     "@onlydoge/indexing-pipeline": "workspace:*",
     "@onlydoge/platform": "workspace:*",

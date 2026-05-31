@@ -1,4 +1,5 @@
 import { AccessControlService } from '@onlydoge/access-control';
+import { AnalyticsQueryService } from '@onlydoge/analytics-query';
 import { EntityLabelingService } from '@onlydoge/entity-labeling';
 import { ExplorerQueryService } from '@onlydoge/explorer-query';
 import { CoreDogecoinIndexerService } from '@onlydoge/indexing-pipeline';
@@ -21,6 +22,7 @@ import {
 
 export interface Runtime {
   accessControl: AccessControlService;
+  analyticsQuery: AnalyticsQueryService;
   entityLabeling: EntityLabelingService;
   explorerQuery: ExplorerQueryService;
   indexingPipeline: Pick<CoreDogecoinIndexerService, 'runOnce' | 'start'>;
@@ -61,6 +63,7 @@ export async function createRuntime(input?: {
     softDeleteAddressesByNetworkIds: (networkIds) =>
       entityLabeling.softDeleteAddressesByNetworkIds(networkIds),
   });
+  const analyticsQuery = new AnalyticsQueryService(metadata, metadata, factWarehouse);
   const investigationQuery = new InvestigationQueryService(metadata, explorerWarehouse, metadata);
   const explorerQuery = new ExplorerQueryService(
     metadata,
@@ -83,6 +86,7 @@ export async function createRuntime(input?: {
     settings,
     metadata,
     accessControl,
+    analyticsQuery,
     networkCatalog,
     entityLabeling,
     explorerQuery,

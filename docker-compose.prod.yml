@@ -51,6 +51,7 @@ services:
       CLICKHOUSE_DB: ${CLICKHOUSE_DB}
       CLICKHOUSE_USER: ${CLICKHOUSE_USER}
       CLICKHOUSE_PASSWORD: ${CLICKHOUSE_PASSWORD}
+      CLICKHOUSE_ANALYTICS_PASSWORD: ${CLICKHOUSE_ANALYTICS_PASSWORD}
       CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT: 1
     healthcheck:
       test:
@@ -67,6 +68,7 @@ services:
       - ./docker/clickhouse/init/001_schema.sql:/docker-entrypoint-initdb.d/001_schema.sql:ro
       - ./docker/clickhouse/config.d/onlydoge-memory.xml:/etc/clickhouse-server/config.d/onlydoge-memory.xml:ro
       - ./docker/clickhouse/users.d/onlydoge-memory.xml:/etc/clickhouse-server/users.d/onlydoge-memory.xml:ro
+      - ./docker/clickhouse/users.d/onlydoge-analytics.xml:/etc/clickhouse-server/users.d/onlydoge-analytics.xml:ro
 
   onlydoge-api:
     build:
@@ -124,6 +126,8 @@ services:
       ONLYDOGE_WAREHOUSE_REQUEST_TIMEOUT_MS: ${ONLYDOGE_WAREHOUSE_REQUEST_TIMEOUT_MS:-30000}
       ONLYDOGE_WAREHOUSE_USER: ${CLICKHOUSE_USER}
       ONLYDOGE_WAREHOUSE_PASSWORD: ${CLICKHOUSE_PASSWORD}
+      ONLYDOGE_ANALYTICS_WAREHOUSE_USER: ${CLICKHOUSE_ANALYTICS_USER:-onlydoge_analytics}
+      ONLYDOGE_ANALYTICS_WAREHOUSE_PASSWORD: ${CLICKHOUSE_ANALYTICS_PASSWORD}
     healthcheck:
       test:
         [
@@ -195,6 +199,8 @@ services:
       ONLYDOGE_WAREHOUSE_REQUEST_TIMEOUT_MS: ${ONLYDOGE_WAREHOUSE_REQUEST_TIMEOUT_MS:-30000}
       ONLYDOGE_WAREHOUSE_USER: ${CLICKHOUSE_USER}
       ONLYDOGE_WAREHOUSE_PASSWORD: ${CLICKHOUSE_PASSWORD}
+      ONLYDOGE_ANALYTICS_WAREHOUSE_USER: ${CLICKHOUSE_ANALYTICS_USER:-onlydoge_analytics}
+      ONLYDOGE_ANALYTICS_WAREHOUSE_PASSWORD: ${CLICKHOUSE_ANALYTICS_PASSWORD}
     healthcheck:
       test: ['CMD', 'bun', 'run', 'scripts/indexer-health.ts']
       interval: 30s

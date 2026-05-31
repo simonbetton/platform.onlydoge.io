@@ -27,14 +27,15 @@ const maxClickHouseQueryValueBytesPerChunk = 12_000;
 export function clickHouseClientOptions(
   settings: WarehouseSettings,
   requestTimeoutMs: number,
+  credentials?: { password?: string; user?: string },
 ): ClickHouseClientOptions {
   const options: ClickHouseClientOptions = {
     url: settings.location,
     request_timeout: requestTimeoutMs,
   };
   assignClickHouseStringOption(options, 'database', settings.database);
-  assignClickHouseStringOption(options, 'username', settings.user);
-  assignClickHouseStringOption(options, 'password', settings.password);
+  assignClickHouseStringOption(options, 'username', credentials?.user ?? settings.user);
+  assignClickHouseStringOption(options, 'password', credentials?.password ?? settings.password);
   return options;
 }
 

@@ -716,6 +716,7 @@ describe('clickhouse warehouse adapter', () => {
       'core_utxo_creates_v1',
       'core_utxo_spends_v1',
       'address_movements_v2',
+      'analytics_transactions_v1',
       'core_processed_blocks_v1',
     ]);
     expect(insert).toHaveBeenCalledWith(
@@ -815,6 +816,7 @@ describe('clickhouse warehouse adapter', () => {
       'core_utxo_creates_v1',
       'core_utxo_spends_v1',
       'address_movements_v2',
+      'analytics_transactions_v1',
       'utxo_outputs_current_v2',
       'balances_v2',
       'applied_blocks_v2',
@@ -1032,6 +1034,7 @@ describe('clickhouse warehouse adapter', () => {
         'ALTER TABLE core_processed_blocks_v1 DELETE WHERE network_id = {networkId:UInt64} AND block_height >= {fromBlockHeight:UInt64}',
         'ALTER TABLE address_movements_v2 DELETE WHERE network_id = {networkId:UInt64} AND block_height >= {fromBlockHeight:UInt64}',
         'ALTER TABLE address_movements_by_address_v2 DELETE WHERE network_id = {networkId:UInt64} AND block_height >= {fromBlockHeight:UInt64}',
+        'ALTER TABLE analytics_transactions_v1 DELETE WHERE network_id = {networkId:UInt64} AND block_height >= {fromBlockHeight:UInt64}',
       ]),
     );
     expect(

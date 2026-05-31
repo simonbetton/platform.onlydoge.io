@@ -53,6 +53,7 @@ services:
       CLICKHOUSE_DB: ${CLICKHOUSE_DB:-onlydoge}
       CLICKHOUSE_USER: ${CLICKHOUSE_USER:-onlydoge}
       CLICKHOUSE_PASSWORD: ${CLICKHOUSE_PASSWORD:-onlydoge}
+      CLICKHOUSE_ANALYTICS_PASSWORD: ${CLICKHOUSE_ANALYTICS_PASSWORD:-onlydoge_analytics}
       CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT: 1
     ports:
       - '${CLICKHOUSE_HTTP_PORT:-8123}:8123'
@@ -71,6 +72,7 @@ services:
       - ./docker/clickhouse/init/001_schema.sql:/docker-entrypoint-initdb.d/001_schema.sql:ro
       - ./docker/clickhouse/config.d/onlydoge-memory.xml:/etc/clickhouse-server/config.d/onlydoge-memory.xml:ro
       - ./docker/clickhouse/users.d/onlydoge-memory.xml:/etc/clickhouse-server/users.d/onlydoge-memory.xml:ro
+      - ./docker/clickhouse/users.d/onlydoge-analytics.xml:/etc/clickhouse-server/users.d/onlydoge-analytics.xml:ro
 
   onlydoge:
     build:
@@ -130,6 +132,8 @@ services:
       ONLYDOGE_WAREHOUSE_REQUEST_TIMEOUT_MS: ${ONLYDOGE_WAREHOUSE_REQUEST_TIMEOUT_MS:-30000}
       ONLYDOGE_WAREHOUSE_USER: ${CLICKHOUSE_USER:-onlydoge}
       ONLYDOGE_WAREHOUSE_PASSWORD: ${CLICKHOUSE_PASSWORD:-onlydoge}
+      ONLYDOGE_ANALYTICS_WAREHOUSE_USER: ${CLICKHOUSE_ANALYTICS_USER:-onlydoge_analytics}
+      ONLYDOGE_ANALYTICS_WAREHOUSE_PASSWORD: ${CLICKHOUSE_ANALYTICS_PASSWORD:-onlydoge_analytics}
     healthcheck:
       test:
         [

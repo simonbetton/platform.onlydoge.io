@@ -1,0 +1,32 @@
+<clickhouse>
+  <profiles>
+    <onlydoge_analytics>
+      <readonly>1</readonly>
+      <max_execution_time>5</max_execution_time>
+      <timeout_before_checking_execution_speed>0</timeout_before_checking_execution_speed>
+      <max_rows_to_read>50000000</max_rows_to_read>
+      <max_bytes_to_read>5000000000</max_bytes_to_read>
+      <max_result_rows>1000</max_result_rows>
+      <result_overflow_mode>break</result_overflow_mode>
+      <max_memory_usage>1073741824</max_memory_usage>
+      <max_threads>2</max_threads>
+    </onlydoge_analytics>
+  </profiles>
+  <users>
+    <onlydoge_analytics>
+      <password from_env="CLICKHOUSE_ANALYTICS_PASSWORD" />
+      <profile>onlydoge_analytics</profile>
+      <quota>onlydoge_analytics</quota>
+    </onlydoge_analytics>
+  </users>
+  <quotas>
+    <onlydoge_analytics>
+      <interval>
+        <duration>60</duration>
+        <queries>120</queries>
+        <read_rows>200000000</read_rows>
+        <read_bytes>20000000000</read_bytes>
+      </interval>
+    </onlydoge_analytics>
+  </quotas>
+</clickhouse>

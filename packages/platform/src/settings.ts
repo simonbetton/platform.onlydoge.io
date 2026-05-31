@@ -26,6 +26,8 @@ export interface StorageSettings {
 }
 
 export interface WarehouseSettings {
+  analyticsPassword?: string;
+  analyticsUser?: string;
   driver: 'duckdb' | 'clickhouse';
   location: string;
   database?: string;
@@ -413,11 +415,17 @@ function applyClickHouseDatabase(settings: WarehouseSettings, database: string |
 function applyClickHouseCredentials(settings: WarehouseSettings, env: NodeJS.ProcessEnv): void {
   applyClickHouseCredential(settings, 'user', env.ONLYDOGE_WAREHOUSE_USER);
   applyClickHouseCredential(settings, 'password', env.ONLYDOGE_WAREHOUSE_PASSWORD);
+  applyClickHouseCredential(settings, 'analyticsUser', env.ONLYDOGE_ANALYTICS_WAREHOUSE_USER);
+  applyClickHouseCredential(
+    settings,
+    'analyticsPassword',
+    env.ONLYDOGE_ANALYTICS_WAREHOUSE_PASSWORD,
+  );
 }
 
 function applyClickHouseCredential(
   settings: WarehouseSettings,
-  key: 'password' | 'user',
+  key: 'analyticsPassword' | 'analyticsUser' | 'password' | 'user',
   value: string | undefined,
 ): void {
   if (value) {

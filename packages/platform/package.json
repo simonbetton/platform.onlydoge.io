@@ -8,6 +8,7 @@
     "@clickhouse/client": "1.18.5",
     "@libsql/client": "^0.17.3",
     "@onlydoge/access-control": "workspace:*",
+    "@onlydoge/analytics-query": "workspace:*",
     "@onlydoge/entity-labeling": "workspace:*",
     "@onlydoge/explorer-query": "workspace:*",
     "@onlydoge/indexing-pipeline": "workspace:*",

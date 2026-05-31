@@ -5,6 +5,7 @@
   "exports": "./src/index.ts",
   "dependencies": {
     "@onlydoge/access-control": "workspace:*",
+    "@onlydoge/analytics-query": "workspace:*",
     "@onlydoge/entity-labeling": "workspace:*",
     "@onlydoge/explorer-query": "workspace:*",
     "@onlydoge/investigation-query": "workspace:*",

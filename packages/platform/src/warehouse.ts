@@ -2,6 +2,17 @@ import { mkdir, readFile, writeFile } from 'node:fs/promises';
 import { dirname } from 'node:path';
 
 import { createClient } from '@clickhouse/client';
+import {
+  type AnalyticsQueryColumn,
+  type AnalyticsQueryEstimate,
+  type AnalyticsQueryExecutionResult,
+  type AnalyticsQueryLimits,
+  type AnalyticsQueryParams,
+  type AnalyticsTransactionFact,
+  type AnalyticsWarehousePort,
+  analyticsQueryMaxResultRows,
+  analyticsTransactionsTable,
+} from '@onlydoge/analytics-query';
 import type { ExplorerWarehousePort } from '@onlydoge/explorer-query';
 import {
   type AddressMovement,
@@ -156,6 +167,15 @@ type ClickHouseCommandSettings = NonNullable<ClickHouseCommandParameters['clickh
 type ClickHouseInsertParameters = Parameters<ClickHouseClient['insert']>[0];
 type ClickHouseJsonQueryParameters = Parameters<ClickHouseClient['query']>[0];
 type ClickHouseRequestContext = ReturnType<typeof createAbortableRequestContext>;
+type ClickHouseJsonResult = {
+  data?: Array<Record<string, unknown>>;
+  meta?: AnalyticsQueryColumn[];
+  statistics?: {
+    bytes_read?: number;
+    elapsed?: number;
+    rows_read?: number;
+  };
+};
 type AddressMovementSummaryRow = {
   receivedBase: string;
   sentBase: string;
@@ -174,7 +194,8 @@ export class InMemoryWarehouseAdapter
     InvestigationWarehousePort,
     ProjectionWarehousePort,
     ProjectionFactWarehousePort,
-    ExplorerWarehousePort
+    ExplorerWarehousePort,
+    AnalyticsWarehousePort
 {
   protected state: WarehouseState = emptyWarehouseState();
   private readonly bootstrapTails = new Map<PrimaryId, number>();
@@ -657,7 +678,98 @@ export class InMemoryWarehouseAdapter
     await this.afterMutation();
   }
 
+  public async insertAnalyticsTransactionFacts(rows: AnalyticsTransactionFact[]): Promise<void> {
+    for (const row of rows) {
+      this.upsertAnalyticsTransactionFact(row);
+    }
+    await this.afterMutation();
+  }
+
+  public async backfillAnalyticsTransactionFacts(input: {
+    networkId: PrimaryId;
+    throughBlockHeight: number;
+  }): Promise<{ rowsInserted: number | null; throughBlockHeight: number }> {
+    const rows = this.buildInMemoryAnalyticsTransactionFacts(
+      input.networkId,
+      input.throughBlockHeight,
+    );
+    this.state.transactionFacts = this.state.transactionFacts.filter(
+      (row) => row.networkId !== input.networkId || row.blockHeight > input.throughBlockHeight,
+    );
+    for (const row of rows) {
+      this.upsertAnalyticsTransactionFact(row);
+    }
+    await this.afterMutation();
+    return { rowsInserted: rows.length, throughBlockHeight: input.throughBlockHeight };
+  }
+
+  public async preflightAnalyticsQuery(input: {
+    params: AnalyticsQueryParams;
+  }): Promise<AnalyticsQueryEstimate> {
+    return {
+      estimatedRows: this.filteredAnalyticsFacts(input.params).length,
+      estimatedBytes: null,
+    };
+  }
+
+  public async executeAnalyticsQuery(input: {
+    params: AnalyticsQueryParams;
+    sql: string;
+  }): Promise<AnalyticsQueryExecutionResult> {
+    const rows = executeInMemoryAnalyticsSql(input.sql, this.filteredAnalyticsFacts(input.params));
+    return {
+      rows,
+      columns: inMemoryAnalyticsColumns(rows),
+      statistics: {
+        elapsed: null,
+        rowsRead: this.filteredAnalyticsFacts(input.params).length,
+        bytesRead: null,
+      },
+      warnings: ['in-memory analytics execution is test-only'],
+    };
+  }
+
   protected async afterMutation(): Promise<void> {}
+
+  private upsertAnalyticsTransactionFact(row: AnalyticsTransactionFact): void {
+    const index = this.state.transactionFacts.findIndex(
+      (candidate) => candidate.networkId === row.networkId && candidate.txid === row.txid,
+    );
+    if (index >= 0) {
+      this.state.transactionFacts[index] = { ...row };
+      return;
+    }
+
+    this.state.transactionFacts.push({ ...row });
+  }
+
+  private buildInMemoryAnalyticsTransactionFacts(
+    networkId: PrimaryId,
+    throughBlockHeight: number,
+  ): AnalyticsTransactionFact[] {
+    const outputs = this.state.utxoOutputs.filter(
+      (row) => row.networkId === networkId && row.blockHeight <= throughBlockHeight,
+    );
+    const outputsByKey = new Map(outputs.map((row) => [row.outputKey, row]));
+    const grouped = new Map<string, ProjectionUtxoOutput[]>();
+    for (const output of outputs) {
+      grouped.set(output.txid, [...(grouped.get(output.txid) ?? []), output]);
+    }
+
+    return [...grouped.values()].map((txOutputs) =>
+      analyticsFactFromOutputs(txOutputs, outputsByKey, throughBlockHeight),
+    );
+  }
+
+  private filteredAnalyticsFacts(params: AnalyticsQueryParams): AnalyticsTransactionFact[] {
+    return this.state.transactionFacts.filter(
+      (row) =>
+        row.networkId === params.networkId &&
+        row.blockTime >= params.fromTime &&
+        row.blockTime < params.toTime &&
+        row.blockHeight <= params.maxFinalizedHeight,
+    );
+  }
 
   private applyBatchUtxoCreates(outputs: ProjectionUtxoOutput[]): void {
     for (const output of outputs) {
@@ -1034,6 +1146,179 @@ function isUnspentSpendableOutput(
   return [output.isSpendable, output.spentByTxid === null].every(Boolean);
 }
 
+function analyticsFactFromOutputs(
+  outputs: ProjectionUtxoOutput[],
+  outputsByKey: Map<string, ProjectionUtxoOutput>,
+  version: number,
+): AnalyticsTransactionFact {
+  const sorted = [...outputs].sort((left, right) => left.vout - right.vout);
+  const first = requireAnalyticsOutput(sorted);
+  const isCoinbase = sorted.some((output) => output.isCoinbase);
+  const spentInputs = [...outputsByKey.values()].filter((output) =>
+    isSpentByTransaction(output, first.txid),
+  );
+  const totalInput = spentInputs.reduce((sum, output) => sum + BigInt(output.valueBase), 0n);
+  const grossOutput = sorted.reduce((sum, output) => sum + BigInt(output.valueBase), 0n);
+
+  return {
+    networkId: first.networkId,
+    blockHeight: first.blockHeight,
+    blockHash: first.blockHash,
+    blockTime: first.blockTime,
+    txid: first.txid,
+    txIndex: first.txIndex,
+    isCoinbase,
+    inputCount: spentInputs.length,
+    outputCount: sorted.length,
+    totalInputBase: totalInput.toString(),
+    grossOutputBase: grossOutput.toString(),
+    feeBase: analyticsFeeBase(isCoinbase, totalInput, grossOutput),
+    version,
+  };
+}
+
+function requireAnalyticsOutput(outputs: ProjectionUtxoOutput[]): ProjectionUtxoOutput {
+  const first = outputs[0];
+  if (!first) {
+    throw new Error('analytics transaction fact requires at least one output');
+  }
+
+  return first;
+}
+
+function isSpentByTransaction(output: ProjectionUtxoOutput, txid: string): boolean {
+  return output.spentByTxid === txid;
+}
+
+function analyticsFeeBase(
+  isCoinbase: boolean,
+  totalInput: bigint,
+  grossOutput: bigint,
+): string | null {
+  if (isCoinbase || totalInput === 0n) {
+    return null;
+  }
+
+  return (totalInput - grossOutput).toString();
+}
+
+function executeInMemoryAnalyticsSql(
+  sql: string,
+  facts: AnalyticsTransactionFact[],
+): Array<Record<string, unknown>> {
+  const normalized = sql.toLowerCase();
+  if (normalized.includes('avgornull') || normalized.includes('avg(')) {
+    return [inMemoryAverageFeeRow(facts)];
+  }
+  if (normalized.includes('fee_base')) {
+    return inMemoryTopFeeRows(facts);
+  }
+  if (normalized.includes('gross_output')) {
+    return inMemoryTopGrossOutputRows(facts);
+  }
+
+  return facts.slice(0, analyticsQueryMaxResultRows).map(inMemoryAnalyticsFactRow);
+}
+
+function inMemoryAverageFeeRow(facts: AnalyticsTransactionFact[]): Record<string, unknown> {
+  const feeValues = facts
+    .filter((fact) => !fact.isCoinbase && fact.feeBase !== null)
+    .map((fact) => BigInt(fact.feeBase as string));
+  if (feeValues.length === 0) {
+    return { average_fee_base: null };
+  }
+
+  const total = feeValues.reduce((sum, fee) => sum + fee, 0n);
+  return { average_fee_base: (total / BigInt(feeValues.length)).toString() };
+}
+
+function inMemoryTopFeeRows(facts: AnalyticsTransactionFact[]): Array<Record<string, unknown>> {
+  return facts
+    .filter((fact) => !fact.isCoinbase && fact.feeBase !== null)
+    .sort(compareAnalyticsFeeDesc)
+    .slice(0, analyticsQueryMaxResultRows)
+    .map((fact) => ({
+      txid: fact.txid,
+      block_height: fact.blockHeight,
+      block_time: fact.blockTime,
+      fee_base: fact.feeBase,
+    }));
+}
+
+function inMemoryTopGrossOutputRows(
+  facts: AnalyticsTransactionFact[],
+): Array<Record<string, unknown>> {
+  return facts
+    .filter((fact) => !fact.isCoinbase)
+    .sort(compareAnalyticsGrossOutputDesc)
+    .slice(0, analyticsQueryMaxResultRows)
+    .map((fact) => ({
+      txid: fact.txid,
+      block_height: fact.blockHeight,
+      block_time: fact.blockTime,
+      gross_output_base: fact.grossOutputBase,
+    }));
+}
+
+function inMemoryAnalyticsFactRow(fact: AnalyticsTransactionFact): Record<string, unknown> {
+  return {
+    network_id: fact.networkId,
+    block_height: fact.blockHeight,
+    block_hash: fact.blockHash,
+    block_time: fact.blockTime,
+    txid: fact.txid,
+    tx_index: fact.txIndex,
+    is_coinbase: fact.isCoinbase ? 1 : 0,
+    input_count: fact.inputCount,
+    output_count: fact.outputCount,
+    total_input_base_i256: fact.totalInputBase,
+    gross_output_base_i256: fact.grossOutputBase,
+    fee_base_i256: fact.feeBase,
+  };
+}
+
+function compareAnalyticsFeeDesc(
+  left: AnalyticsTransactionFact,
+  right: AnalyticsTransactionFact,
+): number {
+  return compareBigIntDesc(left.feeBase ?? '0', right.feeBase ?? '0');
+}
+
+function compareAnalyticsGrossOutputDesc(
+  left: AnalyticsTransactionFact,
+  right: AnalyticsTransactionFact,
+): number {
+  return compareBigIntDesc(left.grossOutputBase, right.grossOutputBase);
+}
+
+function compareBigIntDesc(left: string, right: string): number {
+  const diff = BigInt(right) - BigInt(left);
+  if (diff > 0n) {
+    return 1;
+  }
+  if (diff < 0n) {
+    return -1;
+  }
+
+  return 0;
+}
+
+function inMemoryAnalyticsColumns(rows: Array<Record<string, unknown>>): AnalyticsQueryColumn[] {
+  const first = rows[0];
+  if (!first) {
+    return [];
+  }
+
+  return Object.entries(first).map(([name, value]) => ({
+    name,
+    type: inMemoryAnalyticsColumnType(value),
+  }));
+}
+
+function inMemoryAnalyticsColumnType(value: unknown): string {
+  return typeof value === 'number' ? 'UInt64' : 'String';
+}
+
 function utxoOutputForWrite(output: ProjectionUtxoOutput, clone: boolean): ProjectionUtxoOutput {
   if (clone) {
     return { ...output };
@@ -1048,14 +1333,23 @@ export class ClickHouseWarehouseAdapter
     ProjectionWarehousePort,
     ProjectionFactWarehousePort,
     ExplorerWarehousePort,
-    ClickHouseCoreDogecoinStore
+    ClickHouseCoreDogecoinStore,
+    AnalyticsWarehousePort
 {
   private readonly client: ReturnType<typeof createClient>;
+  private readonly analyticsClient: ReturnType<typeof createClient>;
   private readonly requestTimeoutMs: number;
 
   public constructor(settings: WarehouseSettings) {
     this.requestTimeoutMs = settings.requestTimeoutMs ?? 30_000;
     this.client = createClient(clickHouseClientOptions(settings, this.requestTimeoutMs));
+    this.analyticsClient = createClient(
+      clickHouseClientOptions(
+        settings,
+        this.requestTimeoutMs,
+        analyticsClickHouseCredentials(settings),
+      ),
+    );
   }
 
   public async boot(): Promise<void> {
@@ -1192,6 +1486,10 @@ export class ClickHouseWarehouseAdapter
         table: appliedBlocksTable,
         heightColumn: 'block_height',
       },
+      {
+        table: analyticsTransactionsTable,
+        heightColumn: 'block_height',
+      },
     ];
 
     for (const deletion of deletes) {
@@ -1277,6 +1575,7 @@ export class ClickHouseWarehouseAdapter
       requestContext,
     );
     await this.insertCoreAddressMovements(networkId, pending, requestContext);
+    await this.insertCoreTransactionFacts(networkId, pending, requestContext);
     await this.applyCoreCurrentStateWindowIfEnabled(networkId, pending, context, requestContext);
     await this.insertRows(
       coreProcessedBlocksTable,
@@ -1312,6 +1611,28 @@ export class ClickHouseWarehouseAdapter
 
     return pending.flatMap((application) =>
       coreApplicationAddressMovements(application, createdOutputs, currentOutputs),
+    );
+  }
+
+  private async insertCoreTransactionFacts(
+    networkId: PrimaryId,
+    pending: CoreDogecoinBlockApplication[],
+    requestContext: ClickHouseRequestContext,
+  ): Promise<void> {
+    const createdOutputs = coreCreatedOutputsByKey(pending);
+    const currentOutputs = await this.getCurrentUtxoOutputMap(
+      networkId,
+      externalCoreSpendKeys(pending),
+      requestContext,
+    );
+    const facts = pending.flatMap((application) =>
+      coreApplicationTransactionFacts(application, createdOutputs, currentOutputs),
+    );
+
+    await this.insertRows(
+      analyticsTransactionsTable,
+      facts.map(toAnalyticsTransactionFactInsertRow),
+      requestContext,
     );
   }
 
@@ -3315,6 +3636,90 @@ export class ClickHouseWarehouseAdapter
     return rows.length > 0;
   }
 
+  public async insertAnalyticsTransactionFacts(rows: AnalyticsTransactionFact[]): Promise<void> {
+    await this.insertRows(
+      analyticsTransactionsTable,
+      rows.map(toAnalyticsTransactionFactInsertRow),
+    );
+  }
+
+  public async backfillAnalyticsTransactionFacts(input: {
+    networkId: PrimaryId;
+    throughBlockHeight: number;
+  }): Promise<{ rowsInserted: number | null; throughBlockHeight: number }> {
+    await this.executeCommand({
+      query: `
+        ALTER TABLE ${analyticsTransactionsTable}
+        DELETE WHERE network_id = {networkId:UInt64}
+          AND block_height <= {throughBlockHeight:UInt64}
+      `,
+      query_params: input,
+      clickhouse_settings: {
+        mutations_sync: '2',
+        max_execution_time: 300,
+      },
+    });
+    await this.executeCommand({
+      query: analyticsTransactionFactsBackfillSql(),
+      query_params: input,
+      clickhouse_settings: {
+        max_execution_time: 300,
+        max_bytes_before_external_group_by: '1073741824',
+        max_bytes_before_external_sort: '1073741824',
+      },
+    });
+
+    return { rowsInserted: null, throughBlockHeight: input.throughBlockHeight };
+  }
+
+  public async preflightAnalyticsQuery(input: {
+    limits: AnalyticsQueryLimits;
+    params: AnalyticsQueryParams;
+    sql: string;
+  }): Promise<AnalyticsQueryEstimate> {
+    const rows = await this.queryAnalyticsRows<{
+      bytes?: number;
+      rows?: number;
+    }>({
+      query: `EXPLAIN ESTIMATE ${input.sql}`,
+      query_params: analyticsQueryParamsRecord(input.params),
+      format: 'JSONEachRow',
+      clickhouse_settings: analyticsClickHouseSettings(input.limits),
+    });
+
+    return {
+      estimatedRows: sumNullableNumbers(rows.map((row) => row.rows)),
+      estimatedBytes: sumNullableNumbers(rows.map((row) => row.bytes)),
+    };
+  }
+
+  public async executeAnalyticsQuery(input: {
+    limits: AnalyticsQueryLimits;
+    params: AnalyticsQueryParams;
+    sql: string;
+  }): Promise<AnalyticsQueryExecutionResult> {
+    try {
+      const result = await this.analyticsClient.query({
+        query: input.sql,
+        query_params: analyticsQueryParamsRecord(input.params),
+        format: 'JSON',
+        clickhouse_settings: analyticsClickHouseSettings(input.limits),
+      });
+      return analyticsExecutionResult(await result.json<ClickHouseJsonResult>());
+    } catch (error) {
+      throw this.toInfrastructureError(error);
+    }
+  }
+
+  private async queryAnalyticsRows<T>(parameters: ClickHouseJsonQueryParameters): Promise<T[]> {
+    try {
+      const result = await this.analyticsClient.query(parameters);
+      return (await result.json<T>()) as T[];
+    } catch (error) {
+      throw this.toInfrastructureError(error);
+    }
+  }
+
   private async queryRows<T>(
     parameters: ClickHouseJsonQueryParameters,
     requestContext?: ClickHouseRequestContext,
@@ -3456,7 +3861,8 @@ export async function createWarehouse(
 export async function createFactWarehouse(
   settings: WarehouseSettings,
 ): Promise<
-  ProjectionFactWarehousePort &
+  AnalyticsWarehousePort &
+    ProjectionFactWarehousePort &
     Pick<
       ProjectionStateStorePort,
       | 'getCurrentAddressSummary'
@@ -3476,7 +3882,8 @@ export async function createFactWarehouse(
     ExplorerWarehousePort
 > {
   return createWarehouse(settings) as Promise<
-    ProjectionFactWarehousePort &
+    AnalyticsWarehousePort &
+      ProjectionFactWarehousePort &
       Pick<
         ProjectionStateStorePort,
         | 'getCurrentAddressSummary'
@@ -4140,6 +4547,26 @@ function toCoreProcessedBlockInsertRow(
   };
 }
 
+function toAnalyticsTransactionFactInsertRow(
+  row: AnalyticsTransactionFact,
+): Record<string, unknown> {
+  return {
+    network_id: row.networkId,
+    block_height: row.blockHeight,
+    block_hash: row.blockHash,
+    block_time: row.blockTime,
+    txid: row.txid,
+    tx_index: row.txIndex,
+    is_coinbase: clickHouseBool(row.isCoinbase),
+    input_count: row.inputCount,
+    output_count: row.outputCount,
+    total_input_base: row.totalInputBase,
+    gross_output_base: row.grossOutputBase,
+    fee_base: row.feeBase,
+    version: row.version,
+  };
+}
+
 function coreWindowNetworkId(input: CoreDogecoinBlockApplication[]): PrimaryId {
   const [application] = input;
   if (!application) {
@@ -4344,6 +4771,88 @@ function coreSpendAddressMovement(
 
 function isCoreAddressMovementOutput(output: ProjectionUtxoOutput): boolean {
   return output.isSpendable && output.address.length > 0;
+}
+
+function coreApplicationTransactionFacts(
+  application: CoreDogecoinBlockApplication,
+  createdOutputs: Map<string, ProjectionUtxoOutput>,
+  currentOutputs: Map<string, ProjectionUtxoOutput>,
+): AnalyticsTransactionFact[] {
+  const outputsByTxid = groupCoreOutputsByTxid(application.utxoCreates);
+  const spendsByTxid = groupCoreSpendsByTxid(application.utxoSpends);
+
+  return [...outputsByTxid.entries()].map(([txid, outputs]) =>
+    coreTransactionFact(application, txid, outputs, spendsByTxid.get(txid) ?? [], {
+      createdOutputs,
+      currentOutputs,
+    }),
+  );
+}
+
+function groupCoreOutputsByTxid(
+  outputs: ProjectionUtxoOutput[],
+): Map<string, ProjectionUtxoOutput[]> {
+  const grouped = new Map<string, ProjectionUtxoOutput[]>();
+  for (const output of outputs) {
+    grouped.set(output.txid, [...(grouped.get(output.txid) ?? []), output]);
+  }
+
+  return grouped;
+}
+
+function groupCoreSpendsByTxid(spends: CoreDogecoinSpend[]): Map<string, CoreDogecoinSpend[]> {
+  const grouped = new Map<string, CoreDogecoinSpend[]>();
+  for (const spend of spends) {
+    grouped.set(spend.spentByTxid, [...(grouped.get(spend.spentByTxid) ?? []), spend]);
+  }
+
+  return grouped;
+}
+
+function coreTransactionFact(
+  application: CoreDogecoinBlockApplication,
+  txid: string,
+  outputs: ProjectionUtxoOutput[],
+  spends: CoreDogecoinSpend[],
+  outputMaps: {
+    createdOutputs: Map<string, ProjectionUtxoOutput>;
+    currentOutputs: Map<string, ProjectionUtxoOutput>;
+  },
+): AnalyticsTransactionFact {
+  const sortedOutputs = [...outputs].sort((left, right) => left.vout - right.vout);
+  const firstOutput = requireAnalyticsOutput(sortedOutputs);
+  const totalInput = spends.reduce((sum, spend) => sum + coreSpendValue(spend, outputMaps), 0n);
+  const grossOutput = sortedOutputs.reduce((sum, output) => sum + BigInt(output.valueBase), 0n);
+  const isCoinbase = sortedOutputs.some((output) => output.isCoinbase);
+
+  return {
+    networkId: application.networkId,
+    blockHeight: application.blockHeight,
+    blockHash: application.blockHash,
+    blockTime: application.blockTime,
+    txid,
+    txIndex: firstOutput.txIndex,
+    isCoinbase,
+    inputCount: spends.length,
+    outputCount: sortedOutputs.length,
+    totalInputBase: totalInput.toString(),
+    grossOutputBase: grossOutput.toString(),
+    feeBase: analyticsFeeBase(isCoinbase, totalInput, grossOutput),
+    version: application.blockHeight,
+  };
+}
+
+function coreSpendValue(
+  spend: CoreDogecoinSpend,
+  outputMaps: {
+    createdOutputs: Map<string, ProjectionUtxoOutput>;
+    currentOutputs: Map<string, ProjectionUtxoOutput>;
+  },
+): bigint {
+  const output =
+    outputMaps.createdOutputs.get(spend.outputKey) ??
+    outputMaps.currentOutputs.get(spend.outputKey);
+  return output ? BigInt(output.valueBase) : 0n;
 }
 
 function assertCorePrevoutsExist(
@@ -4736,6 +5245,140 @@ function clickHouseCoreMaterializationSettings(
     min_insert_block_size_bytes: '0',
     min_insert_block_size_rows: '0',
   };
+}
+
+function analyticsClickHouseSettings(limits: AnalyticsQueryLimits): ClickHouseCommandSettings {
+  return {
+    max_execution_time: limits.maxExecutionSeconds,
+    max_rows_to_read: String(limits.maxRowsToRead),
+    max_bytes_to_read: String(limits.maxBytesToRead),
+    max_result_rows: String(limits.maxResultRows),
+    result_overflow_mode: 'break',
+    timeout_before_checking_execution_speed: 0,
+  };
+}
+
+function analyticsClickHouseCredentials(
+  settings: WarehouseSettings,
+): { password?: string; user?: string } | undefined {
+  const credentials: { password?: string; user?: string } = {};
+  if (settings.analyticsUser) {
+    credentials.user = settings.analyticsUser;
+  }
+  if (settings.analyticsPassword) {
+    credentials.password = settings.analyticsPassword;
+  }
+
+  return Object.keys(credentials).length > 0 ? credentials : undefined;
+}
+
+function analyticsQueryParamsRecord(params: AnalyticsQueryParams): Record<string, unknown> {
+  return { ...params };
+}
+
+function analyticsExecutionResult(payload: ClickHouseJsonResult): AnalyticsQueryExecutionResult {
+  return {
+    columns: payload.meta ?? [],
+    rows: payload.data ?? [],
+    statistics: {
+      elapsed: payload.statistics?.elapsed ?? null,
+      rowsRead: payload.statistics?.rows_read ?? null,
+      bytesRead: payload.statistics?.bytes_read ?? null,
+    },
+    warnings: [],
+  };
+}
+
+function sumNullableNumbers(values: Array<number | undefined>): number | null {
+  const numbers = values.filter((value): value is number => typeof value === 'number');
+  if (numbers.length === 0) {
+    return null;
+  }
+
+  return numbers.reduce((sum, value) => sum + value, 0);
+}
+
+function analyticsTransactionFactsBackfillSql(): string {
+  return `
+    INSERT INTO ${analyticsTransactionsTable} (
+      network_id,
+      block_height,
+      block_hash,
+      block_time,
+      txid,
+      tx_index,
+      is_coinbase,
+      input_count,
+      output_count,
+      total_input_base,
+      gross_output_base,
+      fee_base,
+      version
+    )
+    WITH
+    latest_outputs AS (
+      SELECT
+        network_id,
+        block_height,
+        block_hash,
+        block_time,
+        txid,
+        tx_index,
+        vout,
+        output_key,
+        value_base,
+        is_coinbase,
+        version
+      FROM ${coreUtxoCreatesTable}
+      WHERE network_id = {networkId:UInt64}
+        AND block_height <= {throughBlockHeight:UInt64}
+      ORDER BY output_key ASC, version DESC
+      LIMIT 1 BY output_key
+    ),
+    latest_spends AS (
+      SELECT
+        spent_output_key,
+        spent_by_txid,
+        version
+      FROM ${coreUtxoSpendsTable}
+      WHERE network_id = {networkId:UInt64}
+        AND spent_in_block <= {throughBlockHeight:UInt64}
+      ORDER BY spent_output_key ASC, version DESC
+      LIMIT 1 BY spent_output_key
+    ),
+    input_totals AS (
+      SELECT
+        s.spent_by_txid AS txid,
+        count() AS input_count,
+        sum(toInt256(o.value_base)) AS total_input_base_i256
+      FROM latest_spends AS s
+      INNER JOIN latest_outputs AS o
+      ON o.output_key = s.spent_output_key
+      GROUP BY s.spent_by_txid
+    )
+    SELECT
+      any(o.network_id) AS network_id,
+      any(o.block_height) AS block_height,
+      any(o.block_hash) AS block_hash,
+      any(o.block_time) AS block_time,
+      o.txid AS txid,
+      min(o.tx_index) AS tx_index,
+      max(o.is_coinbase) AS is_coinbase,
+      toUInt64(coalesce(any(i.input_count), 0)) AS input_count,
+      count() AS output_count,
+      toString(coalesce(any(i.total_input_base_i256), 0)) AS total_input_base,
+      toString(sum(toInt256(o.value_base))) AS gross_output_base,
+      if(
+        max(o.is_coinbase) = 1 OR coalesce(any(i.total_input_base_i256), 0) = 0,
+        NULL,
+        toString(coalesce(any(i.total_input_base_i256), 0) - sum(toInt256(o.value_base)))
+      ) AS fee_base,
+      max(o.block_height) AS version
+    FROM latest_outputs AS o
+    LEFT JOIN input_totals AS i
+    ON i.txid = o.txid
+    GROUP BY o.txid
+  `;
 }
 
 function addCoreBalanceDelta(
@@ -5201,6 +5844,30 @@ const clickHouseWarehouseBootstrapStatements = [
     ENGINE = ReplacingMergeTree(version)
     ORDER BY (network_id, block_height)
   `,
+  `
+    CREATE TABLE IF NOT EXISTS ${analyticsTransactionsTable}
+    (
+      network_id UInt64,
+      block_height UInt64,
+      block_hash String,
+      block_time UInt64,
+      txid String,
+      tx_index UInt64,
+      is_coinbase UInt8,
+      input_count UInt64,
+      output_count UInt64,
+      total_input_base String,
+      gross_output_base String,
+      fee_base Nullable(String),
+      total_input_base_i256 Int256 MATERIALIZED toInt256(total_input_base),
+      gross_output_base_i256 Int256 MATERIALIZED toInt256(gross_output_base),
+      fee_base_i256 Nullable(Int256) MATERIALIZED if(isNull(fee_base), NULL, toInt256(fee_base)),
+      version UInt64
+    )
+    ENGINE = ReplacingMergeTree(version)
+    ORDER BY (network_id, block_time, block_height, tx_index, txid)
+    SETTINGS old_parts_lifetime = 0
+  `,
 ];
 
 const clickHouseDestructiveResetTables = [
@@ -5225,4 +5892,5 @@ const clickHouseDestructiveResetTables = [
   coreUtxoCreatesTable,
   coreUtxoSpendsTable,
   coreProcessedBlocksTable,
+  analyticsTransactionsTable,
 ];

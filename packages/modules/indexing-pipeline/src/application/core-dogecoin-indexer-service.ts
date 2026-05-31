@@ -12,6 +12,8 @@ import type {
 import { fromDecimalUnits } from '../domain/amounts';
 import {
   configKeyBlockHeight,
+  configKeyDogecoinAnalyticsFactsReady,
+  configKeyDogecoinAnalyticsFactsTail,
   configKeyDogecoinCurrentStateReady,
   configKeyDogecoinHistoryReady,
   configKeyIndexerFactProgress,
@@ -876,9 +878,25 @@ export class CoreDogecoinIndexerService {
         ),
       );
     }
+    if (await this.isDogecoinAnalyticsFactsReady(networkId)) {
+      writes.push(
+        this.configs.setJsonValue(
+          configKeyDogecoinAnalyticsFactsTail(networkId),
+          finalizedTail(state.processTail, this.settings.coreReprocessDepth),
+        ),
+      );
+    }
 
     await Promise.all(writes);
     this.observeProgress(networkId, state);
+  }
+
+  private async isDogecoinAnalyticsFactsReady(networkId: PrimaryId): Promise<boolean> {
+    return (
+      (await this.configs.getJsonValue<boolean>(
+        configKeyDogecoinAnalyticsFactsReady(networkId),
+      )) === true
+    );
   }
 
   private async runCoreBlockStep<T>(

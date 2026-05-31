@@ -60,6 +60,14 @@ export function configKeyDogecoinHistoryReady(networkId: PrimaryId): string {
   return `dogecoin_history_ready_n${networkId}`;
 }
 
+export function configKeyDogecoinAnalyticsFactsReady(networkId: PrimaryId): string {
+  return `dogecoin_analytics_facts_ready_n${networkId}`;
+}
+
+export function configKeyDogecoinAnalyticsFactsTail(networkId: PrimaryId): string {
+  return `dogecoin_analytics_facts_tail_n${networkId}`;
+}
+
 export function configKeyDogecoinCurrentStateMaterialization(networkId: PrimaryId): string {
   return `dogecoin_current_state_materialization_n${networkId}`;
 }

@@ -20,6 +20,7 @@
       "@onlydoge/api": ["./apps/api/src/index.ts"],
       "@onlydoge/indexer-app": ["./apps/indexer/src/index.ts"],
       "@onlydoge/platform": ["./packages/platform/src/index.ts"],
+      "@onlydoge/analytics-query": ["./packages/modules/analytics-query/src/index.ts"],
       "@onlydoge/access-control": ["./packages/modules/access-control/src/index.ts"],
       "@onlydoge/network-catalog": ["./packages/modules/network-catalog/src/index.ts"],
       "@onlydoge/entity-labeling": ["./packages/modules/entity-labeling/src/index.ts"],
