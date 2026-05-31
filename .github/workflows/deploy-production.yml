@@ -29,6 +29,37 @@ jobs:
       name: production
       url: ${{ vars.PROD_BASE_URL }}
     steps:
+      - name: Validate production configuration
+        env:
+          PROD_ADMIN_API_TOKEN: ${{ secrets.PROD_ADMIN_API_TOKEN }}
+          PROD_BASE_URL: ${{ vars.PROD_BASE_URL }}
+          PROD_ENV_FILE: ${{ secrets.PROD_ENV_FILE }}
+          PROD_SSH_PRIVATE_KEY: ${{ secrets.PROD_SSH_PRIVATE_KEY }}
+          PROD_SSH_TARGET: ${{ secrets.PROD_SSH_TARGET }}
+          SKIP_E2E: ${{ inputs.skip_e2e }}
+        run: |
+          set -euo pipefail
+          missing=()
+          for name in PROD_BASE_URL PROD_ENV_FILE PROD_SSH_PRIVATE_KEY PROD_SSH_TARGET; do
+            if [[ -z "${!name}" ]]; then
+              missing+=("$name")
+            fi
+          done
+          if [[ "$SKIP_E2E" != "true" && -z "$PROD_ADMIN_API_TOKEN" ]]; then
+            missing+=(PROD_ADMIN_API_TOKEN)
+          fi
+          if (( ${#missing[@]} > 0 )); then
+            printf '::error::Missing required production configuration: %s\n' "${missing[*]}"
+            exit 1
+          fi
+          case "$PROD_BASE_URL" in
+            http://*|https://*) ;;
+            *)
+              printf '::error::PROD_BASE_URL must include http:// or https://\n'
+              exit 1
+              ;;
+          esac
+
       - name: Check out repository
         uses: actions/checkout@v6
 
