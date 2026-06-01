@@ -2,6 +2,7 @@ import { readFile } from 'node:fs/promises';
 import { join } from 'node:path';
 
 import {
+  type BlockchainRpcPort,
   CoreDogecoinIndexerService,
   type CoreDogecoinIndexerSettings,
   type CoreIndexerState,
@@ -13,6 +14,7 @@ import {
   configKeyIndexerProcessTail,
   configKeyIndexerStage,
   configKeyIndexerSyncTail,
+  type RawBlockStoragePort,
 } from '@onlydoge/indexing-pipeline';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
@@ -170,22 +172,8 @@ describe('core dogecoin indexer integration', () => {
     const service = new CoreDogecoinIndexerService(
       memoryCoordinator(values),
       dogecoinNetworkReader(),
-      {
-        async getPart<T extends Record<string, unknown>>(_networkId: number, blockHeight: number) {
-          return (rawBlocks.get(blockHeight) as T | undefined) ?? null;
-        },
-        async putPart(_networkId, blockHeight, _part, payload) {
-          rawBlocks.set(blockHeight, payload);
-        },
-      },
-      {
-        async getBlockHeight() {
-          return 3;
-        },
-        async getBlockSnapshot(_network, blockHeight) {
-          return testDogecoinBlockSnapshot(blockHeight);
-        },
-      },
+      memoryRawBlockStorage(rawBlocks),
+      dogecoinTipReader(3),
       {
         async applyCoreDogecoinBlock() {
           throw new Error('online ready state should not process core blocks');
@@ -277,22 +265,8 @@ describe('core dogecoin indexer integration', () => {
     const service = new CoreDogecoinIndexerService(
       memoryCoordinator(values),
       dogecoinNetworkReader(),
-      {
-        async getPart<T extends Record<string, unknown>>(_networkId: number, blockHeight: number) {
-          return (rawBlocks.get(blockHeight) as T | undefined) ?? null;
-        },
-        async putPart(_networkId, blockHeight, _part, payload) {
-          rawBlocks.set(blockHeight, payload);
-        },
-      },
-      {
-        async getBlockHeight() {
-          return 8;
-        },
-        async getBlockSnapshot(_network, blockHeight) {
-          return testDogecoinBlockSnapshot(blockHeight);
-        },
-      },
+      memoryRawBlockStorage(rawBlocks),
+      dogecoinTipReader(8),
       {
         async applyCoreDogecoinBlock() {
           throw new Error('online split should not use single-block core processing');
@@ -384,23 +358,8 @@ describe('core dogecoin indexer integration', () => {
     const service = new CoreDogecoinIndexerService(
       memoryCoordinator(values),
       dogecoinNetworkReader(),
-      {
-        async getPart<T extends Record<string, unknown>>(_networkId: number, blockHeight: number) {
-          return (rawBlocks.get(blockHeight) as T | undefined) ?? null;
-        },
-        async putPart(_networkId, blockHeight, _part, payload) {
-          rawBlocks.set(blockHeight, payload);
-        },
-      },
-      {
-        async getBlockHeight() {
-          return 12;
-        },
-        async getBlockSnapshot(_network, blockHeight) {
-          fetchedHeights.push(blockHeight);
-          return testDogecoinBlockSnapshot(blockHeight);
-        },
-      },
+      memoryRawBlockStorage(rawBlocks),
+      dogecoinTipReader(12, (blockHeight) => fetchedHeights.push(blockHeight)),
       {
         async applyCoreDogecoinBlock() {
           throw new Error('online split should not use single-block core processing');
@@ -688,6 +647,42 @@ function dogecoinNetworkReader() {
           rps: 10,
         },
       ];
+    },
+  };
+}
+
+function memoryRawBlockStorage(
+  rawBlocks: Map<number, Record<string, unknown>>,
+): RawBlockStoragePort {
+  return {
+    async getPart<T extends Record<string, unknown>>(
+      _networkId: number,
+      blockHeight: number,
+    ): Promise<T | null> {
+      return (rawBlocks.get(blockHeight) as T | undefined) ?? null;
+    },
+    async putPart(
+      _networkId: number,
+      blockHeight: number,
+      _part: string,
+      payload: Record<string, unknown>,
+    ): Promise<void> {
+      rawBlocks.set(blockHeight, payload);
+    },
+  };
+}
+
+function dogecoinTipReader(
+  tip: number,
+  onBlockSnapshot?: (blockHeight: number) => void,
+): BlockchainRpcPort {
+  return {
+    async getBlockHeight() {
+      return tip;
+    },
+    async getBlockSnapshot(_network, blockHeight) {
+      onBlockSnapshot?.(blockHeight);
+      return testDogecoinBlockSnapshot(blockHeight);
     },
   };
 }

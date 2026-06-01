@@ -118,6 +118,7 @@ export class AnalyticsQueryService {
     }
   }
 
+  // fallow-ignore-next-line unused-class-member
   public async backfill(input: { network?: string; throughBlockHeight?: number }): Promise<{
     network: string;
     rowsInserted: number | null;

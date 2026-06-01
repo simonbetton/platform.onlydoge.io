@@ -927,35 +927,9 @@ describe('clickhouse warehouse adapter', () => {
   });
 
   it('rejects core Dogecoin windows whose previous processed block was orphaned', async () => {
-    const adapter = new ClickHouseWarehouseAdapter({
-      driver: 'clickhouse',
-      location: 'http://clickhouse:8123',
+    const { adapter, insert } = installCoreProcessedBlocksClient({
+      blockHashByHeight: { 1: 'orphan-block-1' },
     });
-    const query = vi.fn(
-      async ({
-        query: statement,
-        query_params: params,
-      }: {
-        query: string;
-        query_params?: Record<string, unknown>;
-      }) => {
-        if (statement.includes('FROM core_processed_blocks_v1')) {
-          if (statement.includes('block_height = {blockHeight:UInt64}')) {
-            return {
-              json: async () => [
-                {
-                  blockHeight: params?.blockHeight,
-                  blockHash: 'orphan-block-1',
-                },
-              ],
-            };
-          }
-          return { json: async () => [] };
-        }
-        return { json: async () => [] };
-      },
-    );
-    const { insert } = installClickHouseClient(adapter, query);
 
     await expect(
       adapter.applyCoreDogecoinWindow([
@@ -972,42 +946,10 @@ describe('clickhouse warehouse adapter', () => {
   });
 
   it('rewinds and replays the core Dogecoin tail on a block hash mismatch', async () => {
-    const adapter = new ClickHouseWarehouseAdapter({
-      driver: 'clickhouse',
-      location: 'http://clickhouse:8123',
+    const { adapter, command, insert } = installCoreProcessedBlocksClient({
+      blockHashByHeight: { 1: 'block-1' },
+      latestRows: [{ blockHeight: 2, blockHash: 'old-block-2' }],
     });
-    const query = vi.fn(
-      async ({
-        query: statement,
-        query_params: params,
-      }: {
-        query: string;
-        query_params?: Record<string, unknown>;
-      }) => {
-        if (statement.includes('FROM core_processed_blocks_v1')) {
-          if (statement.includes('block_height = {blockHeight:UInt64}')) {
-            return {
-              json: async () => [
-                {
-                  blockHeight: params?.blockHeight,
-                  blockHash: 'block-1',
-                },
-              ],
-            };
-          }
-          return {
-            json: async () => [
-              {
-                blockHeight: 2,
-                blockHash: 'old-block-2',
-              },
-            ],
-          };
-        }
-        return { json: async () => [] };
-      },
-    );
-    const { command, insert } = installClickHouseClient(adapter, query);
 
     await expect(
       adapter.applyCoreDogecoinWindow(
@@ -1225,6 +1167,32 @@ function expectStandardAddressSummary(summary: unknown): void {
 
 function jsonRows<T>(rows: T[]) {
   return { json: async () => rows };
+}
+
+function installCoreProcessedBlocksClient(input: {
+  blockHashByHeight: Record<number, string>;
+  latestRows?: Array<{ blockHash: string; blockHeight: number }>;
+}) {
+  const adapter = new ClickHouseWarehouseAdapter({
+    driver: 'clickhouse',
+    location: 'http://clickhouse:8123',
+  });
+  const query = vi.fn(async (parameters: { query: string }) => {
+    const params = (parameters as { query_params?: Record<string, unknown> }).query_params;
+    if (parameters.query.includes('FROM core_processed_blocks_v1')) {
+      if (parameters.query.includes('block_height = {blockHeight:UInt64}')) {
+        const blockHeight = Number(params?.blockHeight);
+        const blockHash = input.blockHashByHeight[blockHeight];
+        return jsonRows(
+          blockHash === undefined ? [] : [{ blockHeight: params?.blockHeight, blockHash }],
+        );
+      }
+      return jsonRows(input.latestRows ?? []);
+    }
+    return jsonRows([]);
+  });
+  const { command, insert } = installClickHouseClient(adapter, query);
+  return { adapter, command, insert, query };
 }
 
 function installClickHouseClient(
