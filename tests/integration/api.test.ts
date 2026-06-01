@@ -6,7 +6,7 @@ import { AccessControlService, InMemoryApiKeyRateLimiter } from '@onlydoge/acces
 import { buildApiApp } from '@onlydoge/api';
 import { configKeyDogecoinHistoryReady } from '@onlydoge/indexing-pipeline';
 import { createRuntime } from '@onlydoge/platform';
-import { ApiSecret } from '@onlydoge/shared-kernel';
+import { ApiSecret, InfrastructureError } from '@onlydoge/shared-kernel';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import { dogecoinFixture } from '../fixtures/dogecoin';
@@ -761,21 +761,54 @@ describe('api integration', () => {
         architecture: 'dogecoin',
         chainId: 0,
         blockTime: 60,
+        rpcEndpoint: 'https://user:pass@doge.example/rpc',
+      },
+    });
+
+    expect(response.status).toBe(500);
+    expect(await response.json()).toEqual({
+      error: 'could not connect to `https://***:***@doge.example/rpc`',
+    });
+    expect(consoleError).toHaveBeenCalledWith('[onlydoge] infrastructure error', {
+      route: 'POST /v1/networks',
+      code: 'UNKNOWN',
+      message: 'could not connect to `https://***:***@doge.example/rpc`',
+      cause: 'Error: socket hang up',
+    });
+
+    consoleError.mockRestore();
+    await ctx.cleanup();
+  });
+
+  it('masks rpc endpoint credentials in infrastructure error responses', async () => {
+    const consoleError = vi.spyOn(console, 'error').mockImplementation(() => {});
+    const { ctx, headers } = await createAuthenticatedTestApp();
+    const createNetwork = vi
+      .spyOn(ctx.runtime.networkCatalog, 'createNetwork')
+      .mockRejectedValueOnce(
+        new InfrastructureError(
+          'could not connect to `https://raw-user:raw-pass@doge.example/rpc`',
+        ),
+      );
+
+    const response = await request(ctx.app, '/v1/networks', {
+      method: 'POST',
+      headers,
+      body: {
+        name: 'Dogecoin Mainnet',
+        architecture: 'dogecoin',
+        chainId: 0,
+        blockTime: 60,
         rpcEndpoint: 'https://doge.example/rpc',
       },
     });
 
     expect(response.status).toBe(500);
     expect(await response.json()).toEqual({
-      error: 'could not connect to `https://doge.example/rpc`',
-    });
-    expect(consoleError).toHaveBeenCalledWith('[onlydoge] infrastructure error', {
-      route: 'POST /v1/networks',
-      code: 'UNKNOWN',
-      message: 'could not connect to `https://doge.example/rpc`',
-      cause: 'Error: socket hang up',
+      error: 'could not connect to `https://***:***@doge.example/rpc`',
     });
 
+    createNetwork.mockRestore();
     consoleError.mockRestore();
     await ctx.cleanup();
   });

@@ -356,14 +356,15 @@ function handleInfrastructureError(
     return null;
   }
 
+  const message = maskRpcEndpointAuthInErrorMessage(error.message);
   console.error('[onlydoge] infrastructure error', {
     route,
     code,
-    message: maskLoggedErrorMessage(error.message),
+    message,
     ...errorCauseLog(error.cause),
   });
   set.status = error.statusCode;
-  return { error: error.message };
+  return { error: message };
 }
 
 function errorCauseLog(cause: unknown): { cause?: string } {
@@ -759,7 +760,7 @@ function hasStatusProperty(error: unknown): error is object {
   return [typeof error === 'object', error !== null, 'status' in Object(error)].every(Boolean);
 }
 
-function maskLoggedErrorMessage(message: string): string {
+function maskRpcEndpointAuthInErrorMessage(message: string): string {
   return message.replace(/`(https?:\/\/[^`]+)`/gu, (_match, endpoint) => {
     try {
       return `\`${maskRpcEndpointAuth(RpcEndpoint.parse(endpoint))}\``;

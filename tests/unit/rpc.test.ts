@@ -47,16 +47,36 @@ describe('http blockchain rpc gateway', () => {
     );
 
     const gateway = new HttpBlockchainRpcGateway(5);
+    const healthCheck = gateway.assertHealthy(
+      'dogecoin',
+      'http://rpc-user:rpc-password@dogecoin-rpc.example.com:22555/',
+    );
 
-    await expect(
-      gateway.assertHealthy(
-        'dogecoin',
-        'http://rpc-user:rpc-password@dogecoin-rpc.example.com:22555/',
-      ),
-    ).rejects.toMatchObject({
-      message:
-        'could not connect to `http://rpc-user:rpc-password@dogecoin-rpc.example.com:22555/`',
+    await expect(healthCheck).rejects.toMatchObject({
+      message: 'could not connect to `http://***:***@dogecoin-rpc.example.com:22555/`',
     });
+    await expect(healthCheck).rejects.not.toThrow(/rpc-user|rpc-password/u);
+  });
+
+  it('masks rpc endpoint credentials in invalid rpc response errors', async () => {
+    vi.spyOn(globalThis, 'fetch').mockResolvedValue(
+      Response.json({
+        result: null,
+        error: { message: 'rpc failed' },
+      }),
+    );
+
+    const gateway = new HttpBlockchainRpcGateway();
+    const blockHeight = gateway.getBlockHeight({
+      architecture: 'dogecoin',
+      rpcEndpoint: 'https://rpc-user:rpc-password@dogecoin-rpc.example.com:22555/rpc',
+      rps: Number.MAX_SAFE_INTEGER,
+    });
+
+    await expect(blockHeight).rejects.toMatchObject({
+      message: 'could not connect to `https://***:***@dogecoin-rpc.example.com:22555/rpc`',
+    });
+    await expect(blockHeight).rejects.not.toThrow(/rpc-user|rpc-password/u);
   });
 
   it('throttles rpc calls using the configured rps', async () => {

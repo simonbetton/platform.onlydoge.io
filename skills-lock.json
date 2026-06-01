@@ -103,6 +103,12 @@
       "skillPath": "skills/engineering/setup-matt-pocock-skills/SKILL.md",
       "computedHash": "0164a8b1ef998abca426056c6ed8a7716a9d4692fc6daa5378f68381a6dafd24"
     },
+    "skillguard": {
+      "source": "LLMSecurity/skillguard",
+      "sourceType": "github",
+      "skillPath": "SKILL.md",
+      "computedHash": "6d13fc2e7c9237acb8055fe8a272fb2bba23373a622545b1543a73c6a6d61571"
+    },
     "tdd": {
       "source": "mattpocock/skills",
       "sourceType": "github",

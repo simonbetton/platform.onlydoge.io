@@ -1,7 +1,11 @@
 import type { BlockchainRpcPort } from '@onlydoge/indexing-pipeline';
 
 import type { NetworkRpcGateway } from '@onlydoge/network-catalog';
-import { type ChainFamily, InfrastructureError } from '@onlydoge/shared-kernel';
+import {
+  type ChainFamily,
+  InfrastructureError,
+  maskRpcEndpointAuth,
+} from '@onlydoge/shared-kernel';
 
 export class HttpBlockchainRpcGateway implements NetworkRpcGateway, BlockchainRpcPort {
   private readonly rateLimitQueues = new Map<string, Promise<void>>();
@@ -125,7 +129,7 @@ export class HttpBlockchainRpcGateway implements NetworkRpcGateway, BlockchainRp
       return error;
     }
 
-    return new InfrastructureError(`could not connect to \`${rpcEndpoint}\``, {
+    return new InfrastructureError(rpcConnectionErrorMessage(rpcEndpoint), {
       ...infrastructureErrorCause(error),
     });
   }
@@ -196,6 +200,18 @@ function infrastructureErrorCause(error: unknown): { cause?: Error } {
   return { cause: error };
 }
 
+function rpcConnectionErrorMessage(rpcEndpoint: string): string {
+  return `could not connect to \`${displayRpcEndpoint(rpcEndpoint)}\``;
+}
+
+function displayRpcEndpoint(rpcEndpoint: string): string {
+  try {
+    return maskRpcEndpointAuth(rpcEndpoint);
+  } catch {
+    return 'RPC endpoint';
+  }
+}
+
 function hasRpcCredentials(url: URL): boolean {
   return [url.username, url.password].some(hasText);
 }
@@ -219,7 +235,7 @@ function assertValidRpcResult<T>(
   rpcEndpoint: string,
 ): asserts payload is { result: T } {
   if (isInvalidRpcResult(response, payload)) {
-    throw new InfrastructureError(`could not connect to \`${rpcEndpoint}\``);
+    throw new InfrastructureError(rpcConnectionErrorMessage(rpcEndpoint));
   }
 }
 
