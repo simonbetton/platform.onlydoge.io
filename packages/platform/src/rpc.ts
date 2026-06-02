@@ -1,13 +1,12 @@
 import type { BlockchainRpcPort } from '@onlydoge/indexing-pipeline';
 
-import type { NetworkRpcGateway } from '@onlydoge/network-catalog';
 import {
   type ChainFamily,
   InfrastructureError,
   maskRpcEndpointAuth,
 } from '@onlydoge/shared-kernel';
 
-export class HttpBlockchainRpcGateway implements NetworkRpcGateway, BlockchainRpcPort {
+export class HttpBlockchainRpcGateway implements BlockchainRpcPort {
   private readonly rateLimitQueues = new Map<string, Promise<void>>();
   private readonly rateLimitState = new Map<string, number>();
 
@@ -20,28 +19,31 @@ export class HttpBlockchainRpcGateway implements NetworkRpcGateway, BlockchainRp
     await this.getBlockHeight({ architecture, rpcEndpoint, rps: Number.MAX_SAFE_INTEGER });
   }
 
-  public async getBlockHeight(network: {
+  public async getBlockHeight(dogecoin: {
     architecture: ChainFamily;
     rpcEndpoint: string;
     rps: number;
   }): Promise<number> {
-    return this.callDogecoin<number>(network.rpcEndpoint, network.rps, 'getblockcount', []);
+    return this.callDogecoin<number>(dogecoin.rpcEndpoint, dogecoin.rps, 'getblockcount', []);
   }
 
   public async getBlockSnapshot(
-    network: {
+    dogecoin: {
       architecture: ChainFamily;
       rpcEndpoint: string;
       rps: number;
     },
     blockHeight: number,
   ): Promise<Record<string, unknown>> {
-    const hash = await this.callDogecoin<string>(network.rpcEndpoint, network.rps, 'getblockhash', [
-      blockHeight,
-    ]);
+    const hash = await this.callDogecoin<string>(
+      dogecoin.rpcEndpoint,
+      dogecoin.rps,
+      'getblockhash',
+      [blockHeight],
+    );
     const block = await this.callDogecoin<Record<string, unknown>>(
-      network.rpcEndpoint,
-      network.rps,
+      dogecoin.rpcEndpoint,
+      dogecoin.rps,
       'getblock',
       [hash, 2],
     );
@@ -49,7 +51,7 @@ export class HttpBlockchainRpcGateway implements NetworkRpcGateway, BlockchainRp
     return { block };
   }
 
-  public async getMempoolSnapshot(network: {
+  public async getMempoolSnapshot(dogecoin: {
     architecture: ChainFamily;
     rpcEndpoint: string;
     rps: number;
@@ -60,15 +62,15 @@ export class HttpBlockchainRpcGateway implements NetworkRpcGateway, BlockchainRp
   }> {
     const [info, rawEntries] = await Promise.all([
       this.callDogecoin<Record<string, unknown>>(
-        network.rpcEndpoint,
-        network.rps,
+        dogecoin.rpcEndpoint,
+        dogecoin.rps,
         'getmempoolinfo',
         [],
         this.mempoolTimeoutMs,
       ),
       this.callDogecoin<Record<string, unknown>>(
-        network.rpcEndpoint,
-        network.rps,
+        dogecoin.rpcEndpoint,
+        dogecoin.rps,
         'getrawmempool',
         [true],
         this.mempoolTimeoutMs,

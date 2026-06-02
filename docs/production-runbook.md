@@ -6,7 +6,7 @@ This runbook describes the Docker + Caddy production shape. The reusable section
 
 - `onlydoge-api`: HTTP API process.
 - `onlydoge-indexer`: long-running indexing process.
-- PostgreSQL: metadata, leases, API keys, network config, and progress.
+- PostgreSQL: metadata, leases, API keys, singleton Dogecoin config, and progress.
 - S3-compatible object storage: raw block snapshots.
 - ClickHouse: current-state and history read models.
 - Reverse proxy: Caddy, Nginx, Traefik, or a cloud load balancer.
@@ -114,7 +114,7 @@ The workflow runs quality checks, builds and pushes a fresh multi-arch productio
 
 ## Production E2E
 
-The production E2E suite is destructive only for disposable metadata it creates during the run. It never creates or deletes networks.
+The production E2E suite is destructive only for disposable API-key and audit metadata it creates during the run. It does not mutate Dogecoin explorer state.
 
 Required environment:
 
@@ -126,6 +126,7 @@ Optional environment:
 
 - `PROD_SSH_TARGET`: app host SSH target for container digest and health checks
 - `PROD_SSH_JUMP`: SSH bastion target, if needed
+- `PROD_PARITY_MAX_BLOCK_LAG`: allowed OnlyDoge latest-block lag versus BlockCypher, default `12`
 
 Run the E2E suite after a deploy:
 
@@ -139,13 +140,15 @@ export PROD_SSH_JUMP=root@203.0.113.10
 bun run e2e:production
 ```
 
+Production parity uses BlockCypher's unauthenticated Dogecoin endpoints, so keep runs sparse to avoid public API rate limits.
+
 Run deploy plus E2E in one command when `.env.managed` already selects the intended image tag and host:
 
 ```bash
 bun run deploy:production
 ```
 
-The suite creates an ephemeral API key using the admin API token, then uses that ephemeral API token for protected API checks and disposable tag/entity/address metadata. Teardown deletes in this order: address, entity, tag, ephemeral API key. Cleanup tolerates already-missing resources but fails on unexpected cleanup errors.
+The suite creates an ephemeral API key using the admin API token, then uses that ephemeral API token for protected explorer and auth checks. Teardown deletes the ephemeral API key. Cleanup tolerates already-missing credentials but fails on unexpected cleanup errors.
 
 The suite verifies:
 
@@ -154,7 +157,7 @@ The suite verifies:
 - per-key rate limiting for authenticated protected requests
 - Dogecoin production stats are `stage = "online"` with no `lastError`
 - current-state explorer address and UTXO reads
-- metadata write/read/delete behavior
+- removed network, token, entity, address-label, tag, stats, and info routes return 404
 - history endpoints return either ready data or the documented `425` history-not-ready response
 - optional Docker host containers match `EXPECTED_IMAGE_DIGEST`
 
@@ -176,22 +179,22 @@ curl -fsS -i https://api.example.com/v1/heartbeat/
 curl -fsS https://api.example.com/openapi/json >/dev/null
 ```
 
-Stats require an API token when called over HTTP. From inside the API container, use the runtime directly:
+Indexer state can be inspected from inside the API container:
 
 ```bash
 docker compose --env-file .env -f docker-compose.managed.yml exec -T onlydoge-api \
-  bun -e 'const { createRuntime } = await import("@onlydoge/platform"); const runtime = await createRuntime({mode:"http"}); console.log(JSON.stringify(await runtime.investigationQuery.stats(), null, 2)); process.exit(0);'
+  bun -e 'const { createRuntime } = await import("@onlydoge/platform"); const runtime = await createRuntime({mode:"http"}); console.log(JSON.stringify(await runtime.metadata.getCoreIndexerState(1), null, 2)); process.exit(0);'
 ```
 
 Healthy Dogecoin current-state production looks like:
 
 - `stage = "online"`
 - `lastError = null`
-- `dogecoin_current_state_ready_n1 = true`
-- `dogecoin_history_ready_n1 = true`
-- `syncTail` aligned with `block_height_n1` once online raw sync catches the node tip
-- `processTail` aligned with `block_height_n1` once online processing catches the node tip
-- `finalizedTail` behind `processTail` by `indexer_reprocess_depth_n1`
+- `dogecoin_current_state_ready = true`
+- `dogecoin_history_ready = true`
+- `syncTail` aligned with `block_height` once online raw sync catches the node tip
+- `processTail` aligned with `block_height` once online processing catches the node tip
+- `finalizedTail` behind `processTail` by `indexer_reprocess_depth`
 - `factTail` aligned with `processTail` when core-backed history is enabled
 
 Raw block sync and processing can be at the node tip while the last reprocess-depth blocks remain reorg-active. The mempool is the node's current set of unconfirmed transactions, so it is separate from this canonicality window.

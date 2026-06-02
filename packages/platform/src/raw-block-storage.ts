@@ -8,7 +8,6 @@ import type {
   RawBlockStoragePort,
   RawBlockStorageRequestContext,
 } from '@onlydoge/indexing-pipeline';
-import type { PrimaryId } from '@onlydoge/shared-kernel';
 
 import type { StorageSettings } from './settings';
 
@@ -16,13 +15,12 @@ export class FileRawBlockStorageAdapter implements RawBlockStoragePort {
   public constructor(private readonly basePath: string) {}
 
   public async getPart<T extends Record<string, unknown>>(
-    networkId: PrimaryId,
     blockHeight: number,
     part: string,
     context?: RawBlockStorageRequestContext,
   ): Promise<T | null> {
     assertNotAborted(context);
-    const filePath = join(this.basePath, String(networkId), String(blockHeight), `${part}.json.gz`);
+    const filePath = join(this.basePath, String(blockHeight), `${part}.json.gz`);
     try {
       const payload = await readFile(filePath);
       assertNotAborted(context);
@@ -34,14 +32,13 @@ export class FileRawBlockStorageAdapter implements RawBlockStoragePort {
   }
 
   public async putPart(
-    networkId: PrimaryId,
     blockHeight: number,
     part: string,
     payload: Record<string, unknown>,
     context?: RawBlockStorageRequestContext,
   ): Promise<void> {
     assertNotAborted(context);
-    const filePath = join(this.basePath, String(networkId), String(blockHeight), `${part}.json.gz`);
+    const filePath = join(this.basePath, String(blockHeight), `${part}.json.gz`);
     await mkdir(dirname(filePath), { recursive: true });
     await writeFile(filePath, gzipSync(Buffer.from(JSON.stringify(payload))));
     assertNotAborted(context);
@@ -61,12 +58,11 @@ export class S3RawBlockStorageAdapter implements RawBlockStoragePort {
   }
 
   public async getPart<T extends Record<string, unknown>>(
-    networkId: PrimaryId,
     blockHeight: number,
     part: string,
     context?: RawBlockStorageRequestContext,
   ): Promise<T | null> {
-    const key = this.storageKey(networkId, blockHeight, part);
+    const key = this.storageKey(blockHeight, part);
     const request = createRequestAbortSignal(context);
     try {
       const body = await this.getObjectBody(key, request);
@@ -81,13 +77,12 @@ export class S3RawBlockStorageAdapter implements RawBlockStoragePort {
   }
 
   public async putPart(
-    networkId: PrimaryId,
     blockHeight: number,
     part: string,
     payload: Record<string, unknown>,
     context?: RawBlockStorageRequestContext,
   ): Promise<void> {
-    const key = this.storageKey(networkId, blockHeight, part);
+    const key = this.storageKey(blockHeight, part);
     const request = createRequestAbortSignal(context);
     try {
       await this.putObjectBody(key, payload, request);
@@ -127,8 +122,8 @@ export class S3RawBlockStorageAdapter implements RawBlockStoragePort {
     );
   }
 
-  private storageKey(networkId: PrimaryId, blockHeight: number, part: string): string {
-    return [this.prefix, networkId, blockHeight, `${part}.json.gz`].filter(Boolean).join('/');
+  private storageKey(blockHeight: number, part: string): string {
+    return [this.prefix, blockHeight, `${part}.json.gz`].filter(Boolean).join('/');
   }
 }
 

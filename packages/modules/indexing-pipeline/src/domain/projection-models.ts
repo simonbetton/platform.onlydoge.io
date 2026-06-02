@@ -1,6 +1,4 @@
-import type { PrimaryId } from '@onlydoge/shared-kernel';
-
-import { addAmountBase, formatAmountBase, parseAmountBase } from './amounts';
+import { formatAmountBase, parseAmountBase } from './amounts';
 
 export interface ProjectionUtxoOutput {
   address: string;
@@ -9,7 +7,6 @@ export interface ProjectionUtxoOutput {
   blockTime: number;
   isCoinbase: boolean;
   isSpendable: boolean;
-  networkId: PrimaryId;
   outputKey: string;
   scriptType: string;
   spentByTxid: string | null;
@@ -92,200 +89,9 @@ export interface AddressMovement {
   direction: 'credit' | 'debit';
   entryIndex: number;
   movementId: string;
-  networkId: PrimaryId;
   outputKey: string | null;
   txIndex: number;
   txid: string;
-}
-
-export interface TransferFact {
-  amountBase: string;
-  assetAddress: string;
-  blockHash: string;
-  blockHeight: number;
-  blockTime: number;
-  confidence: number;
-  derivationMethod: string;
-  fromAddress: string;
-  inputAddressCount: number;
-  isChange: boolean;
-  networkId: PrimaryId;
-  outputAddressCount: number;
-  toAddress: string;
-  transferId: string;
-  transferIndex: number;
-  txIndex: number;
-  txid: string;
-}
-
-export interface DirectLinkDelta {
-  assetAddress: string;
-  firstSeenBlockHeight: number;
-  fromAddress: string;
-  lastSeenBlockHeight: number;
-  networkId: PrimaryId;
-  toAddress: string;
-  totalAmountBase: string;
-  transferCount: number;
-}
-
-export interface DirectLinkRecord extends DirectLinkDelta {}
-
-export function mergeDirectLinkDelta<T extends DirectLinkRecord>(
-  current: T,
-  delta: DirectLinkDelta,
-): T {
-  return {
-    ...current,
-    transferCount: current.transferCount + delta.transferCount,
-    totalAmountBase: addAmountBase(current.totalAmountBase, delta.totalAmountBase),
-    firstSeenBlockHeight: Math.min(current.firstSeenBlockHeight, delta.firstSeenBlockHeight),
-    lastSeenBlockHeight: Math.max(current.lastSeenBlockHeight, delta.lastSeenBlockHeight),
-  };
-}
-
-export function applyDirectLinkDeltasToSnapshots<T extends DirectLinkRecord>(input: {
-  currentDirectLinks: Map<string, T>;
-  directLinkDeltas: DirectLinkDelta[];
-  keyForDelta: (delta: DirectLinkDelta) => string;
-  nextDirectLinks: Map<string, T>;
-  toStoredRecord?: (record: DirectLinkRecord, delta: DirectLinkDelta) => T;
-}): void {
-  for (const delta of input.directLinkDeltas) {
-    const key = input.keyForDelta(delta);
-    input.nextDirectLinks.set(key, nextDirectLinkRecord(input, key, delta));
-  }
-}
-
-function nextDirectLinkRecord<T extends DirectLinkRecord>(
-  input: {
-    currentDirectLinks: Map<string, T>;
-    nextDirectLinks: Map<string, T>;
-    toStoredRecord?: (record: DirectLinkRecord, delta: DirectLinkDelta) => T;
-  },
-  key: string,
-  delta: DirectLinkDelta,
-): T {
-  return storedDirectLinkRecord(input, mergedDirectLinkRecord(input, key, delta), delta);
-}
-
-function mergedDirectLinkRecord<T extends DirectLinkRecord>(
-  input: {
-    currentDirectLinks: Map<string, T>;
-    nextDirectLinks: Map<string, T>;
-  },
-  key: string,
-  delta: DirectLinkDelta,
-): DirectLinkRecord {
-  const current = nextDirectLinkCurrent(input, key);
-  if (current) {
-    return mergeDirectLinkDelta(current, delta);
-  }
-
-  return { ...delta };
-}
-
-function nextDirectLinkCurrent<T extends DirectLinkRecord>(
-  input: {
-    currentDirectLinks: Map<string, T>;
-    nextDirectLinks: Map<string, T>;
-  },
-  key: string,
-): T | undefined {
-  const next = input.nextDirectLinks.get(key);
-  if (next) {
-    return next;
-  }
-
-  return input.currentDirectLinks.get(key);
-}
-
-function storedDirectLinkRecord<T extends DirectLinkRecord>(
-  input: {
-    toStoredRecord?: (record: DirectLinkRecord, delta: DirectLinkDelta) => T;
-  },
-  record: DirectLinkRecord,
-  delta: DirectLinkDelta,
-): T {
-  if (input.toStoredRecord) {
-    return input.toStoredRecord(record, delta);
-  }
-
-  return record as T;
-}
-
-export function buildDirectLinkDeltas(
-  networkId: PrimaryId,
-  blockHeight: number,
-  transfers: TransferFact[],
-  options?: { includeChange?: boolean },
-): DirectLinkDelta[] {
-  const result = new Map<string, DirectLinkDelta>();
-  for (const transfer of transfers) {
-    applyDirectLinkTransferIfIncluded(result, networkId, blockHeight, transfer, options);
-  }
-
-  return [...result.values()];
-}
-
-function shouldSkipDirectLinkTransfer(
-  transfer: TransferFact,
-  options?: { includeChange?: boolean },
-): boolean {
-  return [transfer.isChange, !includeDirectLinkChange(options)].every(Boolean);
-}
-
-function includeDirectLinkChange(options?: { includeChange?: boolean }): boolean {
-  return options?.includeChange === true;
-}
-
-function applyDirectLinkTransferIfIncluded(
-  result: Map<string, DirectLinkDelta>,
-  networkId: PrimaryId,
-  blockHeight: number,
-  transfer: TransferFact,
-  options?: { includeChange?: boolean },
-): void {
-  if (shouldSkipDirectLinkTransfer(transfer, options)) {
-    return;
-  }
-
-  applyDirectLinkTransfer(result, networkId, blockHeight, transfer);
-}
-
-function applyDirectLinkTransfer(
-  result: Map<string, DirectLinkDelta>,
-  networkId: PrimaryId,
-  blockHeight: number,
-  transfer: TransferFact,
-): void {
-  const key = [transfer.fromAddress, transfer.toAddress, transfer.assetAddress].join(':');
-  const current = result.get(key);
-  if (current) {
-    current.transferCount += 1;
-    current.totalAmountBase = addAmountBase(current.totalAmountBase, transfer.amountBase);
-    current.lastSeenBlockHeight = blockHeight;
-    return;
-  }
-
-  result.set(key, newDirectLinkDelta(networkId, blockHeight, transfer));
-}
-
-function newDirectLinkDelta(
-  networkId: PrimaryId,
-  blockHeight: number,
-  transfer: TransferFact,
-): DirectLinkDelta {
-  return {
-    networkId,
-    fromAddress: transfer.fromAddress,
-    toAddress: transfer.toAddress,
-    assetAddress: transfer.assetAddress,
-    transferCount: 1,
-    totalAmountBase: transfer.amountBase,
-    firstSeenBlockHeight: blockHeight,
-    lastSeenBlockHeight: blockHeight,
-  };
 }
 
 export interface ProjectionBalanceSnapshot {
@@ -293,7 +99,6 @@ export interface ProjectionBalanceSnapshot {
   assetAddress: string;
   asOfBlockHeight: number;
   balance: string;
-  networkId: PrimaryId;
 }
 
 export function applyAddressMovementsToBalances<
@@ -377,9 +182,7 @@ function nextBalanceAmount(currentAmount: bigint, movement: AddressMovement): bi
 
 function assertNonNegativeBalance(amount: bigint, movement: AddressMovement): void {
   if (amount < 0n) {
-    throw new Error(
-      `negative balance for ${movement.networkId}:${movement.address}:${movement.assetAddress}`,
-    );
+    throw new Error(`negative balance for ${movement.address}:${movement.assetAddress}`);
   }
 }
 
@@ -389,7 +192,6 @@ function balanceSnapshot(
   amount: bigint,
 ): ProjectionBalanceSnapshot {
   return {
-    networkId: movement.networkId,
     address: movement.address,
     assetAddress: movement.assetAddress,
     balance: formatAmountBase(amount),
@@ -430,26 +232,6 @@ export interface ProjectionCurrentBalancePage {
 export interface ProjectionAppliedBlock {
   blockHash: string;
   blockHeight: number;
-  networkId: PrimaryId;
-}
-
-export interface ProjectionDirectLinkBatch {
-  blockHash: string;
-  blockHeight: number;
-  directLinkDeltas: DirectLinkDelta[];
-  networkId: PrimaryId;
-}
-
-export interface SourceLinkRecord {
-  firstSeenBlockHeight: number;
-  hopCount: number;
-  lastSeenBlockHeight: number;
-  networkId: PrimaryId;
-  pathAddresses: string[];
-  pathTransferCount: number;
-  sourceAddress: string;
-  sourceAddressId: PrimaryId;
-  toAddress: string;
 }
 
 export interface BlockProjectionBatch {
@@ -457,19 +239,12 @@ export interface BlockProjectionBatch {
   blockHash: string;
   blockHeight: number;
   blockTime: number;
-  directLinkDeltas: DirectLinkDelta[];
-  networkId: PrimaryId;
-  transfers: TransferFact[];
   utxoCreates: ProjectionUtxoOutput[];
   utxoSpends: ProjectionUtxoSpend[];
 }
 
-export function projectionBlockIdentity(
-  networkId: PrimaryId,
-  blockHeight: number,
-  blockHash: string,
-): string {
-  return `${networkId}:${blockHeight}:${blockHash}`;
+export function projectionBlockIdentity(blockHeight: number, blockHash: string): string {
+  return `${blockHeight}:${blockHash}`;
 }
 
 export function projectionBalanceSnapshotKey(address: string, assetAddress: string): string {
@@ -487,27 +262,6 @@ export function parseProjectionBalanceSnapshotKey(key: string): {
   };
 }
 
-export function projectionDirectLinkSnapshotKey(
-  fromAddress: string,
-  toAddress: string,
-  assetAddress: string,
-): string {
-  return `${fromAddress}:${toAddress}:${assetAddress}`;
-}
-
-export function parseProjectionDirectLinkSnapshotKey(key: string): {
-  assetAddress: string;
-  fromAddress: string;
-  toAddress: string;
-} {
-  const [fromAddress = '', toAddress = '', ...assetAddressParts] = key.split(':');
-  return {
-    fromAddress,
-    toAddress,
-    assetAddress: assetAddressParts.join(':'),
-  };
-}
-
 export function orderProjectionBatches<T extends { blockHeight: number }>(batches: T[]): T[] {
   return [...batches].sort((left, right) => left.blockHeight - right.blockHeight);
 }
@@ -516,7 +270,6 @@ export function toProjectionAppliedBlocks<T extends ProjectionAppliedBlock>(
   batches: T[],
 ): ProjectionAppliedBlock[] {
   return batches.map((batch) => ({
-    networkId: batch.networkId,
     blockHeight: batch.blockHeight,
     blockHash: batch.blockHash,
   }));
@@ -527,39 +280,29 @@ export function pendingProjectionBatches<T extends ProjectionAppliedBlock>(
   appliedBlocks: Set<string>,
 ): T[] {
   return batches.filter(
-    (batch) =>
-      !appliedBlocks.has(
-        projectionBlockIdentity(batch.networkId, batch.blockHeight, batch.blockHash),
-      ),
+    (batch) => !appliedBlocks.has(projectionBlockIdentity(batch.blockHeight, batch.blockHash)),
   );
 }
 
 export interface PendingProjectionWindow<T extends ProjectionAppliedBlock> {
-  networkId: PrimaryId;
   orderedBatches: T[];
   pendingBatches: T[];
 }
 
 export async function resolvePendingProjectionWindow<T extends ProjectionAppliedBlock>(
   batches: T[],
-  listAppliedBlocks: (
-    networkId: PrimaryId,
-    blocks: ProjectionAppliedBlock[],
-  ) => Promise<Set<string>>,
+  listAppliedBlocks: (blocks: ProjectionAppliedBlock[]) => Promise<Set<string>>,
 ): Promise<PendingProjectionWindow<T> | null> {
   if (batches.length === 0) {
     return null;
   }
 
   const orderedBatches = orderProjectionBatches(batches);
-  const networkId = requireFirstProjectionBatch(orderedBatches).networkId;
+  requireFirstProjectionBatch(orderedBatches);
 
-  const appliedBlocks = await listAppliedBlocks(
-    networkId,
-    toProjectionAppliedBlocks(orderedBatches),
-  );
+  const appliedBlocks = await listAppliedBlocks(toProjectionAppliedBlocks(orderedBatches));
   const pendingBatches = pendingProjectionBatches(orderedBatches, appliedBlocks);
-  return pendingProjectionWindow(networkId, orderedBatches, pendingBatches);
+  return pendingProjectionWindow(orderedBatches, pendingBatches);
 }
 
 function requireFirstProjectionBatch<T extends ProjectionAppliedBlock>(batches: T[]): T {
@@ -572,7 +315,6 @@ function requireFirstProjectionBatch<T extends ProjectionAppliedBlock>(batches: 
 }
 
 function pendingProjectionWindow<T extends ProjectionAppliedBlock>(
-  networkId: PrimaryId,
   orderedBatches: T[],
   pendingBatches: T[],
 ): PendingProjectionWindow<T> | null {
@@ -580,7 +322,7 @@ function pendingProjectionWindow<T extends ProjectionAppliedBlock>(
     return null;
   }
 
-  return { networkId, orderedBatches, pendingBatches };
+  return { orderedBatches, pendingBatches };
 }
 
 export function collectProjectionSpendOutputKeys(batches: BlockProjectionBatch[]): string[] {
@@ -623,15 +365,11 @@ function applyProjectionUtxoBatch(
 }
 
 export async function buildProjectionUtxoWindow(
-  networkId: PrimaryId,
   batches: BlockProjectionBatch[],
-  loadOutputs: (
-    networkId: PrimaryId,
-    outputKeys: string[],
-  ) => Promise<Map<string, ProjectionUtxoOutput>>,
+  loadOutputs: (outputKeys: string[]) => Promise<Map<string, ProjectionUtxoOutput>>,
 ): Promise<Map<string, ProjectionUtxoOutput>> {
   const spendKeys = collectProjectionSpendOutputKeys(batches);
-  const currentOutputs = await loadOutputs(networkId, spendKeys);
+  const currentOutputs = await loadOutputs(spendKeys);
   return buildNextProjectionUtxoOutputs(batches, currentOutputs);
 }
 
@@ -709,11 +447,7 @@ export async function buildProjectionStateChanges<
   batches: BlockProjectionBatch[];
   keyForMovement: (movement: AddressMovement) => string;
   loadBalances: (keys: TKey[]) => Promise<Map<string, TSnapshot>>;
-  loadOutputs: (
-    networkId: PrimaryId,
-    outputKeys: string[],
-  ) => Promise<Map<string, ProjectionUtxoOutput>>;
-  networkId: PrimaryId;
+  loadOutputs: (outputKeys: string[]) => Promise<Map<string, ProjectionUtxoOutput>>;
   toSnapshotKey: (key: { address: string; assetAddress: string }) => TKey;
   toStoredSnapshot?: (snapshot: ProjectionBalanceSnapshot, movement: AddressMovement) => TSnapshot;
 }): Promise<{
@@ -721,7 +455,7 @@ export async function buildProjectionStateChanges<
   nextOutputs: Map<string, ProjectionUtxoOutput>;
 }> {
   const [nextOutputs, nextBalances] = await Promise.all([
-    buildProjectionUtxoWindow(input.networkId, input.batches, input.loadOutputs),
+    buildProjectionUtxoWindow(input.batches, input.loadOutputs),
     buildProjectionBalanceWindow({
       batches: input.batches,
       keyForMovement: input.keyForMovement,
@@ -734,48 +468,23 @@ export async function buildProjectionStateChanges<
   return { nextOutputs, nextBalances };
 }
 
-export function collectProjectionDirectLinkSnapshotKeys(
-  batches: Array<{ directLinkDeltas: DirectLinkDelta[] }>,
-): string[] {
-  return [
-    ...new Set(
-      batches.flatMap((batch) =>
-        batch.directLinkDeltas.map((delta) =>
-          projectionDirectLinkSnapshotKey(delta.fromAddress, delta.toAddress, delta.assetAddress),
-        ),
-      ),
-    ),
-  ];
-}
-
 export interface ProjectionFactWindow {
   addressMovements: AddressMovement[];
   appliedBlocks: ProjectionAppliedBlock[];
   balances: ProjectionBalanceSnapshot[];
-  directLinks: DirectLinkRecord[];
-  networkId: PrimaryId;
-  transfers: TransferFact[];
   utxoOutputs: ProjectionUtxoOutput[];
 }
 
 export interface ProjectionStateBootstrapSnapshot {
   appliedBlocks: ProjectionAppliedBlock[];
   balances: ProjectionBalanceSnapshot[];
-  directLinks: DirectLinkRecord[];
-  sourceLinks: SourceLinkRecord[];
   utxoOutputs: ProjectionUtxoOutput[];
-}
-
-export interface TrackedAddress {
-  address: string;
-  addressId: PrimaryId;
 }
 
 export type CoreIndexerStage = 'sync_backfill' | 'process_backfill' | 'online';
 
 export interface CoreIndexerState {
   lastError: string | null;
-  networkId: PrimaryId;
   onlineTip: number;
   processTail: number;
   stage: CoreIndexerStage;
@@ -788,7 +497,6 @@ export interface CoreBlockRecord {
   blockHeight: number;
   blockTime: number;
   fetchedAt: string;
-  networkId: PrimaryId;
   previousBlockHash: string | null;
   processedAt: string | null;
   rawStorageKey: string;
@@ -806,7 +514,6 @@ export interface CoreDogecoinBlockApplication {
   blockHash: string;
   blockHeight: number;
   blockTime: number;
-  networkId: PrimaryId;
   previousBlockHash: string | null;
   rawStorageKey: string;
   txCount: number;

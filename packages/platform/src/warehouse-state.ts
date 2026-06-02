@@ -1,49 +1,27 @@
 import type { AnalyticsTransactionFact } from '@onlydoge/analytics-query';
 import {
   type AddressMovement,
-  type BlockProjectionBatch,
-  type DirectLinkRecord,
   formatAmountBase,
   type ProjectionBalanceCursor,
   type ProjectionBalanceSnapshot,
   type ProjectionUtxoOutput,
   parseAmountBase,
-  type SourceLinkRecord,
 } from '@onlydoge/indexing-pipeline';
-import type { PrimaryId } from '@onlydoge/shared-kernel';
 
 export interface BalanceRow {
   address: string;
   assetAddress: string;
   asOfBlockHeight: number;
   balance: string;
-  networkId: PrimaryId;
 }
 
 export interface WarehouseState {
   appliedBlocks: Array<{
     blockHash: string;
     blockHeight: number;
-    networkId: PrimaryId;
-  }>;
-  directLinkAppliedBlocks: Array<{
-    blockHash: string;
-    blockHeight: number;
-    networkId: PrimaryId;
   }>;
   addressMovements: AddressMovement[];
   balances: BalanceRow[];
-  directLinks: DirectLinkRecord[];
-  sourceLinks: SourceLinkRecord[];
-  tokens: Array<{
-    address: string;
-    decimals: number;
-    id: string;
-    name: string;
-    networkId: PrimaryId;
-    symbol: string;
-  }>;
-  transfers: BlockProjectionBatch['transfers'];
   transactionFacts: AnalyticsTransactionFact[];
   utxoOutputs: ProjectionUtxoOutput[];
 }
@@ -84,15 +62,10 @@ export interface AddressTransactionSummary {
 
 export const emptyWarehouseState = (): WarehouseState => ({
   appliedBlocks: [],
-  directLinkAppliedBlocks: [],
   utxoOutputs: [],
   addressMovements: [],
-  transfers: [],
   transactionFacts: [],
   balances: [],
-  directLinks: [],
-  sourceLinks: [],
-  tokens: [],
 });
 
 export function mergeWarehouseState(
@@ -103,26 +76,20 @@ export function mergeWarehouseState(
     ...emptyWarehouseState(),
     ...source,
     appliedBlocks: rowsOrEmpty(source.appliedBlocks),
-    directLinkAppliedBlocks: rowsOrEmpty(source.directLinkAppliedBlocks),
     utxoOutputs: rowsOrEmpty(source.utxoOutputs),
     addressMovements: rowsOrEmpty(source.addressMovements),
-    transfers: rowsOrEmpty(source.transfers),
     transactionFacts: rowsOrEmpty(source.transactionFacts),
     balances: rowsOrEmpty(source.balances),
-    directLinks: rowsOrEmpty(source.directLinks),
-    sourceLinks: rowsOrEmpty(source.sourceLinks),
-    tokens: rowsOrEmpty(source.tokens),
   };
 }
 
 export function currentBalancePageRows(
   balances: BalanceRow[],
-  networkId: PrimaryId,
   cursor: ProjectionBalanceCursor | null,
   limit: number,
 ): BalanceRow[] {
   return balances
-    .filter((row) => isCurrentBalancePageRow(row, networkId, cursor))
+    .filter((row) => isCurrentBalancePageRow(row, cursor))
     .sort(compareBalanceRows)
     .slice(0, limit)
     .map((row) => ({ ...row }));
@@ -247,9 +214,7 @@ function applyMovementAmount(
 
 export function assertNonNegativeBalance(movement: AddressMovement, nextAmount: bigint): void {
   if (nextAmount < 0n) {
-    throw new Error(
-      `negative balance for ${movement.networkId}:${movement.address}:${movement.assetAddress}`,
-    );
+    throw new Error(`negative balance for ${movement.address}:${movement.assetAddress}`);
   }
 }
 
@@ -257,12 +222,8 @@ function rowsOrEmpty<T>(rows: T[] | undefined): T[] {
   return rows ?? [];
 }
 
-function isCurrentBalancePageRow(
-  row: BalanceRow,
-  networkId: PrimaryId,
-  cursor: ProjectionBalanceCursor | null,
-): boolean {
-  return [row.networkId === networkId, isCurrentBalanceCursorRow(row, cursor)].every(Boolean);
+function isCurrentBalancePageRow(row: BalanceRow, cursor: ProjectionBalanceCursor | null): boolean {
+  return isCurrentBalanceCursorRow(row, cursor);
 }
 
 function isAfterBalanceCursor(row: BalanceRow, cursor: ProjectionBalanceCursor): boolean {

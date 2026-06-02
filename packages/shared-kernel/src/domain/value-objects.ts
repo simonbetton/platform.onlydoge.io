@@ -6,17 +6,13 @@ import { ValidationError } from './errors';
 
 export type PrimaryId = number;
 
-export type IdPrefix = 'net' | 'key' | 'ent' | 'adr' | 'tag' | 'tok';
+export type IdPrefix = 'key';
 
 export type ChainFamily = 'dogecoin';
 
 export type Mode = 'both' | 'indexer' | 'http';
 
-export type RiskLevel = 'low' | 'high';
-
-export type RiskReason = 'entity' | 'source';
-
-const prefixSet = new Set<IdPrefix>(['net', 'key', 'ent', 'adr', 'tag', 'tok']);
+const prefixSet = new Set<IdPrefix>(['key']);
 const modeSet = new Set<Mode>(['both', 'indexer', 'http']);
 const apiSecretLookupNamespace = 'onlydoge-api-token-lookup-v1';
 
@@ -30,10 +26,6 @@ function isChainFamily(value: string): value is ChainFamily {
 
 function isMode(value: string): value is Mode {
   return modeSet.has(value as Mode);
-}
-
-function isRiskLevel(value: string): value is RiskLevel {
-  return value === 'low' || value === 'high';
 }
 
 export class ExternalId {
@@ -231,15 +223,6 @@ export function parseChainFamily(input: string): ChainFamily {
   const value = input.trim().toLowerCase();
   if (!isChainFamily(value)) {
     throw new ValidationError(`invalid architecture: ${input}`);
-  }
-
-  return value;
-}
-
-export function parseRiskLevel(input: string): RiskLevel {
-  const value = input.trim().toLowerCase();
-  if (!isRiskLevel(value)) {
-    throw new ValidationError(`invalid risk level: ${input}`);
   }
 
   return value;

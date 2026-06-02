@@ -5,26 +5,17 @@ import {
   configKeyDogecoinAnalyticsFactsTail,
   configKeyIndexerFinalizedTail,
 } from '@onlydoge/indexing-pipeline';
-import {
-  NotFoundError,
-  OnlyDogeError,
-  type PrimaryId,
-  TooEarlyError,
-  ValidationError,
-} from '@onlydoge/shared-kernel';
+import { OnlyDogeError, TooEarlyError, ValidationError } from '@onlydoge/shared-kernel';
 import { Parser } from 'node-sql-parser';
 
-import type {
-  AnalyticsConfigPort,
-  AnalyticsNetworkPort,
-  AnalyticsWarehousePort,
-} from '../contracts/ports';
+import type { AnalyticsConfigPort, AnalyticsWarehousePort } from '../contracts/ports';
 import {
   type AnalyticsQueryInput,
   type AnalyticsQueryLimits,
   type AnalyticsQueryParams,
   type AnalyticsQueryResponse,
   type AnalyticsSchemaResponse,
+  analyticsBalancesCurrentTable,
   analyticsQueryDefaultLimit,
   analyticsQueryMaxBytesToRead,
   analyticsQueryMaxConcurrentRequests,
@@ -36,43 +27,76 @@ import {
   analyticsQueryRateLimitMaxRequests,
   analyticsQueryRateLimitWindowMs,
   analyticsTransactionsTable,
+  mempoolSamplesTable,
 } from '../domain/query-models';
-
-type AnalyticsNetwork = Awaited<ReturnType<AnalyticsNetworkPort['listActiveNetworks']>>[number];
 
 const parser = new Parser();
 const placeholderPatterns = [
-  { pattern: /\{networkId:UInt64\}/gu, replacement: '1' },
   { pattern: /\{fromTime:UInt64\}/gu, replacement: '1' },
   { pattern: /\{toTime:UInt64\}/gu, replacement: '2' },
   { pattern: /\{maxFinalizedHeight:UInt64\}/gu, replacement: '100' },
   { pattern: /\{limit:UInt64\}/gu, replacement: '100' },
 ];
-const requiredPlaceholders = [
-  '{networkId:UInt64}',
-  '{fromTime:UInt64}',
-  '{toTime:UInt64}',
-  '{maxFinalizedHeight:UInt64}',
+const analyticsAllowedTables = [
+  analyticsTransactionsTable,
+  analyticsBalancesCurrentTable,
+  mempoolSamplesTable,
 ] as const;
-const requiredColumns = ['network_id', 'block_time', 'block_height'];
-const requiredPredicatePatterns = [
+type AnalyticsAllowedTable = (typeof analyticsAllowedTables)[number];
+const tablePredicatePolicies: Record<
+  AnalyticsAllowedTable,
   {
-    column: 'network_id',
-    pattern: /(?:\b[a-zA-Z_][\w]*\.)?\bnetwork_id\b\s*=\s*\{networkId:UInt64\}/iu,
+    predicates: Array<{
+      column: string;
+      pattern: RegExp;
+    }>;
+    requiredPlaceholders: string[];
+  }
+> = {
+  [analyticsTransactionsTable]: {
+    requiredPlaceholders: ['{fromTime:UInt64}', '{toTime:UInt64}', '{maxFinalizedHeight:UInt64}'],
+    predicates: [
+      {
+        column: 'block_time',
+        pattern: /(?:\b[a-zA-Z_][\w]*\.)?\bblock_time\b\s*>=\s*\{fromTime:UInt64\}/iu,
+      },
+      {
+        column: 'block_time',
+        pattern: /(?:\b[a-zA-Z_][\w]*\.)?\bblock_time\b\s*<\s*\{toTime:UInt64\}/iu,
+      },
+      {
+        column: 'block_height',
+        pattern: /(?:\b[a-zA-Z_][\w]*\.)?\bblock_height\b\s*<=\s*\{maxFinalizedHeight:UInt64\}/iu,
+      },
+    ],
   },
-  {
-    column: 'block_time',
-    pattern: /(?:\b[a-zA-Z_][\w]*\.)?\bblock_time\b\s*>=\s*\{fromTime:UInt64\}/iu,
+  [analyticsBalancesCurrentTable]: {
+    requiredPlaceholders: ['{maxFinalizedHeight:UInt64}'],
+    predicates: [
+      {
+        column: 'as_of_block_height',
+        pattern:
+          /(?:\b[a-zA-Z_][\w]*\.)?\bas_of_block_height\b\s*<=\s*\{maxFinalizedHeight:UInt64\}/iu,
+      },
+    ],
   },
-  {
-    column: 'block_time',
-    pattern: /(?:\b[a-zA-Z_][\w]*\.)?\bblock_time\b\s*<\s*\{toTime:UInt64\}/iu,
+  [mempoolSamplesTable]: {
+    requiredPlaceholders: ['{fromTime:UInt64}', '{toTime:UInt64}'],
+    predicates: [
+      {
+        column: 'sampled_at',
+        pattern:
+          /(?:\b[a-zA-Z_][\w]*\.)?\bsampled_at\b\s*>=\s*(?:fromUnixTimestamp|toDateTime)\s*\(\s*\{fromTime:UInt64\}\s*\)/iu,
+      },
+      {
+        column: 'sampled_at',
+        pattern:
+          /(?:\b[a-zA-Z_][\w]*\.)?\bsampled_at\b\s*<\s*(?:fromUnixTimestamp|toDateTime)\s*\(\s*\{toTime:UInt64\}\s*\)/iu,
+      },
+    ],
   },
-  {
-    column: 'block_height',
-    pattern: /(?:\b[a-zA-Z_][\w]*\.)?\bblock_height\b\s*<=\s*\{maxFinalizedHeight:UInt64\}/iu,
-  },
-] as const;
+};
+const analyticsAllowedTableSet = new Set<string>(analyticsAllowedTables);
 const disallowedSqlPatterns = [
   { label: 'FINAL', pattern: /\bFINAL\b/iu },
   { label: 'FORMAT', pattern: /\bFORMAT\b/iu },
@@ -94,7 +118,6 @@ export class AnalyticsQueryService {
   });
 
   public constructor(
-    private readonly networks: AnalyticsNetworkPort,
     private readonly configs: AnalyticsConfigPort,
     private readonly warehouse: AnalyticsWarehousePort,
   ) {}
@@ -119,44 +142,38 @@ export class AnalyticsQueryService {
   }
 
   // fallow-ignore-next-line unused-class-member
-  public async backfill(input: { network?: string; throughBlockHeight?: number }): Promise<{
-    network: string;
+  public async backfill(input: { throughBlockHeight?: number } = {}): Promise<{
     rowsInserted: number | null;
     throughBlockHeight: number;
   }> {
-    const network = await this.resolveNetwork(input.network);
-    const throughBlockHeight =
-      input.throughBlockHeight ?? (await this.requireFinalizedTail(network.networkId));
+    const throughBlockHeight = input.throughBlockHeight ?? (await this.requireFinalizedTail());
     if (throughBlockHeight < 0) {
       throw new TooEarlyError('dogecoin analytics facts are not ready');
     }
 
     const result = await this.warehouse.backfillAnalyticsTransactionFacts({
-      networkId: network.networkId,
       throughBlockHeight,
     });
     await this.configs.setJsonValue(
-      configKeyDogecoinAnalyticsFactsTail(network.networkId),
+      configKeyDogecoinAnalyticsFactsTail(),
       result.throughBlockHeight,
     );
-    await this.configs.setJsonValue(configKeyDogecoinAnalyticsFactsReady(network.networkId), true);
+    await this.configs.setJsonValue(configKeyDogecoinAnalyticsFactsReady(), true);
 
     return {
-      network: network.id,
       rowsInserted: result.rowsInserted,
       throughBlockHeight: result.throughBlockHeight,
     };
   }
 
   private async executeQuery(input: AnalyticsQueryInput): Promise<AnalyticsQueryResponse> {
-    const network = await this.resolveNetwork(input.network);
     const timeWindow = parseTimeWindow(input);
-    const finalizedTail = await this.requireFinalizedTail(network.networkId);
-    await this.assertAnalyticsReady(network.networkId, finalizedTail);
+    const finalizedTail = await this.requireFinalizedTail();
+    await this.assertAnalyticsReady(finalizedTail);
 
     const sql = validateAnalyticsSql(input.sql);
     const limits = analyticsQueryLimits();
-    const params = analyticsQueryParams(network.networkId, timeWindow, finalizedTail, input.limit);
+    const params = analyticsQueryParams(timeWindow, finalizedTail, input.limit);
     const estimate = await this.warehouse.preflightAnalyticsQuery({ sql, params, limits });
     assertEstimateWithinLimits(estimate.estimatedRows, limits.maxRowsToRead, 'rows');
     assertEstimateWithinLimits(estimate.estimatedBytes, limits.maxBytesToRead, 'bytes');
@@ -166,7 +183,6 @@ export class AnalyticsQueryService {
     return {
       query: {
         hash: queryHash(sql),
-        network: network.id,
         from: timeWindow.fromIso,
         to: timeWindow.toIso,
         finalizedBlockHeight: finalizedTail,
@@ -185,31 +201,8 @@ export class AnalyticsQueryService {
     };
   }
 
-  private async resolveNetwork(networkId: string | undefined): Promise<AnalyticsNetwork> {
-    const activeNetworks = (await this.networks.listActiveNetworks()).filter(
-      (network) => network.architecture === 'dogecoin',
-    );
-    if (networkId) {
-      const network = activeNetworks.find((candidate) => candidate.id === networkId);
-      if (!network) {
-        throw new NotFoundError('network not found');
-      }
-      return network;
-    }
-
-    if (activeNetworks.length === 1) {
-      return activeNetworks[0] as AnalyticsNetwork;
-    }
-
-    throw new ValidationError(
-      'invalid parameter for `network`: required when multiple networks exist',
-    );
-  }
-
-  private async requireFinalizedTail(networkId: PrimaryId): Promise<number> {
-    const finalizedTail = await this.configs.getJsonValue<number>(
-      configKeyIndexerFinalizedTail(networkId),
-    );
+  private async requireFinalizedTail(): Promise<number> {
+    const finalizedTail = await this.configs.getJsonValue<number>(configKeyIndexerFinalizedTail());
     if (typeof finalizedTail !== 'number') {
       throw new TooEarlyError('dogecoin finalized chain is not ready');
     }
@@ -217,10 +210,10 @@ export class AnalyticsQueryService {
     return finalizedTail;
   }
 
-  private async assertAnalyticsReady(networkId: PrimaryId, finalizedTail: number): Promise<void> {
+  private async assertAnalyticsReady(finalizedTail: number): Promise<void> {
     const [ready, factsTail] = await Promise.all([
-      this.configs.getJsonValue<boolean>(configKeyDogecoinAnalyticsFactsReady(networkId)),
-      this.configs.getJsonValue<number>(configKeyDogecoinAnalyticsFactsTail(networkId)),
+      this.configs.getJsonValue<boolean>(configKeyDogecoinAnalyticsFactsReady()),
+      this.configs.getJsonValue<number>(configKeyDogecoinAnalyticsFactsTail()),
     ]);
     if (ready !== true || typeof factsTail !== 'number' || factsTail < finalizedTail) {
       throw new TooEarlyError('dogecoin analytics facts are not ready');
@@ -295,7 +288,6 @@ function parseTimestampSeconds(value: string, field: string): number {
 
 function validateAnalyticsSql(input: string): string {
   const sql = normalizeSql(input);
-  assertRequiredPlaceholders(sql);
   const parsedSql = sqlWithParserPlaceholders(sql);
   const ast = parser.astify(parsedSql, { database: 'postgresql' });
   if (Array.isArray(ast)) {
@@ -304,8 +296,8 @@ function validateAnalyticsSql(input: string): string {
 
   assertSelectAst(ast);
   assertNoSelectStar(ast);
-  assertAllowedTables(parsedSql, ast);
-  assertRequiredColumns(parsedSql, sql);
+  const tables = assertAllowedTables(parsedSql, ast);
+  assertTablePredicatePolicies(sql, tables);
   return sql;
 }
 
@@ -333,8 +325,8 @@ function assertNoDisallowedSqlClauses(sql: string): void {
   }
 }
 
-function assertRequiredPlaceholders(sql: string): void {
-  for (const placeholder of requiredPlaceholders) {
+function assertRequiredPlaceholders(sql: string, placeholders: Iterable<string>): void {
+  for (const placeholder of placeholders) {
     if (!sql.includes(placeholder)) {
       throw new ValidationError(`analytics SQL must include ${placeholder}`);
     }
@@ -390,15 +382,24 @@ function containsSelectStar(value: unknown): boolean {
   return Object.values(value).some(containsSelectStar);
 }
 
-function assertAllowedTables(sql: string, ast: unknown): void {
+function assertAllowedTables(sql: string, ast: unknown): AnalyticsAllowedTable[] {
   const cteNames = collectCteNames(ast);
   const tables = parser.tableList(sql, { database: 'postgresql' }).map(tableListName);
   const invalid = tables.find(
-    (table) => table !== analyticsTransactionsTable && !cteNames.has(table),
+    (table) => !analyticsAllowedTableSet.has(table) && !cteNames.has(table),
   );
   if (invalid) {
     throw new ValidationError(`analytics SQL cannot query table: ${invalid}`);
   }
+
+  const referencedTables = tables.filter((table): table is AnalyticsAllowedTable =>
+    analyticsAllowedTableSet.has(table),
+  );
+  if (referencedTables.length === 0) {
+    throw new ValidationError('analytics SQL must query a curated analytics table');
+  }
+
+  return [...new Set(referencedTables)];
 }
 
 function collectCteNames(ast: unknown): Set<string> {
@@ -417,22 +418,25 @@ function tableListName(value: string): string {
   return value.split('::').at(-1) ?? value;
 }
 
-function assertRequiredColumns(parsedSql: string, originalSql: string): void {
-  const columns = new Set(
-    parser.columnList(parsedSql, { database: 'postgresql' }).map(columnListName),
-  );
-  for (const column of requiredColumns) {
-    if (!columns.has(column)) {
-      throw new ValidationError(`analytics SQL must constrain ${column}`);
+function assertTablePredicatePolicies(sql: string, tables: AnalyticsAllowedTable[]): void {
+  const searchable = stripSqlCommentsAndStrings(sql);
+  const requiredPlaceholders = new Set<string>();
+  for (const table of tables) {
+    const policy = tablePredicatePolicies[table];
+    for (const placeholder of policy.requiredPlaceholders) {
+      requiredPlaceholders.add(placeholder);
     }
+    assertTablePredicates(searchable, policy.predicates);
   }
-  assertRequiredPredicates(originalSql);
+  assertRequiredPlaceholders(sql, requiredPlaceholders);
 }
 
-function assertRequiredPredicates(sql: string): void {
-  const searchable = stripSqlCommentsAndStrings(sql);
-  for (const { column, pattern } of requiredPredicatePatterns) {
-    if (!pattern.test(searchable)) {
+function assertTablePredicates(
+  searchableSql: string,
+  predicates: Array<{ column: string; pattern: RegExp }>,
+): void {
+  for (const { column, pattern } of predicates) {
+    if (!pattern.test(searchableSql)) {
       throw new ValidationError(`analytics SQL must constrain ${column}`);
     }
   }
@@ -445,18 +449,12 @@ function stripSqlCommentsAndStrings(sql: string): string {
     .replace(/'(?:''|[^'])*'/gu, "''");
 }
 
-function columnListName(value: string): string {
-  return value.split('::').at(-1) ?? value;
-}
-
 function analyticsQueryParams(
-  networkId: PrimaryId,
   timeWindow: AnalyticsTimeWindow,
   finalizedTail: number,
   limit: number | undefined,
 ): AnalyticsQueryParams {
   return {
-    networkId,
     fromTime: timeWindow.fromTime,
     toTime: timeWindow.toTime,
     maxFinalizedHeight: finalizedTail,
@@ -510,7 +508,6 @@ function analyticsSchemaResponse(): AnalyticsSchemaResponse {
         description:
           'Finalized Dogecoin transaction facts for AI analytics. Values ending in `_base_i256` are integer base units, where 100000000 base units equals 1 DOGE.',
         columns: [
-          { name: 'network_id', type: 'UInt64', description: 'Internal network identifier.' },
           { name: 'block_height', type: 'UInt64', description: 'Confirmed block height.' },
           { name: 'block_hash', type: 'String', description: 'Confirmed block hash.' },
           { name: 'block_time', type: 'UInt64', description: 'Block timestamp in Unix seconds.' },
@@ -536,17 +533,74 @@ function analyticsSchemaResponse(): AnalyticsSchemaResponse {
           },
         ],
       },
+      {
+        name: analyticsBalancesCurrentTable,
+        description:
+          'Current finalized Dogecoin address balances for richest-address and balance-distribution analytics.',
+        columns: [
+          { name: 'address', type: 'String', description: 'Dogecoin address.' },
+          { name: 'asset_address', type: 'String', description: 'Native DOGE asset marker.' },
+          {
+            name: 'balance',
+            type: 'String',
+            description: 'Current balance in base units as a decimal string.',
+          },
+          {
+            name: 'balance_i256',
+            type: 'Int256',
+            description: 'Current balance in base units for numeric sorting and aggregation.',
+          },
+          {
+            name: 'as_of_block_height',
+            type: 'UInt64',
+            description: 'Finalized block height used for this current balance snapshot.',
+          },
+        ],
+      },
+      {
+        name: mempoolSamplesTable,
+        description:
+          'Persisted verbose mempool transaction samples. Rows are retained for one hour.',
+        columns: [
+          {
+            name: 'sampled_at',
+            type: 'DateTime',
+            description: 'Sample timestamp.',
+          },
+          { name: 'txid', type: 'String', description: 'Mempool transaction id.' },
+          {
+            name: 'entry_time',
+            type: 'Nullable(UInt64)',
+            description: 'Transaction entry time from Dogecoin Core when available.',
+          },
+          {
+            name: 'height',
+            type: 'Nullable(UInt64)',
+            description: 'Node mempool height metadata when available.',
+          },
+          {
+            name: 'size_bytes',
+            type: 'Nullable(UInt64)',
+            description: 'Transaction virtual or serialized size in bytes when available.',
+          },
+          {
+            name: 'fee_base',
+            type: 'Nullable(String)',
+            description: 'Fee in base units when available.',
+          },
+          {
+            name: 'fee_rate_base_per_kilobyte',
+            type: 'Nullable(String)',
+            description: 'Fee rate in base units per kilobyte when available.',
+          },
+        ],
+      },
     ],
     constraints: {
       maxWindowSeconds: analyticsQueryMaxWindowSeconds,
       maxSqlCharacters: analyticsQueryMaxSqlCharacters,
       requiresFinalizedBlocks: true,
       placeholders: [
-        {
-          name: 'networkId',
-          sql: '{networkId:UInt64}',
-          description: 'Bound by OnlyDoge from the request network parameter.',
-        },
         {
           name: 'fromTime',
           sql: '{fromTime:UInt64}',
@@ -564,19 +618,14 @@ function analyticsSchemaResponse(): AnalyticsSchemaResponse {
             'Finalized chain tail; include `block_height <= {maxFinalizedHeight:UInt64}`.',
         },
       ],
-      unsupportedQuestions: [
-        'mempool to first confirmation latency',
-        'unconfirmed mempool analytics',
-        'change-adjusted economic transfer value',
-      ],
+      unsupportedQuestions: ['change-adjusted economic transfer value'],
     },
     examples: [
       {
         description: 'Average confirmed transaction fee in the requested window.',
         sql: `SELECT avgOrNull(fee_base_i256) AS average_fee_base
 FROM ${analyticsTransactionsTable}
-WHERE network_id = {networkId:UInt64}
-  AND block_time >= {fromTime:UInt64}
+WHERE block_time >= {fromTime:UInt64}
   AND block_time < {toTime:UInt64}
   AND block_height <= {maxFinalizedHeight:UInt64}
   AND is_coinbase = 0`,
@@ -585,8 +634,7 @@ WHERE network_id = {networkId:UInt64}
         description: 'Highest confirmed transaction fee in the requested window.',
         sql: `SELECT txid, block_height, block_time, fee_base_i256 AS fee_base
 FROM ${analyticsTransactionsTable}
-WHERE network_id = {networkId:UInt64}
-  AND block_time >= {fromTime:UInt64}
+WHERE block_time >= {fromTime:UInt64}
   AND block_time < {toTime:UInt64}
   AND block_height <= {maxFinalizedHeight:UInt64}
   AND is_coinbase = 0
@@ -599,13 +647,29 @@ LIMIT {limit:UInt64}`,
           'Biggest confirmed transactions by gross output value. Gross output includes change.',
         sql: `SELECT txid, block_height, block_time, gross_output_base_i256 AS gross_output_base
 FROM ${analyticsTransactionsTable}
-WHERE network_id = {networkId:UInt64}
-  AND block_time >= {fromTime:UInt64}
+WHERE block_time >= {fromTime:UInt64}
   AND block_time < {toTime:UInt64}
   AND block_height <= {maxFinalizedHeight:UInt64}
   AND is_coinbase = 0
 ORDER BY gross_output_base_i256 DESC, block_height DESC, tx_index DESC
 LIMIT {limit:UInt64}`,
+      },
+      {
+        description: 'Richest current Dogecoin addresses.',
+        sql: `SELECT address, balance_i256 AS balance_base, as_of_block_height
+FROM ${analyticsBalancesCurrentTable}
+WHERE as_of_block_height <= {maxFinalizedHeight:UInt64}
+ORDER BY balance_i256 DESC, address ASC
+LIMIT {limit:UInt64}`,
+      },
+      {
+        description: 'Current mempool fee-rate distribution for the requested sample window.',
+        sql: `SELECT count() AS sampled_transactions,
+       avgOrNull(toInt256OrNull(fee_rate_base_per_kilobyte)) AS average_fee_rate_base_per_kb,
+       quantileOrNull(0.5)(toInt256OrNull(fee_rate_base_per_kilobyte)) AS median_fee_rate_base_per_kb
+FROM ${mempoolSamplesTable}
+WHERE sampled_at >= toDateTime({fromTime:UInt64})
+  AND sampled_at < toDateTime({toTime:UInt64})`,
       },
     ],
   };

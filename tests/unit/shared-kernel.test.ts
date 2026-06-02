@@ -5,8 +5,8 @@ import { describe, expect, it } from 'vitest';
 
 describe('shared kernel', () => {
   it('creates and validates external ids', () => {
-    const id = ExternalId.create('net');
-    expect(id.value).toMatch(/^net_[A-Za-z0-9]+$/u);
+    const id = ExternalId.create('key');
+    expect(id.value).toMatch(/^key_[A-Za-z0-9]+$/u);
     expect(() => ExternalId.parse('key_bad!', 'key')).toThrow();
   });
 

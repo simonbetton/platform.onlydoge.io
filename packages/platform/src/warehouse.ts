@@ -10,29 +10,26 @@ import {
   type AnalyticsQueryParams,
   type AnalyticsTransactionFact,
   type AnalyticsWarehousePort,
+  analyticsBalancesCurrentTable,
   analyticsQueryMaxResultRows,
   analyticsTransactionsTable,
+  mempoolSamplesTable,
 } from '@onlydoge/analytics-query';
 import type { ExplorerWarehousePort } from '@onlydoge/explorer-query';
 import {
   type AddressMovement,
-  applyDirectLinkDeltasToSnapshots,
   type BlockProjectionBatch,
   buildProjectionStateChanges,
   type CoreDogecoinApplyContext,
   type CoreDogecoinApplyResult,
   type CoreDogecoinBlockApplication,
-  collectProjectionDirectLinkSnapshotKeys,
-  type DirectLinkRecord,
   formatAmountBase,
   mapWithConcurrency,
-  mergeDirectLinkDelta,
   type ProjectionAppliedBlock,
   type ProjectionBalanceCursor,
   type ProjectionBalanceSnapshot,
   type ProjectionCurrentBalancePage,
   type ProjectionCurrentUtxoPage,
-  type ProjectionDirectLinkBatch,
   type ProjectionFactWarehousePort,
   type ProjectionFactWindow,
   type ProjectionPageRequestContext,
@@ -40,16 +37,12 @@ import {
   type ProjectionStateStorePort,
   type ProjectionUtxoOutput,
   type ProjectionWarehousePort,
-  parseProjectionDirectLinkSnapshotKey,
   projectionBalanceSnapshotKey,
   projectionBlockIdentity,
-  projectionDirectLinkSnapshotKey,
   resolvePendingProjectionWindow,
-  type SourceLinkRecord,
   toProjectionAppliedBlocks,
 } from '@onlydoge/indexing-pipeline';
-import type { InvestigationWarehousePort } from '@onlydoge/investigation-query';
-import { InfrastructureError, type PrimaryId } from '@onlydoge/shared-kernel';
+import { InfrastructureError } from '@onlydoge/shared-kernel';
 
 import {
   buildCoreCurrentStateOutputKeyRanges,
@@ -69,16 +62,14 @@ import {
   clickHousePagination,
   createAbortableRequestContext,
   formatBalanceTupleList,
-  formatDirectLinkTupleList,
   queryTimeoutMs,
   toAddressMovementInsertRow,
+  toAnalyticsBalanceCurrentInsertRow,
   toAppliedBlockInsertRow,
   toBalanceInsertRow,
   toClickHouseMaxExecutionTimeSeconds,
   toCurrentBalancePage,
   toCurrentUtxoPage,
-  toDirectLinkInsertRow,
-  toTransferInsertRow,
   toUtxoInsertRow,
   warehouseInfrastructureMessage,
 } from './warehouse-query';
@@ -101,8 +92,19 @@ interface VersionedBalanceRow extends BalanceRow {
   version: number;
 }
 
-interface VersionedDirectLinkRow extends DirectLinkRecord {
-  version: number;
+export interface MempoolSampleRow {
+  entryTime: number | null;
+  feeBase: string | null;
+  feeRateBasePerKilobyte: string | null;
+  height: number | null;
+  rawJson: string;
+  sampledAt: string;
+  sizeBytes: number | null;
+  txid: string;
+}
+
+export interface MempoolSampleWarehousePort {
+  insertMempoolSamples(rows: MempoolSampleRow[]): Promise<void>;
 }
 
 interface CoreUtxoCreateRow {
@@ -152,7 +154,8 @@ const maxClickHouseHotOutputKeyBytesPerChunk = 6_000;
 const maxClickHouseCoreOutputKeyValuesPerChunk = 512;
 const maxClickHouseCoreOutputKeyBytesPerChunk = 48_000;
 const maxClickHouseCoreOutputKeyQueryConcurrency = 4;
-const addressMovementsByAddressTable = 'address_movements_by_address_v2';
+const addressMovementsTable = 'dogecoin_address_movements_v1';
+const addressMovementsByAddressTable = 'dogecoin_address_movements_by_address_v1';
 const appliedBlocksTable = clickHouseCoreDogecoinTables.appliedBlocks;
 const balancesTable = clickHouseCoreDogecoinTables.balances;
 const coreProcessedBlocksTable = clickHouseCoreDogecoinTables.coreProcessedBlocks;
@@ -191,36 +194,135 @@ type CoreBenchmarkTables = {
 };
 export class InMemoryWarehouseAdapter
   implements
-    InvestigationWarehousePort,
     ProjectionWarehousePort,
     ProjectionFactWarehousePort,
     ExplorerWarehousePort,
-    AnalyticsWarehousePort
+    ClickHouseCoreDogecoinStore,
+    AnalyticsWarehousePort,
+    MempoolSampleWarehousePort
 {
   protected state: WarehouseState = emptyWarehouseState();
-  private readonly bootstrapTails = new Map<PrimaryId, number>();
+  private bootstrapTail: number | null = null;
 
-  public async getBalancesByAddresses(addresses: string[]) {
-    return this.state.balances.filter((balance) => addresses.includes(balance.address));
+  public async insertMempoolSamples(_rows: MempoolSampleRow[]): Promise<void> {}
+
+  public applyCoreDogecoinBlock(
+    input: CoreDogecoinBlockApplication,
+    context?: CoreDogecoinApplyContext,
+  ) {
+    return this.applyCoreDogecoinWindow([input], context);
   }
 
-  public async getTokensByAddresses(addresses: string[]) {
-    return this.state.tokens.filter((token) => addresses.includes(token.address));
+  public async applyCoreDogecoinWindow(
+    input: CoreDogecoinBlockApplication[],
+    _context?: CoreDogecoinApplyContext,
+  ): Promise<CoreDogecoinApplyResult> {
+    if (input.length === 0) {
+      return { applied: false, processTail: -1 };
+    }
+
+    const pending = this.pendingInMemoryCoreApplications(input);
+    if (pending.length === 0) {
+      return unappliedCoreWindowResult(input);
+    }
+
+    const createdOutputs = coreCreatedOutputsByKey(pending);
+    const currentOutputs = await this.getUtxoOutputs(externalCoreSpendKeys(pending));
+    for (const application of pending) {
+      this.applyInMemoryCoreApplication(application, createdOutputs, currentOutputs);
+    }
+    await this.afterMutation();
+
+    return appliedCoreWindowResult(input, pending);
   }
 
-  public async getDistinctLinksByAddresses(addresses: string[]) {
-    return this.state.sourceLinks
-      .filter((link) => addresses.includes(link.toAddress))
-      .map((link) => ({
-        networkId: link.networkId,
-        fromAddress: link.sourceAddress,
-        toAddress: link.toAddress,
-        transferCount: link.hopCount,
-      }));
+  public async materializeCoreDogecoinCurrentState(
+    _asOfBlockHeight: number,
+    _context?: CoreDogecoinApplyContext,
+  ): Promise<void> {
+    this.rebuildBalancesFromCurrentUtxos();
+    await this.afterMutation();
+  }
+
+  private pendingInMemoryCoreApplications(
+    input: CoreDogecoinBlockApplication[],
+  ): CoreDogecoinBlockApplication[] {
+    for (const application of input) {
+      const existing = this.state.appliedBlocks.find(
+        (block) => block.blockHeight === application.blockHeight,
+      );
+      if (existing && existing.blockHash !== application.blockHash) {
+        this.rewindInMemoryCoreTail(application.blockHeight);
+        return input.filter((candidate) => candidate.blockHeight >= application.blockHeight);
+      }
+    }
+
+    return input.filter(
+      (application) => !this.hasAppliedBlockRecord(application, this.state.appliedBlocks),
+    );
+  }
+
+  private applyInMemoryCoreApplication(
+    application: CoreDogecoinBlockApplication,
+    createdOutputs: Map<string, ProjectionUtxoOutput>,
+    currentOutputs: Map<string, ProjectionUtxoOutput>,
+  ): void {
+    const movements = coreApplicationAddressMovements(application, createdOutputs, currentOutputs);
+    const facts = coreApplicationTransactionFacts(application, createdOutputs, currentOutputs);
+    this.applyBatchUtxoCreates(application.utxoCreates);
+    this.applyBatchUtxoSpends(application.utxoSpends);
+    this.applyBatchAddressMovements(movements, application.blockHeight);
+    for (const fact of facts) {
+      this.upsertAnalyticsTransactionFact(fact);
+    }
+    this.appendAppliedBlock({
+      blockHeight: application.blockHeight,
+      blockHash: application.blockHash,
+    });
+  }
+
+  private rewindInMemoryCoreTail(fromBlockHeight: number): void {
+    this.state.appliedBlocks = this.state.appliedBlocks.filter(
+      (block) => block.blockHeight < fromBlockHeight,
+    );
+    this.state.addressMovements = this.state.addressMovements.filter(
+      (movement) => movement.blockHeight < fromBlockHeight,
+    );
+    this.state.transactionFacts = this.state.transactionFacts.filter(
+      (fact) => fact.blockHeight < fromBlockHeight,
+    );
+    this.state.utxoOutputs = this.state.utxoOutputs.flatMap((output) =>
+      rewindInMemoryUtxoOutput(output, fromBlockHeight),
+    );
+    this.rebuildBalancesFromCurrentUtxos();
+  }
+
+  private rebuildBalancesFromCurrentUtxos(): void {
+    const balances = new Map<string, BalanceRow>();
+    const asOfBlockHeight = this.state.appliedBlocks.reduce(
+      (height, block) => Math.max(height, block.blockHeight),
+      -1,
+    );
+    for (const output of this.state.utxoOutputs) {
+      if (!isUnspentSpendableOutput(output) || output.address.length === 0) {
+        continue;
+      }
+
+      const key = balanceKey(output.address, '');
+      const current = balances.get(key);
+      const balance = (BigInt(current?.balance ?? '0') + BigInt(output.valueBase)).toString();
+      balances.set(key, {
+        address: output.address,
+        assetAddress: '',
+        balance,
+        asOfBlockHeight,
+      });
+    }
+
+    this.state.balances = [...balances.values()];
   }
 
   public async getBalanceSnapshots(
-    networkId: PrimaryId,
     keys: Array<{
       address: string;
       assetAddress: string;
@@ -229,10 +331,8 @@ export class InMemoryWarehouseAdapter
     const keySet = new Set(
       keys.map((key) => projectionBalanceSnapshotKey(key.address, key.assetAddress)),
     );
-    const rows = this.state.balances.filter(
-      (balance) =>
-        balance.networkId === networkId &&
-        keySet.has(projectionBalanceSnapshotKey(balance.address, balance.assetAddress)),
+    const rows = this.state.balances.filter((balance) =>
+      keySet.has(projectionBalanceSnapshotKey(balance.address, balance.assetAddress)),
     );
 
     return new Map(
@@ -240,63 +340,28 @@ export class InMemoryWarehouseAdapter
     );
   }
 
-  public async getDirectLinkSnapshots(
-    networkId: PrimaryId,
-    keys: Array<{
-      assetAddress: string;
-      fromAddress: string;
-      toAddress: string;
-    }>,
-  ): Promise<Map<string, DirectLinkRecord>> {
-    const keySet = new Set(
-      keys.map((key) =>
-        projectionDirectLinkSnapshotKey(key.fromAddress, key.toAddress, key.assetAddress),
-      ),
-    );
-    const rows = this.state.directLinks.filter(
-      (link) =>
-        link.networkId === networkId &&
-        keySet.has(
-          projectionDirectLinkSnapshotKey(link.fromAddress, link.toAddress, link.assetAddress),
-        ),
-    );
-
-    return new Map(
-      rows.map((row) => [
-        projectionDirectLinkSnapshotKey(row.fromAddress, row.toAddress, row.assetAddress),
-        { ...row },
-      ]),
-    );
+  public async clearProjectionBootstrapState(): Promise<void> {
+    this.state.utxoOutputs = [];
+    this.state.balances = [];
+    this.state.appliedBlocks = [];
+    this.bootstrapTail = null;
   }
 
-  public async clearProjectionBootstrapState(networkId: PrimaryId): Promise<void> {
-    this.state.utxoOutputs = this.state.utxoOutputs.filter((row) => row.networkId !== networkId);
-    this.state.balances = this.state.balances.filter((row) => row.networkId !== networkId);
-    this.state.appliedBlocks = this.state.appliedBlocks.filter(
-      (row) => row.networkId !== networkId,
-    );
-    this.bootstrapTails.delete(networkId);
+  public async finalizeProjectionBootstrap(processTail: number): Promise<void> {
+    this.bootstrapTail = processTail;
   }
 
-  public async finalizeProjectionBootstrap(
-    networkId: PrimaryId,
-    processTail: number,
-  ): Promise<void> {
-    this.bootstrapTails.set(networkId, processTail);
-  }
-
-  public async getProjectionBootstrapTail(networkId: PrimaryId): Promise<number | null> {
-    return this.bootstrapTails.get(networkId) ?? null;
+  public async getProjectionBootstrapTail(): Promise<number | null> {
+    return this.bootstrapTail;
   }
 
   public async listCurrentUtxoOutputsPage(
-    networkId: PrimaryId,
     cursorOutputKey: string | null,
     limit: number,
     _context?: ProjectionPageRequestContext,
   ): Promise<ProjectionCurrentUtxoPage> {
     const rows = this.state.utxoOutputs
-      .filter((row) => isCurrentUtxoOutputPageRow(row, networkId, cursorOutputKey))
+      .filter((row) => isCurrentUtxoOutputPageRow(row, cursorOutputKey))
       .sort((left, right) => left.outputKey.localeCompare(right.outputKey))
       .slice(0, limit)
       .map((row) => ({ ...row }));
@@ -308,12 +373,11 @@ export class InMemoryWarehouseAdapter
   }
 
   public async listCurrentBalancesPage(
-    networkId: PrimaryId,
     cursor: ProjectionBalanceCursor | null,
     limit: number,
     _context?: ProjectionPageRequestContext,
   ): Promise<ProjectionCurrentBalancePage> {
-    const rows = currentBalancePageRows(this.state.balances, networkId, cursor, limit);
+    const rows = currentBalancePageRows(this.state.balances, cursor, limit);
 
     return {
       rows,
@@ -343,33 +407,27 @@ export class InMemoryWarehouseAdapter
     }
   }
 
-  public async getCurrentAddressSummary(networkId: PrimaryId, address: string) {
-    const balance = this.getNativeBalance(networkId, address);
-    const utxoCount = this.countSpendableUtxos(networkId, address);
+  public async getCurrentAddressSummary(address: string) {
+    const balance = this.getNativeBalance(address);
+    const utxoCount = this.countSpendableUtxos(address);
 
     return currentAddressSummaryOrNull(balance, utxoCount);
   }
 
-  public async listAppliedBlocks(networkId: PrimaryId, offset = 0, limit?: number) {
-    const rows = this.state.appliedBlocks
-      .filter((block) => block.networkId === networkId)
-      .sort((left, right) => right.blockHeight - left.blockHeight);
+  public async listAppliedBlocks(offset = 0, limit?: number) {
+    const rows = this.state.appliedBlocks.sort(
+      (left, right) => right.blockHeight - left.blockHeight,
+    );
 
     return rows.slice(offset, limit === undefined ? undefined : offset + limit);
   }
 
-  public async getAppliedBlockByHash(networkId: PrimaryId, blockHash: string) {
-    return (
-      this.state.appliedBlocks.find(
-        (block) => block.networkId === networkId && block.blockHash === blockHash,
-      ) ?? null
-    );
+  public async getAppliedBlockByHash(blockHash: string) {
+    return this.state.appliedBlocks.find((block) => block.blockHash === blockHash) ?? null;
   }
 
-  public async getTransactionRef(networkId: PrimaryId, txid: string) {
-    const output = this.state.utxoOutputs.find(
-      (candidate) => candidate.networkId === networkId && candidate.txid === txid,
-    );
+  public async getTransactionRef(txid: string) {
+    const output = this.state.utxoOutputs.find((candidate) => candidate.txid === txid);
     if (!output) {
       return null;
     }
@@ -382,84 +440,61 @@ export class InMemoryWarehouseAdapter
     };
   }
 
-  public async getAddressSummary(networkId: PrimaryId, address: string) {
-    const balance = this.getNativeBalance(networkId, address);
-    const movements = this.getNativeMovements(networkId, address);
-    const utxoCount = this.countSpendableUtxos(networkId, address);
+  public async getAddressSummary(address: string) {
+    const balance = this.getNativeBalance(address);
+    const movements = this.getNativeMovements(address);
+    const utxoCount = this.countSpendableUtxos(address);
     const totals = summarizeNativeMovements(movements);
 
     return inMemoryAddressSummary(balance, totals, utxoCount);
   }
 
-  private getNativeBalance(networkId: PrimaryId, address: string): string {
+  private getNativeBalance(address: string): string {
     return balanceOrZero(
-      this.state.balances.find((candidate) => isNativeBalance(candidate, networkId, address)),
+      this.state.balances.find((candidate) => isNativeBalance(candidate, address)),
     );
   }
 
-  private getNativeMovements(networkId: PrimaryId, address: string): AddressMovement[] {
-    return this.state.addressMovements.filter((candidate) =>
-      isNativeMovement(candidate, networkId, address),
-    );
+  private getNativeMovements(address: string): AddressMovement[] {
+    return this.state.addressMovements.filter((candidate) => isNativeMovement(candidate, address));
   }
 
-  private countSpendableUtxos(networkId: PrimaryId, address: string): number {
-    return this.state.utxoOutputs.filter((candidate) =>
-      isSpendableAddressUtxo(candidate, networkId, address),
-    ).length;
+  private countSpendableUtxos(address: string): number {
+    return this.state.utxoOutputs.filter((candidate) => isSpendableAddressUtxo(candidate, address))
+      .length;
   }
 
-  public async listAddressTransactions(
-    networkId: PrimaryId,
-    address: string,
-    offset = 0,
-    limit?: number,
-  ) {
-    const aggregates = aggregateAddressTransactions(this.getNativeMovements(networkId, address));
+  public async listAddressTransactions(address: string, offset = 0, limit?: number) {
+    const aggregates = aggregateAddressTransactions(this.getNativeMovements(address));
     return paginateAddressTransactions(aggregates, offset, limit);
   }
 
-  public async listAddressUtxos(networkId: PrimaryId, address: string, offset = 0, limit?: number) {
+  public async listAddressUtxos(address: string, offset = 0, limit?: number) {
     return this.state.utxoOutputs
-      .filter((candidate) => isSpendableAddressUtxo(candidate, networkId, address))
+      .filter((candidate) => isSpendableAddressUtxo(candidate, address))
       .sort(compareAddressUtxos)
       .slice(offset, limit === undefined ? undefined : offset + limit);
   }
 
-  public async getUtxoOutput(
-    networkId: PrimaryId,
-    outputKey: string,
-  ): Promise<ProjectionUtxoOutput | null> {
-    return (
-      this.state.utxoOutputs.find(
-        (output) => output.networkId === networkId && output.outputKey === outputKey,
-      ) ?? null
-    );
+  public async getUtxoOutput(outputKey: string): Promise<ProjectionUtxoOutput | null> {
+    return this.state.utxoOutputs.find((output) => output.outputKey === outputKey) ?? null;
   }
 
-  public async getUtxoOutputs(
-    networkId: PrimaryId,
-    outputKeys: string[],
-  ): Promise<Map<string, ProjectionUtxoOutput>> {
+  public async getUtxoOutputs(outputKeys: string[]): Promise<Map<string, ProjectionUtxoOutput>> {
     const outputs = this.state.utxoOutputs.filter((output) =>
-      isRequestedUtxoOutput(output, networkId, outputKeys),
+      isRequestedUtxoOutput(output, outputKeys),
     );
 
     return new Map(outputs.map((output) => [output.outputKey, output]));
   }
 
-  public async hasAppliedBlock(
-    networkId: PrimaryId,
-    blockHeight: number,
-    blockHash: string,
-  ): Promise<boolean> {
+  public async hasAppliedBlock(blockHeight: number, blockHash: string): Promise<boolean> {
     return this.state.appliedBlocks.some((candidate) =>
-      isAppliedBlockRecord(candidate, networkId, blockHeight, blockHash),
+      isAppliedBlockRecord(candidate, blockHeight, blockHash),
     );
   }
 
   public async listAppliedBlockSet(
-    networkId: PrimaryId,
     blocks: Array<{
       blockHash: string;
       blockHeight: number;
@@ -469,72 +504,33 @@ export class InMemoryWarehouseAdapter
       blocks
         .filter((block) =>
           this.state.appliedBlocks.some((candidate) =>
-            isAppliedBlockRecord(candidate, networkId, block.blockHeight, block.blockHash),
+            isAppliedBlockRecord(candidate, block.blockHeight, block.blockHash),
           ),
         )
-        .map((block) => projectionBlockIdentity(networkId, block.blockHeight, block.blockHash)),
+        .map((block) => projectionBlockIdentity(block.blockHeight, block.blockHash)),
     );
   }
 
-  public async hasProjectionState(networkId: PrimaryId): Promise<boolean> {
-    return this.state.appliedBlocks.some((candidate) => candidate.networkId === networkId);
+  public async hasProjectionState(): Promise<boolean> {
+    return this.state.appliedBlocks.length > 0;
   }
 
-  public async getAppliedBlockTail(networkId: PrimaryId): Promise<number | null> {
-    const tail = this.state.appliedBlocks
-      .filter((candidate) => candidate.networkId === networkId)
-      .reduce<number | null>(
-        (current, candidate) =>
-          current === null ? candidate.blockHeight : Math.max(current, candidate.blockHeight),
-        null,
-      );
+  public async getAppliedBlockTail(): Promise<number | null> {
+    const tail = this.state.appliedBlocks.reduce<number | null>(
+      (current, candidate) =>
+        current === null ? candidate.blockHeight : Math.max(current, candidate.blockHeight),
+      null,
+    );
     return tail;
   }
 
   public async importProjectionStateSnapshot(
-    networkId: PrimaryId,
     snapshot: ProjectionStateBootstrapSnapshot,
   ): Promise<void> {
-    this.state.appliedBlocks = [
-      ...this.state.appliedBlocks.filter((row) => row.networkId !== networkId),
-      ...snapshot.appliedBlocks,
-    ];
-    this.state.utxoOutputs = [
-      ...this.state.utxoOutputs.filter((row) => row.networkId !== networkId),
-      ...snapshot.utxoOutputs,
-    ];
-    this.state.balances = [
-      ...this.state.balances.filter((row) => row.networkId !== networkId),
-      ...snapshot.balances,
-    ];
-    this.state.directLinks = [
-      ...this.state.directLinks.filter((row) => row.networkId !== networkId),
-      ...snapshot.directLinks,
-    ];
-    this.state.sourceLinks = [
-      ...this.state.sourceLinks.filter((row) => row.networkId !== networkId),
-      ...snapshot.sourceLinks,
-    ];
+    this.state.appliedBlocks = [...snapshot.appliedBlocks];
+    this.state.utxoOutputs = [...snapshot.utxoOutputs];
+    this.state.balances = [...snapshot.balances];
     await this.afterMutation();
-  }
-
-  public async listDirectLinksFromAddresses(networkId: PrimaryId, fromAddresses: string[]) {
-    return this.state.directLinks.filter(
-      (link) => link.networkId === networkId && fromAddresses.includes(link.fromAddress),
-    );
-  }
-
-  public async listSourceSeedIdsReachingAddresses(
-    networkId: PrimaryId,
-    addresses: string[],
-  ): Promise<PrimaryId[]> {
-    return [
-      ...new Set(
-        this.state.sourceLinks
-          .filter((row) => row.networkId === networkId && addresses.includes(row.toAddress))
-          .map((row) => row.sourceAddressId),
-      ),
-    ];
   }
 
   public async applyProjectionWindow(batches: BlockProjectionBatch[]): Promise<void> {
@@ -543,40 +539,10 @@ export class InMemoryWarehouseAdapter
     }
   }
 
-  public async applyDirectLinkDeltasWindow(batches: ProjectionDirectLinkBatch[]): Promise<void> {
-    for (const batch of batches) {
-      this.applyDirectLinkDeltaBatchIfPending(batch);
-    }
-
-    await this.afterMutation();
-  }
-
-  private applyDirectLinkDeltaBatchIfPending(batch: ProjectionDirectLinkBatch): void {
-    if (this.hasAppliedDirectLinkBlock(batch)) {
-      return;
-    }
-
-    this.applyDirectLinkDeltaBatch(batch);
-  }
-
-  private applyDirectLinkDeltaBatch(batch: ProjectionDirectLinkBatch): void {
-    for (const delta of batch.directLinkDeltas) {
-      this.mergeDirectLinkDelta(delta);
-    }
-
-    this.state.directLinkAppliedBlocks.push({
-      networkId: batch.networkId,
-      blockHeight: batch.blockHeight,
-      blockHash: batch.blockHash,
-    });
-  }
-
   public async applyProjectionFacts(window: ProjectionFactWindow): Promise<void> {
     this.applyProjectionFactOutputs(window.utxoOutputs);
     this.applyProjectionFactMovements(window.addressMovements);
-    this.applyProjectionFactTransfers(window.transfers);
     this.applyProjectionFactBalances(window.balances);
-    this.applyProjectionFactDirectLinks(window.directLinks);
     this.applyProjectionFactBlocks(window.appliedBlocks);
     await this.afterMutation();
   }
@@ -599,29 +565,9 @@ export class InMemoryWarehouseAdapter
     }
   }
 
-  private applyProjectionFactTransfers(transfers: BlockProjectionBatch['transfers']): void {
-    for (const transfer of transfers) {
-      this.appendProjectionTransferIfUnique(transfer);
-    }
-  }
-
-  private appendProjectionTransferIfUnique(
-    transfer: BlockProjectionBatch['transfers'][number],
-  ): void {
-    if (this.appendUniqueTransfer(transfer)) {
-      this.state.transfers.push(transfer);
-    }
-  }
-
   private applyProjectionFactBalances(balances: ProjectionBalanceSnapshot[]): void {
     for (const balance of balances) {
       this.upsertBalance(balance);
-    }
-  }
-
-  private applyProjectionFactDirectLinks(links: DirectLinkRecord[]): void {
-    for (const link of links) {
-      this.upsertDirectLink(link);
     }
   }
 
@@ -631,50 +577,27 @@ export class InMemoryWarehouseAdapter
     }
   }
 
-  public async exportProjectionStateSnapshot(
-    networkId: PrimaryId,
-  ): Promise<ProjectionStateBootstrapSnapshot> {
+  public async exportProjectionStateSnapshot(): Promise<ProjectionStateBootstrapSnapshot> {
     return {
-      appliedBlocks: this.state.appliedBlocks.filter((row) => row.networkId === networkId),
-      utxoOutputs: this.state.utxoOutputs.filter((row) => row.networkId === networkId),
-      balances: this.state.balances.filter((row) => row.networkId === networkId),
-      directLinks: this.state.directLinks.filter((row) => row.networkId === networkId),
-      sourceLinks: this.state.sourceLinks.filter((row) => row.networkId === networkId),
+      appliedBlocks: [...this.state.appliedBlocks],
+      utxoOutputs: [...this.state.utxoOutputs],
+      balances: [...this.state.balances],
     };
   }
 
   public async applyBlockProjection(batch: BlockProjectionBatch): Promise<void> {
-    const alreadyApplied = await this.hasAppliedBlock(
-      batch.networkId,
-      batch.blockHeight,
-      batch.blockHash,
-    );
+    const alreadyApplied = await this.hasAppliedBlock(batch.blockHeight, batch.blockHash);
     if (alreadyApplied) {
       return;
     }
 
     this.applyBatchUtxoCreates(batch.utxoCreates);
-    this.applyBatchUtxoSpends(batch.networkId, batch.utxoSpends);
+    this.applyBatchUtxoSpends(batch.utxoSpends);
     this.applyBatchAddressMovements(batch.addressMovements, batch.blockHeight);
-    this.applyBatchTransfers(batch.transfers);
-    this.applyBatchDirectLinkDeltas(batch.directLinkDeltas);
     this.appendAppliedBlock({
-      networkId: batch.networkId,
       blockHeight: batch.blockHeight,
       blockHash: batch.blockHash,
     });
-    await this.afterMutation();
-  }
-
-  public async replaceSourceLinks(
-    networkId: PrimaryId,
-    sourceAddressId: PrimaryId,
-    rows: SourceLinkRecord[],
-  ): Promise<void> {
-    this.state.sourceLinks = this.state.sourceLinks.filter(
-      (row) => !(row.networkId === networkId && row.sourceAddressId === sourceAddressId),
-    );
-    this.state.sourceLinks.push(...rows);
     await this.afterMutation();
   }
 
@@ -686,15 +609,11 @@ export class InMemoryWarehouseAdapter
   }
 
   public async backfillAnalyticsTransactionFacts(input: {
-    networkId: PrimaryId;
     throughBlockHeight: number;
   }): Promise<{ rowsInserted: number | null; throughBlockHeight: number }> {
-    const rows = this.buildInMemoryAnalyticsTransactionFacts(
-      input.networkId,
-      input.throughBlockHeight,
-    );
+    const rows = this.buildInMemoryAnalyticsTransactionFacts(input.throughBlockHeight);
     this.state.transactionFacts = this.state.transactionFacts.filter(
-      (row) => row.networkId !== input.networkId || row.blockHeight > input.throughBlockHeight,
+      (row) => row.blockHeight > input.throughBlockHeight,
     );
     for (const row of rows) {
       this.upsertAnalyticsTransactionFact(row);
@@ -732,9 +651,7 @@ export class InMemoryWarehouseAdapter
   protected async afterMutation(): Promise<void> {}
 
   private upsertAnalyticsTransactionFact(row: AnalyticsTransactionFact): void {
-    const index = this.state.transactionFacts.findIndex(
-      (candidate) => candidate.networkId === row.networkId && candidate.txid === row.txid,
-    );
+    const index = this.state.transactionFacts.findIndex((candidate) => candidate.txid === row.txid);
     if (index >= 0) {
       this.state.transactionFacts[index] = { ...row };
       return;
@@ -744,12 +661,9 @@ export class InMemoryWarehouseAdapter
   }
 
   private buildInMemoryAnalyticsTransactionFacts(
-    networkId: PrimaryId,
     throughBlockHeight: number,
   ): AnalyticsTransactionFact[] {
-    const outputs = this.state.utxoOutputs.filter(
-      (row) => row.networkId === networkId && row.blockHeight <= throughBlockHeight,
-    );
+    const outputs = this.state.utxoOutputs.filter((row) => row.blockHeight <= throughBlockHeight);
     const outputsByKey = new Map(outputs.map((row) => [row.outputKey, row]));
     const grouped = new Map<string, ProjectionUtxoOutput[]>();
     for (const output of outputs) {
@@ -764,7 +678,6 @@ export class InMemoryWarehouseAdapter
   private filteredAnalyticsFacts(params: AnalyticsQueryParams): AnalyticsTransactionFact[] {
     return this.state.transactionFacts.filter(
       (row) =>
-        row.networkId === params.networkId &&
         row.blockTime >= params.fromTime &&
         row.blockTime < params.toTime &&
         row.blockHeight <= params.maxFinalizedHeight,
@@ -777,12 +690,9 @@ export class InMemoryWarehouseAdapter
     }
   }
 
-  private applyBatchUtxoSpends(
-    networkId: PrimaryId,
-    spends: BlockProjectionBatch['utxoSpends'],
-  ): void {
+  private applyBatchUtxoSpends(spends: BlockProjectionBatch['utxoSpends']): void {
     for (const spend of spends) {
-      const output = this.requireUtxoOutput(networkId, spend.outputKey);
+      const output = this.requireUtxoOutput(spend.outputKey);
       output.spentByTxid = spend.spentByTxid;
       output.spentInBlock = spend.spentInBlock;
       output.spentInputIndex = spend.spentInputIndex;
@@ -804,22 +714,8 @@ export class InMemoryWarehouseAdapter
     this.applyBalanceDelta(movement, blockHeight);
   }
 
-  private applyBatchTransfers(transfers: BlockProjectionBatch['transfers']): void {
-    for (const transfer of transfers) {
-      this.appendProjectionTransferIfUnique(transfer);
-    }
-  }
-
-  private applyBatchDirectLinkDeltas(deltas: BlockProjectionBatch['directLinkDeltas']): void {
-    for (const delta of deltas) {
-      this.mergeDirectLinkDelta(delta);
-    }
-  }
-
-  private requireUtxoOutput(networkId: PrimaryId, outputKey: string): ProjectionUtxoOutput {
-    const output = this.state.utxoOutputs.find(
-      (candidate) => candidate.networkId === networkId && candidate.outputKey === outputKey,
-    );
+  private requireUtxoOutput(outputKey: string): ProjectionUtxoOutput {
+    const output = this.state.utxoOutputs.find((candidate) => candidate.outputKey === outputKey);
     if (!output) {
       throw new Error(`missing utxo output: ${outputKey}`);
     }
@@ -842,15 +738,7 @@ export class InMemoryWarehouseAdapter
 
   private appendUniqueAddressMovement(movement: AddressMovement): boolean {
     return !this.state.addressMovements.some(
-      (candidate) =>
-        candidate.networkId === movement.networkId && candidate.movementId === movement.movementId,
-    );
-  }
-
-  private appendUniqueTransfer(transfer: BlockProjectionBatch['transfers'][number]): boolean {
-    return !this.state.transfers.some(
-      (candidate) =>
-        candidate.networkId === transfer.networkId && candidate.transferId === transfer.transferId,
+      (candidate) => candidate.movementId === movement.movementId,
     );
   }
 
@@ -864,36 +752,10 @@ export class InMemoryWarehouseAdapter
     }
   }
 
-  private upsertDirectLink(link: DirectLinkRecord): void {
-    const existing = this.findDirectLink(link);
-    if (existing) {
-      Object.assign(existing, link);
-    } else {
-      this.state.directLinks.push({ ...link });
-    }
-  }
-
-  private mergeDirectLinkDelta(delta: DirectLinkRecord): void {
-    const current = this.findDirectLink(delta);
-    if (current) {
-      Object.assign(current, mergeDirectLinkDelta(current, delta));
-    } else {
-      this.state.directLinks.push({ ...delta });
-    }
-  }
-
-  private findDirectLink(link: DirectLinkRecord): DirectLinkRecord | undefined {
-    return this.state.directLinks.find((candidate) => isDirectLinkRecord(candidate, link));
-  }
-
   private appendAppliedBlock(block: ProjectionAppliedBlock): void {
     if (!this.hasAppliedBlockRecord(block, this.state.appliedBlocks)) {
       this.state.appliedBlocks.push({ ...block });
     }
-  }
-
-  private hasAppliedDirectLinkBlock(block: ProjectionAppliedBlock): boolean {
-    return this.hasAppliedBlockRecord(block, this.state.directLinkAppliedBlocks);
   }
 
   private hasAppliedBlockRecord(
@@ -901,7 +763,7 @@ export class InMemoryWarehouseAdapter
     blocks: ProjectionAppliedBlock[],
   ): boolean {
     return blocks.some((candidate) =>
-      isAppliedBlockRecord(candidate, block.networkId, block.blockHeight, block.blockHash),
+      isAppliedBlockRecord(candidate, block.blockHeight, block.blockHash),
     );
   }
 
@@ -929,7 +791,6 @@ export class InMemoryWarehouseAdapter
     }
 
     this.state.balances.push({
-      networkId: movement.networkId,
       address: movement.address,
       assetAddress: movement.assetAddress,
       balance: formatAmountBase(nextAmount),
@@ -961,12 +822,9 @@ export class DuckDbWarehouseAdapter extends InMemoryWarehouseAdapter {
 
 function isCurrentUtxoOutputPageRow(
   row: ProjectionUtxoOutput,
-  networkId: PrimaryId,
   cursorOutputKey: string | null,
 ): boolean {
-  return [row.networkId === networkId, isAfterOutputCursor(row.outputKey, cursorOutputKey)].every(
-    Boolean,
-  );
+  return isAfterOutputCursor(row.outputKey, cursorOutputKey);
 }
 
 function isAfterOutputCursor(outputKey: string, cursorOutputKey: string | null): boolean {
@@ -999,7 +857,6 @@ function isBalanceSnapshot(
   balance: ProjectionBalanceSnapshot,
 ): boolean {
   return [
-    candidate.networkId === balance.networkId,
     candidate.address === balance.address,
     candidate.assetAddress === balance.assetAddress,
   ].every(Boolean);
@@ -1031,37 +888,16 @@ function balanceOrZero(balance: ProjectionBalanceSnapshot | undefined): string {
   return balance.balance;
 }
 
-function isNativeBalance(
-  candidate: ProjectionBalanceSnapshot,
-  networkId: PrimaryId,
-  address: string,
-): boolean {
-  return [
-    candidate.networkId === networkId,
-    candidate.address === address,
-    candidate.assetAddress === '',
-  ].every(Boolean);
+function isNativeBalance(candidate: ProjectionBalanceSnapshot, address: string): boolean {
+  return [candidate.address === address, candidate.assetAddress === ''].every(Boolean);
 }
 
-function isNativeMovement(
-  candidate: AddressMovement,
-  networkId: PrimaryId,
-  address: string,
-): boolean {
-  return [
-    candidate.networkId === networkId,
-    candidate.address === address,
-    candidate.assetAddress === '',
-  ].every(Boolean);
+function isNativeMovement(candidate: AddressMovement, address: string): boolean {
+  return [candidate.address === address, candidate.assetAddress === ''].every(Boolean);
 }
 
-function isSpendableAddressUtxo(
-  candidate: ProjectionUtxoOutput,
-  networkId: PrimaryId,
-  address: string,
-): boolean {
+function isSpendableAddressUtxo(candidate: ProjectionUtxoOutput, address: string): boolean {
   return [
-    candidate.networkId === networkId,
     candidate.address === address,
     candidate.isSpendable,
     candidate.spentByTxid === null,
@@ -1080,45 +916,24 @@ function firstNonZero(values: number[]): number {
   return values.find((value) => value !== 0) ?? 0;
 }
 
-function isRequestedUtxoOutput(
-  output: ProjectionUtxoOutput,
-  networkId: PrimaryId,
-  outputKeys: string[],
-): boolean {
-  return [output.networkId === networkId, outputKeys.includes(output.outputKey)].every(Boolean);
+function isRequestedUtxoOutput(output: ProjectionUtxoOutput, outputKeys: string[]): boolean {
+  return outputKeys.includes(output.outputKey);
 }
 
 function isAppliedBlockRecord(
   candidate: ProjectionAppliedBlock,
-  networkId: PrimaryId,
   blockHeight: number,
   blockHash: string,
 ): boolean {
-  return [
-    candidate.networkId === networkId,
-    candidate.blockHeight === blockHeight,
-    candidate.blockHash === blockHash,
-  ].every(Boolean);
+  return [candidate.blockHeight === blockHeight, candidate.blockHash === blockHash].every(Boolean);
 }
 
 function isSameUtxoOutput(candidate: ProjectionUtxoOutput, output: ProjectionUtxoOutput): boolean {
-  return [candidate.networkId === output.networkId, candidate.outputKey === output.outputKey].every(
-    Boolean,
-  );
-}
-
-function isDirectLinkRecord(candidate: DirectLinkRecord, link: DirectLinkRecord): boolean {
-  return [
-    candidate.networkId === link.networkId,
-    candidate.fromAddress === link.fromAddress,
-    candidate.toAddress === link.toAddress,
-    candidate.assetAddress === link.assetAddress,
-  ].every(Boolean);
+  return candidate.outputKey === output.outputKey;
 }
 
 function isMovementBalanceSnapshot(candidate: BalanceRow, movement: AddressMovement): boolean {
   return [
-    candidate.networkId === movement.networkId,
     candidate.address === movement.address,
     candidate.assetAddress === movement.assetAddress,
   ].every(Boolean);
@@ -1146,6 +961,27 @@ function isUnspentSpendableOutput(
   return [output.isSpendable, output.spentByTxid === null].every(Boolean);
 }
 
+function rewindInMemoryUtxoOutput(
+  output: ProjectionUtxoOutput,
+  fromBlockHeight: number,
+): ProjectionUtxoOutput[] {
+  if (output.blockHeight >= fromBlockHeight) {
+    return [];
+  }
+  if (output.spentInBlock !== null && output.spentInBlock >= fromBlockHeight) {
+    return [
+      {
+        ...output,
+        spentByTxid: null,
+        spentInBlock: null,
+        spentInputIndex: null,
+      },
+    ];
+  }
+
+  return [output];
+}
+
 function analyticsFactFromOutputs(
   outputs: ProjectionUtxoOutput[],
   outputsByKey: Map<string, ProjectionUtxoOutput>,
@@ -1161,7 +997,6 @@ function analyticsFactFromOutputs(
   const grossOutput = sorted.reduce((sum, output) => sum + BigInt(output.valueBase), 0n);
 
   return {
-    networkId: first.networkId,
     blockHeight: first.blockHeight,
     blockHash: first.blockHash,
     blockTime: first.blockTime,
@@ -1262,7 +1097,6 @@ function inMemoryTopGrossOutputRows(
 
 function inMemoryAnalyticsFactRow(fact: AnalyticsTransactionFact): Record<string, unknown> {
   return {
-    network_id: fact.networkId,
     block_height: fact.blockHeight,
     block_hash: fact.blockHash,
     block_time: fact.blockTime,
@@ -1329,12 +1163,12 @@ function utxoOutputForWrite(output: ProjectionUtxoOutput, clone: boolean): Proje
 
 export class ClickHouseWarehouseAdapter
   implements
-    InvestigationWarehousePort,
     ProjectionWarehousePort,
     ProjectionFactWarehousePort,
     ExplorerWarehousePort,
     ClickHouseCoreDogecoinStore,
-    AnalyticsWarehousePort
+    AnalyticsWarehousePort,
+    MempoolSampleWarehousePort
 {
   private readonly client: ReturnType<typeof createClient>;
   private readonly analyticsClient: ReturnType<typeof createClient>;
@@ -1396,64 +1230,50 @@ export class ClickHouseWarehouseAdapter
     requestContext: ClickHouseRequestContext,
     context?: CoreDogecoinApplyContext,
   ): Promise<CoreDogecoinApplyResult> {
-    const networkId = coreWindowNetworkId(input);
-    const pending = await this.pendingCoreWindowApplications(
-      networkId,
-      input,
-      context,
-      requestContext,
-    );
+    const pending = await this.pendingCoreWindowApplications(input, context, requestContext);
 
     if (pending.length === 0) {
       return unappliedCoreWindowResult(input);
     }
 
-    await this.validatePendingCoreWindow(networkId, pending, context, requestContext);
-    await this.insertPendingCoreWindow(networkId, pending, context, requestContext);
+    await this.validatePendingCoreWindow(pending, context, requestContext);
+    await this.insertPendingCoreWindow(pending, context, requestContext);
     return appliedCoreWindowResult(input, pending);
   }
 
   private async pendingCoreWindowApplications(
-    networkId: PrimaryId,
     input: CoreDogecoinBlockApplication[],
     context: CoreDogecoinApplyContext | undefined,
     requestContext: ClickHouseRequestContext,
   ): Promise<CoreDogecoinBlockApplication[]> {
     const processedBlocks = await this.getCoreProcessedBlocks(
-      networkId,
       input.map((application) => application.blockHeight),
       requestContext,
     );
     const reorgHeight = firstCoreReorgHeight(input, processedBlocks);
     if (reorgHeight !== null) {
-      await this.rewindCoreDogecoinWindow(networkId, reorgHeight, context);
+      await this.rewindCoreDogecoinWindow(reorgHeight, context);
       return input.filter((application) => application.blockHeight >= reorgHeight);
     }
 
     return input.filter((application) =>
-      isPendingCoreApplication(
-        networkId,
-        application,
-        processedBlocks.get(application.blockHeight),
-      ),
+      isPendingCoreApplication(application, processedBlocks.get(application.blockHeight)),
     );
   }
 
   private async rewindCoreDogecoinWindow(
-    networkId: PrimaryId,
     fromBlockHeight: number,
     context: CoreDogecoinApplyContext | undefined,
   ): Promise<void> {
-    await this.deleteCoreDogecoinTail(networkId, fromBlockHeight, context);
+    await this.deleteCoreDogecoinTail(fromBlockHeight, context);
     if (!shouldUpdateCoreCurrentState(context)) {
       return;
     }
 
-    await this.rematerializeCoreCurrentStateAt(networkId, fromBlockHeight - 1, context);
+    await this.rematerializeCoreCurrentStateAt(fromBlockHeight - 1, context);
   }
 
   private async deleteCoreDogecoinTail(
-    networkId: PrimaryId,
     fromBlockHeight: number,
     context: CoreDogecoinApplyContext | undefined,
   ): Promise<void> {
@@ -1475,7 +1295,7 @@ export class ClickHouseWarehouseAdapter
         heightColumn: 'block_height',
       },
       {
-        table: 'address_movements_v2',
+        table: addressMovementsTable,
         heightColumn: 'block_height',
       },
       {
@@ -1494,20 +1314,18 @@ export class ClickHouseWarehouseAdapter
 
     for (const deletion of deletes) {
       await this.executeCommand({
-        query: `ALTER TABLE ${deletion.table} DELETE WHERE network_id = {networkId:UInt64} AND ${deletion.heightColumn} >= {fromBlockHeight:UInt64}`,
-        query_params: { networkId, fromBlockHeight },
+        query: `ALTER TABLE ${deletion.table} DELETE WHERE ${deletion.heightColumn} >= {fromBlockHeight:UInt64}`,
+        query_params: { fromBlockHeight },
         clickhouse_settings: settings,
       });
     }
   }
 
   private async rematerializeCoreCurrentStateAt(
-    networkId: PrimaryId,
     asOfBlockHeight: number,
     context: CoreDogecoinApplyContext | undefined,
   ): Promise<void> {
-    await this.clearCoreDogecoinCurrentStateForNetwork({
-      networkId,
+    await this.clearCoreDogecoinCurrentState({
       currentUtxosTable: utxoCurrentStateTable,
       currentUtxosByAddressTable: utxoCurrentStateByAddressTable,
       balancesTable,
@@ -1519,7 +1337,6 @@ export class ClickHouseWarehouseAdapter
     }
 
     await this.insertCoreCurrentStateMaterialization({
-      networkId,
       asOfBlockHeight,
       createsTable: coreUtxoCreatesTable,
       spendsTable: coreUtxoSpendsTable,
@@ -1533,18 +1350,16 @@ export class ClickHouseWarehouseAdapter
   }
 
   private async validatePendingCoreWindow(
-    networkId: PrimaryId,
     pending: CoreDogecoinBlockApplication[],
     context: CoreDogecoinApplyContext | undefined,
     requestContext: ClickHouseRequestContext,
   ): Promise<void> {
-    this.assertCoreWindowShape(networkId, pending);
-    await this.assertCoreWindowPreviousBlock(networkId, pending[0], requestContext);
-    await this.assertCoreWindowPrevoutsIfEnabled(networkId, pending, context, requestContext);
+    this.assertCoreWindowShape(pending);
+    await this.assertCoreWindowPreviousBlock(pending[0], requestContext);
+    await this.assertCoreWindowPrevoutsIfEnabled(pending, context, requestContext);
   }
 
   private async assertCoreWindowPrevoutsIfEnabled(
-    networkId: PrimaryId,
     pending: CoreDogecoinBlockApplication[],
     context: CoreDogecoinApplyContext | undefined,
     requestContext: ClickHouseRequestContext,
@@ -1553,11 +1368,10 @@ export class ClickHouseWarehouseAdapter
       return;
     }
 
-    await this.assertCoreWindowPrevouts(networkId, pending, requestContext);
+    await this.assertCoreWindowPrevouts(pending, requestContext);
   }
 
   private async insertPendingCoreWindow(
-    networkId: PrimaryId,
     pending: CoreDogecoinBlockApplication[],
     context: CoreDogecoinApplyContext | undefined,
     requestContext: ClickHouseRequestContext,
@@ -1571,12 +1385,12 @@ export class ClickHouseWarehouseAdapter
     );
     await this.insertRows(
       coreUtxoSpendsTable,
-      spendRows.map((spend) => toCoreUtxoSpendInsertRow(networkId, spend)),
+      spendRows.map(toCoreUtxoSpendInsertRow),
       requestContext,
     );
-    await this.insertCoreAddressMovements(networkId, pending, requestContext);
-    await this.insertCoreTransactionFacts(networkId, pending, requestContext);
-    await this.applyCoreCurrentStateWindowIfEnabled(networkId, pending, context, requestContext);
+    await this.insertCoreAddressMovements(pending, requestContext);
+    await this.insertCoreTransactionFacts(pending, requestContext);
+    await this.applyCoreCurrentStateWindowIfEnabled(pending, context, requestContext);
     await this.insertRows(
       coreProcessedBlocksTable,
       pending.map(toCoreProcessedBlockInsertRow),
@@ -1585,26 +1399,23 @@ export class ClickHouseWarehouseAdapter
   }
 
   private async insertCoreAddressMovements(
-    networkId: PrimaryId,
     pending: CoreDogecoinBlockApplication[],
     requestContext: ClickHouseRequestContext,
   ): Promise<void> {
-    const movements = await this.buildCoreAddressMovements(networkId, pending, requestContext);
+    const movements = await this.buildCoreAddressMovements(pending, requestContext);
     await this.insertRows(
-      'address_movements_v2',
+      addressMovementsTable,
       movements.map(toAddressMovementInsertRow),
       requestContext,
     );
   }
 
   private async buildCoreAddressMovements(
-    networkId: PrimaryId,
     pending: CoreDogecoinBlockApplication[],
     requestContext: ClickHouseRequestContext,
   ): Promise<AddressMovement[]> {
     const createdOutputs = coreCreatedOutputsByKey(pending);
     const currentOutputs = await this.getCurrentUtxoOutputMap(
-      networkId,
       externalCoreSpendKeys(pending),
       requestContext,
     );
@@ -1615,13 +1426,11 @@ export class ClickHouseWarehouseAdapter
   }
 
   private async insertCoreTransactionFacts(
-    networkId: PrimaryId,
     pending: CoreDogecoinBlockApplication[],
     requestContext: ClickHouseRequestContext,
   ): Promise<void> {
     const createdOutputs = coreCreatedOutputsByKey(pending);
     const currentOutputs = await this.getCurrentUtxoOutputMap(
-      networkId,
       externalCoreSpendKeys(pending),
       requestContext,
     );
@@ -1637,7 +1446,6 @@ export class ClickHouseWarehouseAdapter
   }
 
   private async applyCoreCurrentStateWindowIfEnabled(
-    networkId: PrimaryId,
     pending: CoreDogecoinBlockApplication[],
     context: CoreDogecoinApplyContext | undefined,
     requestContext: ClickHouseRequestContext,
@@ -1646,15 +1454,14 @@ export class ClickHouseWarehouseAdapter
       return;
     }
 
-    await this.applyCoreCurrentStateWindow(networkId, pending, requestContext);
+    await this.applyCoreCurrentStateWindow(pending, requestContext);
   }
 
   private async applyCoreCurrentStateWindow(
-    networkId: PrimaryId,
     pending: CoreDogecoinBlockApplication[],
     requestContext: ClickHouseRequestContext,
   ): Promise<void> {
-    const currentState = await this.buildCoreCurrentStateWindow(networkId, pending, requestContext);
+    const currentState = await this.buildCoreCurrentStateWindow(pending, requestContext);
     if (!currentState) {
       return;
     }
@@ -1663,7 +1470,6 @@ export class ClickHouseWarehouseAdapter
   }
 
   private async buildCoreCurrentStateWindow(
-    networkId: PrimaryId,
     pending: CoreDogecoinBlockApplication[],
     requestContext: ClickHouseRequestContext,
   ): Promise<CoreCurrentStateWindow | null> {
@@ -1673,24 +1479,17 @@ export class ClickHouseWarehouseAdapter
     }
 
     const currentOutputs = await this.getCurrentUtxoOutputMap(
-      networkId,
       coreWindowSpendKeys(pending),
       requestContext,
     );
     const mutation = applyCoreCurrentStateMutations(pending, currentOutputs);
     const currentBalances = await this.getBalanceRowsByKeys(
-      networkId,
       [...mutation.balanceDeltas.keys()],
       requestContext,
     );
 
     return {
-      nextBalances: coreCurrentBalanceRows(
-        networkId,
-        windowEnd,
-        mutation.balanceDeltas,
-        currentBalances,
-      ),
+      nextBalances: coreCurrentBalanceRows(windowEnd, mutation.balanceDeltas, currentBalances),
       nextOutputs: mutation.nextOutputs,
       windowEnd,
     };
@@ -1714,6 +1513,11 @@ export class ClickHouseWarehouseAdapter
       requestContext,
     );
     await this.insertRows(
+      analyticsBalancesCurrentTable,
+      currentState.nextBalances.map((row) => toAnalyticsBalanceCurrentInsertRow(row, row.version)),
+      requestContext,
+    );
+    await this.insertRows(
       appliedBlocksTable,
       toProjectionAppliedBlocks(pending).map(toAppliedBlockInsertRow),
       requestContext,
@@ -1721,12 +1525,10 @@ export class ClickHouseWarehouseAdapter
   }
 
   public async materializeCoreDogecoinCurrentState(
-    networkId: PrimaryId,
     asOfBlockHeight: number,
     context?: CoreDogecoinApplyContext,
   ): Promise<void> {
-    await this.clearCoreDogecoinCurrentStateForNetwork({
-      networkId,
+    await this.clearCoreDogecoinCurrentState({
       currentUtxosTable: utxoCurrentStateTable,
       currentUtxosByAddressTable: utxoCurrentStateByAddressTable,
       balancesTable,
@@ -1734,7 +1536,6 @@ export class ClickHouseWarehouseAdapter
       ...coreApplyContextOption(context),
     });
     await this.insertCoreCurrentStateMaterialization({
-      networkId,
       asOfBlockHeight,
       createsTable: coreUtxoCreatesTable,
       spendsTable: coreUtxoSpendsTable,
@@ -1747,13 +1548,12 @@ export class ClickHouseWarehouseAdapter
     });
   }
 
-  private async clearCoreDogecoinCurrentStateForNetwork(input: {
+  private async clearCoreDogecoinCurrentState(input: {
     appliedBlocksTable: string;
     balancesTable: string;
     context?: CoreDogecoinApplyContext;
     currentUtxosByAddressTable: string;
     currentUtxosTable: string;
-    networkId: PrimaryId;
   }): Promise<void> {
     const materializationSettings = clickHouseCoreMaterializationSettings(input.context);
     const mutationSettings = {
@@ -1767,11 +1567,14 @@ export class ClickHouseWarehouseAdapter
       input.appliedBlocksTable,
     ]) {
       await this.executeCommand({
-        query: `ALTER TABLE ${table} DELETE WHERE network_id = {networkId:UInt64}`,
-        query_params: { networkId: input.networkId },
+        query: `ALTER TABLE ${table} DELETE WHERE 1 = 1`,
         clickhouse_settings: mutationSettings,
       });
     }
+    await this.executeCommand({
+      query: `ALTER TABLE ${analyticsBalancesCurrentTable} DELETE WHERE 1 = 1`,
+      clickhouse_settings: mutationSettings,
+    });
   }
 
   public async resetCoreDogecoinStorage(): Promise<void> {
@@ -1807,15 +1610,11 @@ export class ClickHouseWarehouseAdapter
       return { rowsInserted: 0 };
     }
 
-    const networkId = coreWindowNetworkId(input);
-    this.assertCoreWindowShape(networkId, input);
+    this.assertCoreWindowShape(input);
     const tables = coreBenchmarkTableNames(prefix);
     const rows = coreBenchmarkRows(input);
     await this.insertRows(tables.creates, rows.createRows.map(toCoreUtxoCreateInsertRow));
-    await this.insertRows(
-      tables.spends,
-      rows.spendRows.map((spend) => toCoreUtxoSpendInsertRow(networkId, spend)),
-    );
+    await this.insertRows(tables.spends, rows.spendRows.map(toCoreUtxoSpendInsertRow));
     await this.insertRows(tables.processedBlocks, input.map(toCoreProcessedBlockInsertRow));
 
     return {
@@ -1825,7 +1624,6 @@ export class ClickHouseWarehouseAdapter
 
   public async materializeCoreDogecoinBenchmarkCurrentState(
     prefix: string,
-    networkId: PrimaryId,
     asOfBlockHeight: number,
   ): Promise<void> {
     const tables = coreBenchmarkTableNames(prefix);
@@ -1833,7 +1631,6 @@ export class ClickHouseWarehouseAdapter
     await this.executeCommand({ query: `TRUNCATE TABLE ${tables.balances}` });
     await this.executeCommand({ query: `TRUNCATE TABLE ${tables.appliedBlocks}` });
     await this.insertCoreCurrentStateMaterialization({
-      networkId,
       asOfBlockHeight,
       createsTable: tables.creates,
       spendsTable: tables.spends,
@@ -1859,7 +1656,6 @@ export class ClickHouseWarehouseAdapter
     currentUtxosByAddressTable: string;
     currentUtxosTable: string;
     context?: CoreDogecoinApplyContext;
-    networkId: PrimaryId;
     processedBlocksTable: string;
     spendsTable: string;
   }): Promise<void> {
@@ -1868,7 +1664,6 @@ export class ClickHouseWarehouseAdapter
       await this.executeCommand({
         query: `
           INSERT INTO ${input.currentUtxosTable} (
-            network_id,
             block_height,
             block_hash,
             block_time,
@@ -1887,7 +1682,6 @@ export class ClickHouseWarehouseAdapter
             version
           )
           SELECT
-            c.network_id,
             c.block_height,
             c.block_hash,
             c.block_time,
@@ -1908,27 +1702,24 @@ export class ClickHouseWarehouseAdapter
             SELECT *
             FROM ${input.createsTable}
             WHERE
-              network_id = {networkId:UInt64}
-              AND version <= {asOfBlockHeight:UInt64}
+              version <= {asOfBlockHeight:UInt64}
               ${clickHouseStringRangeClause('output_key', range)}
             ORDER BY output_key ASC, version DESC
             LIMIT 1 BY output_key
           ) AS c
           LEFT ANTI JOIN (
-            SELECT network_id, spent_output_key
+            SELECT spent_output_key
             FROM ${input.spendsTable}
             WHERE
-              network_id = {networkId:UInt64}
-              AND version <= {asOfBlockHeight:UInt64}
+              version <= {asOfBlockHeight:UInt64}
               ${clickHouseStringRangeClause('spent_output_key', range)}
             ORDER BY spent_output_key ASC, version DESC
             LIMIT 1 BY spent_output_key
           ) AS s
-          ON c.network_id = s.network_id AND c.output_key = s.spent_output_key
+          ON c.output_key = s.spent_output_key
         `,
         query_params: {
           ...clickHouseStringRangeParams(range),
-          networkId: input.networkId,
           asOfBlockHeight: input.asOfBlockHeight,
         },
         clickhouse_settings: materializationSettings,
@@ -1937,7 +1728,6 @@ export class ClickHouseWarehouseAdapter
     await this.executeCommand({
       query: `
         INSERT INTO ${input.balancesTable} (
-          network_id,
           address,
           asset_address,
           balance,
@@ -1945,7 +1735,6 @@ export class ClickHouseWarehouseAdapter
           version
         )
         SELECT
-          network_id,
           address,
           '',
           toString(sum(toInt256(value_base))),
@@ -1953,13 +1742,12 @@ export class ClickHouseWarehouseAdapter
           {asOfBlockHeight:UInt64}
         FROM ${input.currentUtxosByAddressTable}
         WHERE
-          network_id = {networkId:UInt64}
-          AND is_spendable = 1
+          is_spendable = 1
           AND address != ''
           AND spent_by_txid IS NULL
-        GROUP BY network_id, address
+        GROUP BY address
       `,
-      query_params: { networkId: input.networkId, asOfBlockHeight: input.asOfBlockHeight },
+      query_params: { asOfBlockHeight: input.asOfBlockHeight },
       clickhouse_settings: {
         ...materializationSettings,
         optimize_aggregation_in_order: 1,
@@ -1967,25 +1755,52 @@ export class ClickHouseWarehouseAdapter
     });
     await this.executeCommand({
       query: `
-        INSERT INTO ${input.appliedBlocksTable} (network_id, block_height, block_hash)
-        SELECT network_id, block_height, block_hash
+        INSERT INTO ${analyticsBalancesCurrentTable} (
+          address,
+          asset_address,
+          balance,
+          as_of_block_height,
+          version
+        )
+        SELECT
+          address,
+          '',
+          toString(sum(toInt256(value_base))),
+          {asOfBlockHeight:UInt64},
+          {asOfBlockHeight:UInt64}
+        FROM ${input.currentUtxosByAddressTable}
+        WHERE
+          is_spendable = 1
+          AND address != ''
+          AND spent_by_txid IS NULL
+        GROUP BY address
+      `,
+      query_params: { asOfBlockHeight: input.asOfBlockHeight },
+      clickhouse_settings: {
+        ...materializationSettings,
+        optimize_aggregation_in_order: 1,
+      },
+    });
+    await this.executeCommand({
+      query: `
+        INSERT INTO ${input.appliedBlocksTable} (block_height, block_hash)
+        SELECT block_height, block_hash
         FROM (
-          SELECT network_id, block_height, block_hash, version
+          SELECT block_height, block_hash, version
           FROM ${input.processedBlocksTable}
           WHERE
-            network_id = {networkId:UInt64}
-            AND block_height <= {asOfBlockHeight:UInt64}
+            block_height <= {asOfBlockHeight:UInt64}
           ORDER BY block_height ASC, version DESC
           LIMIT 1 BY block_height
         )
       `,
-      query_params: { networkId: input.networkId, asOfBlockHeight: input.asOfBlockHeight },
+      query_params: { asOfBlockHeight: input.asOfBlockHeight },
       clickhouse_settings: materializationSettings,
     });
   }
 
-  public async getCurrentAddressSummary(networkId: PrimaryId, address: string) {
-    const summary = await this.getAddressSummary(networkId, address);
+  public async getCurrentAddressSummary(address: string) {
+    const summary = await this.getAddressSummary(address);
     if (!summary) {
       return null;
     }
@@ -1996,62 +1811,7 @@ export class ClickHouseWarehouseAdapter
     };
   }
 
-  public async getBalancesByAddresses(addresses: string[]) {
-    return this.queryRowsByAddressChunks<BalanceRow>(
-      addresses,
-      `
-        SELECT
-          network_id AS "networkId",
-          asset_address AS "assetAddress",
-          address,
-          balance,
-          as_of_block_height AS "asOfBlockHeight"
-        FROM balances_v2
-        WHERE address IN ({addresses:Array(String)})
-        ORDER BY network_id ASC, asset_address ASC, address ASC, version DESC
-        LIMIT 1 BY network_id, asset_address, address
-      `,
-    );
-  }
-
-  public async getTokensByAddresses() {
-    return [];
-  }
-
-  public async getDistinctLinksByAddresses(addresses: string[]) {
-    return this.queryRowsByAddressChunks<{
-      fromAddress: string;
-      networkId: PrimaryId;
-      toAddress: string;
-      transferCount: number;
-    }>(
-      addresses,
-      `
-        SELECT network_id AS "networkId", source_address AS "fromAddress", to_address AS "toAddress", hop_count AS "transferCount"
-        FROM source_links
-        WHERE to_address IN ({addresses:Array(String)})
-      `,
-    );
-  }
-
-  private async queryRowsByAddressChunks<T>(addresses: string[], query: string): Promise<T[]> {
-    if (addresses.length === 0) {
-      return [];
-    }
-
-    const rowChunks = await Promise.all(
-      chunkQueryValues(addresses).map((chunk) =>
-        this.queryRows<T>({
-          query,
-          query_params: { addresses: chunk },
-          format: 'JSONEachRow',
-        }),
-      ),
-    );
-    return rowChunks.flat();
-  }
-
-  public async listAppliedBlocks(networkId: PrimaryId, offset = 0, limit?: number) {
+  public async listAppliedBlocks(offset = 0, limit?: number) {
     const pagination = clickHousePagination(offset, limit);
     const rows = await this.queryRows<{
       blockHash: string;
@@ -2061,14 +1821,12 @@ export class ClickHouseWarehouseAdapter
           SELECT
             block_height AS "blockHeight",
             block_hash AS "blockHash"
-          FROM applied_blocks_v2
-          WHERE network_id = {networkId:UInt64}
+          FROM ${appliedBlocksTable}
           ORDER BY block_height DESC
           ${pagination.limitClause}
           ${pagination.offsetClause}
         `,
       query_params: {
-        networkId,
         ...pagination.queryParams,
       },
       format: 'JSONEachRow',
@@ -2077,7 +1835,7 @@ export class ClickHouseWarehouseAdapter
     return rows;
   }
 
-  public async getAppliedBlockByHash(networkId: PrimaryId, blockHash: string) {
+  public async getAppliedBlockByHash(blockHash: string) {
     const rows = await this.queryRows<{
       blockHash: string;
       blockHeight: number;
@@ -2086,18 +1844,18 @@ export class ClickHouseWarehouseAdapter
           SELECT
             block_height AS "blockHeight",
             block_hash AS "blockHash"
-          FROM applied_blocks_v2
-          WHERE network_id = {networkId:UInt64} AND block_hash = {blockHash:String}
+          FROM ${appliedBlocksTable}
+          WHERE block_hash = {blockHash:String}
           LIMIT 1
         `,
-      query_params: { networkId, blockHash },
+      query_params: { blockHash },
       format: 'JSONEachRow',
     });
 
     return rows[0] ?? null;
   }
 
-  public async getTransactionRef(networkId: PrimaryId, txid: string) {
+  public async getTransactionRef(txid: string) {
     const rows = await this.queryRows<{
       blockHash: string;
       blockHeight: number;
@@ -2110,19 +1868,19 @@ export class ClickHouseWarehouseAdapter
             block_hash AS "blockHash",
             block_time AS "blockTime",
             tx_index AS "txIndex"
-          FROM utxo_outputs_v2
-          WHERE network_id = {networkId:UInt64} AND txid = {txid:String}
+          FROM ${utxoCurrentStateTable}
+          WHERE txid = {txid:String}
           ORDER BY version DESC
           LIMIT 1
         `,
-      query_params: { networkId, txid },
+      query_params: { txid },
       format: 'JSONEachRow',
     });
 
-    return rows[0] ?? (await this.getCoreTransactionRef(networkId, txid));
+    return rows[0] ?? (await this.getCoreTransactionRef(txid));
   }
 
-  private async getCoreTransactionRef(networkId: PrimaryId, txid: string) {
+  private async getCoreTransactionRef(txid: string) {
     const prefix = `${txid}:`;
     const rows = await this.queryRows<{
       blockHash: string;
@@ -2138,15 +1896,13 @@ export class ClickHouseWarehouseAdapter
             tx_index AS "txIndex"
           FROM ${coreUtxoCreatesTable}
           WHERE
-            network_id = {networkId:UInt64}
-            AND output_key >= {prefix:String}
+            output_key >= {prefix:String}
             AND output_key < {prefixEnd:String}
           ORDER BY output_key ASC, version DESC
           LIMIT 1 BY output_key
           LIMIT 1
         `,
       query_params: {
-        networkId,
         prefix,
         prefixEnd: `${txid};`,
       },
@@ -2156,21 +1912,20 @@ export class ClickHouseWarehouseAdapter
     return rows[0] ?? null;
   }
 
-  public async getAddressSummary(networkId: PrimaryId, address: string) {
+  public async getAddressSummary(address: string) {
     const [movementFromTable, balance, utxoCount] = await Promise.all([
-      this.queryAddressMovementSummary(networkId, address),
-      this.queryNativeBalance(networkId, address),
-      this.querySpendableUtxoCount(networkId, address),
+      this.queryAddressMovementSummary(address),
+      this.queryNativeBalance(address),
+      this.querySpendableUtxoCount(address),
     ]);
     const movement = hasAddressMovementSummary(movementFromTable)
       ? movementFromTable
-      : await this.queryCoreAddressMovementSummary(networkId, address);
+      : await this.queryCoreAddressMovementSummary(address);
 
     return buildClickHouseAddressSummary(movement, balance, utxoCount);
   }
 
   private async queryAddressMovementSummary(
-    networkId: PrimaryId,
     address: string,
   ): Promise<AddressMovementSummaryRow | undefined> {
     const rows = await this.queryRows<AddressMovementSummaryRow>({
@@ -2180,9 +1935,9 @@ export class ClickHouseWarehouseAdapter
             CAST(sumIf(amount_base_i256, direction = 'debit') AS String) AS "sentBase",
             uniqExact(txid) AS "txCount"
           FROM ${addressMovementsByAddressTable}
-          WHERE network_id = {networkId:UInt64} AND address = {address:String} AND asset_address = ''
+          WHERE address = {address:String} AND asset_address = ''
         `,
-      query_params: { networkId, address },
+      query_params: { address },
       format: 'JSONEachRow',
     });
 
@@ -2190,7 +1945,6 @@ export class ClickHouseWarehouseAdapter
   }
 
   private async queryCoreAddressMovementSummary(
-    networkId: PrimaryId,
     address: string,
   ): Promise<AddressMovementSummaryRow | undefined> {
     const rows = await this.queryRows<AddressMovementSummaryRow>({
@@ -2202,8 +1956,7 @@ export class ClickHouseWarehouseAdapter
               value_base
             FROM ${coreUtxoCreatesTable}
             WHERE
-              network_id = {networkId:UInt64}
-              AND address = {address:String}
+              address = {address:String}
               AND is_spendable = 1
             ORDER BY output_key ASC, version DESC
             LIMIT 1 BY output_key
@@ -2230,31 +1983,30 @@ export class ClickHouseWarehouseAdapter
                 spent_by_txid
               FROM ${coreUtxoSpendsTable}
               WHERE
-                network_id = {networkId:UInt64}
-                AND spent_output_key IN (SELECT output_key FROM address_outputs)
+                spent_output_key IN (SELECT output_key FROM address_outputs)
               ORDER BY spent_output_key ASC, version DESC
               LIMIT 1 BY spent_output_key
             ) AS s
             ON c.output_key = s.spent_output_key
           )
         `,
-      query_params: { networkId, address },
+      query_params: { address },
       format: 'JSONEachRow',
     });
 
     return rows[0];
   }
 
-  private async queryNativeBalance(networkId: PrimaryId, address: string): Promise<string> {
+  private async queryNativeBalance(address: string): Promise<string> {
     const rows = await this.queryRows<{ balance: string }>({
       query: `
           SELECT balance
-          FROM balances_v2
-          WHERE network_id = {networkId:UInt64} AND address = {address:String} AND asset_address = ''
+          FROM ${balancesTable}
+          WHERE address = {address:String} AND asset_address = ''
           ORDER BY version DESC
           LIMIT 1
         `,
-      query_params: { networkId, address },
+      query_params: { address },
       format: 'JSONEachRow',
     });
 
@@ -2262,7 +2014,7 @@ export class ClickHouseWarehouseAdapter
     return first ? first.balance : '0';
   }
 
-  private async querySpendableUtxoCount(networkId: PrimaryId, address: string): Promise<number> {
+  private async querySpendableUtxoCount(address: string): Promise<number> {
     const rows = await this.queryRows<{ utxoCount: number }>({
       query: `
           SELECT count() AS "utxoCount"
@@ -2272,13 +2024,13 @@ export class ClickHouseWarehouseAdapter
               is_spendable,
               spent_by_txid
             FROM ${utxoCurrentStateByAddressTable}
-            WHERE network_id = {networkId:UInt64} AND address = {address:String}
+            WHERE address = {address:String}
             ORDER BY output_key ASC, version DESC
             LIMIT 1 BY output_key
           )
           WHERE is_spendable = 1 AND spent_by_txid IS NULL
         `,
-      query_params: { networkId, address },
+      query_params: { address },
       format: 'JSONEachRow',
     });
 
@@ -2286,12 +2038,7 @@ export class ClickHouseWarehouseAdapter
     return first ? first.utxoCount : 0;
   }
 
-  public async listAddressTransactions(
-    networkId: PrimaryId,
-    address: string,
-    offset = 0,
-    limit?: number,
-  ) {
+  public async listAddressTransactions(address: string, offset = 0, limit?: number) {
     const pagination = clickHousePagination(offset, limit);
     const rows = await this.queryRows<{
       blockHash: string;
@@ -2312,31 +2059,23 @@ export class ClickHouseWarehouseAdapter
             CAST(sumIf(amount_base_i256, direction = 'credit') AS String) AS "receivedBase",
             CAST(sumIf(amount_base_i256, direction = 'debit') AS String) AS "sentBase"
           FROM ${addressMovementsByAddressTable}
-          WHERE network_id = {networkId:UInt64} AND address = {address:String} AND asset_address = ''
+          WHERE address = {address:String} AND asset_address = ''
           GROUP BY block_height, block_hash, block_time, txid, tx_index
           ORDER BY block_height DESC, tx_index DESC, txid DESC
           ${pagination.limitClause}
           ${pagination.offsetClause}
         `,
       query_params: {
-        networkId,
         address,
         ...pagination.queryParams,
       },
       format: 'JSONEachRow',
     });
 
-    return rows.length > 0
-      ? rows
-      : await this.listCoreAddressTransactions(networkId, address, offset, limit);
+    return rows.length > 0 ? rows : await this.listCoreAddressTransactions(address, offset, limit);
   }
 
-  private async listCoreAddressTransactions(
-    networkId: PrimaryId,
-    address: string,
-    offset = 0,
-    limit?: number,
-  ) {
+  private async listCoreAddressTransactions(address: string, offset = 0, limit?: number) {
     const pagination = clickHousePagination(offset, limit);
     return await this.queryRows<{
       blockHash: string;
@@ -2360,8 +2099,7 @@ export class ClickHouseWarehouseAdapter
               value_base
             FROM ${coreUtxoCreatesTable}
             WHERE
-              network_id = {networkId:UInt64}
-              AND address = {address:String}
+              address = {address:String}
               AND is_spendable = 1
             ORDER BY output_key ASC, version DESC
             LIMIT 1 BY output_key
@@ -2373,8 +2111,7 @@ export class ClickHouseWarehouseAdapter
               spent_in_block
             FROM ${coreUtxoSpendsTable}
             WHERE
-              network_id = {networkId:UInt64}
-              AND spent_output_key IN (SELECT output_key FROM address_outputs)
+              spent_output_key IN (SELECT output_key FROM address_outputs)
             ORDER BY spent_output_key ASC, version DESC
             LIMIT 1 BY spent_output_key
           ),
@@ -2385,8 +2122,7 @@ export class ClickHouseWarehouseAdapter
               block_time
             FROM ${coreProcessedBlocksTable}
             WHERE
-              network_id = {networkId:UInt64}
-              AND block_height IN (SELECT spent_in_block FROM address_spends)
+              block_height IN (SELECT spent_in_block FROM address_spends)
             ORDER BY block_height ASC, version DESC
             LIMIT 1 BY block_height
           )
@@ -2429,7 +2165,6 @@ export class ClickHouseWarehouseAdapter
           ${pagination.offsetClause}
         `,
       query_params: {
-        networkId,
         address,
         ...pagination.queryParams,
       },
@@ -2437,7 +2172,7 @@ export class ClickHouseWarehouseAdapter
     });
   }
 
-  public async listAddressUtxos(networkId: PrimaryId, address: string, offset = 0, limit?: number) {
+  public async listAddressUtxos(address: string, offset = 0, limit?: number) {
     const pagination = clickHousePagination(offset, limit);
     const pageRows = await this.queryRows<{
       blockHeight: number;
@@ -2462,7 +2197,7 @@ export class ClickHouseWarehouseAdapter
               is_spendable,
               spent_by_txid
             FROM ${utxoCurrentStateByAddressTable}
-            WHERE network_id = {networkId:UInt64} AND address = {address:String}
+            WHERE address = {address:String}
             ORDER BY output_key ASC, version DESC
             LIMIT 1 BY output_key
           )
@@ -2472,7 +2207,6 @@ export class ClickHouseWarehouseAdapter
           ${pagination.offsetClause}
         `,
       query_params: {
-        networkId,
         address,
         ...pagination.queryParams,
       },
@@ -2483,36 +2217,26 @@ export class ClickHouseWarehouseAdapter
       return [];
     }
 
-    const outputsByKey = await this.getUtxoOutputs(
-      networkId,
-      pageRows.map((row) => row.outputKey),
-    );
+    const outputsByKey = await this.getUtxoOutputs(pageRows.map((row) => row.outputKey));
 
     return pageRows.flatMap((row) => spendableOutputByKey(outputsByKey, row.outputKey));
   }
 
-  public async getUtxoOutput(
-    networkId: PrimaryId,
-    outputKey: string,
-  ): Promise<ProjectionUtxoOutput | null> {
-    return (await this.getUtxoOutputs(networkId, [outputKey])).get(outputKey) ?? null;
+  public async getUtxoOutput(outputKey: string): Promise<ProjectionUtxoOutput | null> {
+    return (await this.getUtxoOutputs([outputKey])).get(outputKey) ?? null;
   }
 
-  public async getUtxoOutputs(
-    networkId: PrimaryId,
-    outputKeys: string[],
-  ): Promise<Map<string, ProjectionUtxoOutput>> {
+  public async getUtxoOutputs(outputKeys: string[]): Promise<Map<string, ProjectionUtxoOutput>> {
     if (outputKeys.length === 0) {
       return new Map();
     }
 
-    const currentOutputs = await this.getCurrentUtxoOutputMap(networkId, outputKeys);
-    await this.addMissingUtxoOutputs(networkId, outputKeys, currentOutputs);
+    const currentOutputs = await this.getCurrentUtxoOutputMap(outputKeys);
+    await this.addMissingUtxoOutputs(outputKeys, currentOutputs);
     return currentOutputs;
   }
 
   private async addMissingUtxoOutputs(
-    networkId: PrimaryId,
     outputKeys: string[],
     currentOutputs: Map<string, ProjectionUtxoOutput>,
   ): Promise<void> {
@@ -2521,12 +2245,11 @@ export class ClickHouseWarehouseAdapter
       return;
     }
 
-    await this.addFallbackUtxoOutputs(networkId, missingOutputKeys, currentOutputs);
-    await this.addHistoricalUtxoOutputsIfMissing(networkId, outputKeys, currentOutputs);
+    await this.addFallbackUtxoOutputs(missingOutputKeys, currentOutputs);
+    await this.addHistoricalUtxoOutputsIfMissing(outputKeys, currentOutputs);
   }
 
   private async addHistoricalUtxoOutputsIfMissing(
-    networkId: PrimaryId,
     outputKeys: string[],
     currentOutputs: Map<string, ProjectionUtxoOutput>,
   ): Promise<void> {
@@ -2535,17 +2258,15 @@ export class ClickHouseWarehouseAdapter
       return;
     }
 
-    await this.addCoreHistoricalUtxoOutputs(networkId, stillMissingOutputKeys, currentOutputs);
+    await this.addCoreHistoricalUtxoOutputs(stillMissingOutputKeys, currentOutputs);
   }
 
   private async getCurrentUtxoOutputMap(
-    networkId: PrimaryId,
     outputKeys: string[],
     requestContext?: ClickHouseRequestContext,
   ): Promise<Map<string, ProjectionUtxoOutput>> {
     const currentRows = await this.queryUtxoOutputsFromTable(
       utxoCurrentStateTable,
-      networkId,
       outputKeys,
       requestContext,
     );
@@ -2553,13 +2274,11 @@ export class ClickHouseWarehouseAdapter
   }
 
   private async addFallbackUtxoOutputs(
-    networkId: PrimaryId,
     missingOutputKeys: string[],
     currentOutputs: Map<string, ProjectionUtxoOutput>,
   ): Promise<void> {
     const fallbackRows = await this.queryUtxoOutputsFromTable(
-      'utxo_outputs_v2',
-      networkId,
+      utxoCurrentStateTable,
       missingOutputKeys,
     );
     await this.insertFallbackUtxoOutputsIfPresent(fallbackRows, currentOutputs);
@@ -2590,7 +2309,6 @@ export class ClickHouseWarehouseAdapter
   }
 
   private async addCoreHistoricalUtxoOutputs(
-    networkId: PrimaryId,
     missingOutputKeys: string[],
     currentOutputs: Map<string, ProjectionUtxoOutput>,
   ): Promise<void> {
@@ -2604,7 +2322,6 @@ export class ClickHouseWarehouseAdapter
         this.queryRows<ProjectionUtxoOutput>({
           query: `
               SELECT
-                c.network_id AS "networkId",
                 c.block_height AS "blockHeight",
                 c.block_hash AS "blockHash",
                 c.block_time AS "blockTime",
@@ -2622,7 +2339,6 @@ export class ClickHouseWarehouseAdapter
                 s.spent_input_index AS "spentInputIndex"
               FROM (
                 SELECT
-                  network_id,
                   block_height,
                   block_hash,
                   block_time,
@@ -2637,8 +2353,7 @@ export class ClickHouseWarehouseAdapter
                   is_spendable
                 FROM ${coreUtxoCreatesTable}
                 WHERE
-                  network_id = {networkId:UInt64}
-                  AND output_key IN ({outputKeys:Array(String)})
+                  output_key IN ({outputKeys:Array(String)})
                 ORDER BY output_key ASC, version DESC
                 LIMIT 1 BY output_key
               ) AS c
@@ -2650,14 +2365,13 @@ export class ClickHouseWarehouseAdapter
                   spent_input_index
                 FROM ${coreUtxoSpendsTable}
                 WHERE
-                  network_id = {networkId:UInt64}
-                  AND spent_output_key IN ({outputKeys:Array(String)})
+                  spent_output_key IN ({outputKeys:Array(String)})
                 ORDER BY spent_output_key ASC, version DESC
                 LIMIT 1 BY spent_output_key
               ) AS s
               ON c.output_key = s.spent_output_key
             `,
-          query_params: { networkId, outputKeys: chunk },
+          query_params: { outputKeys: chunk },
           format: 'JSONEachRow',
         }),
     );
@@ -2667,22 +2381,17 @@ export class ClickHouseWarehouseAdapter
     }
   }
 
-  public async hasAppliedBlock(
-    networkId: PrimaryId,
-    blockHeight: number,
-    blockHash: string,
-  ): Promise<boolean> {
+  public async hasAppliedBlock(blockHeight: number, blockHash: string): Promise<boolean> {
     const rows = await this.queryRows<Record<string, unknown>>({
       query: `
           SELECT 1
-          FROM applied_blocks_v2
+          FROM ${appliedBlocksTable}
           WHERE
-            network_id = {networkId:UInt64}
-            AND block_height = {blockHeight:UInt64}
+            block_height = {blockHeight:UInt64}
             AND block_hash = {blockHash:String}
           LIMIT 1
         `,
-      query_params: { networkId, blockHeight, blockHash },
+      query_params: { blockHeight, blockHash },
       format: 'JSONEachRow',
     });
 
@@ -2690,7 +2399,6 @@ export class ClickHouseWarehouseAdapter
   }
 
   public async listAppliedBlockSet(
-    networkId: PrimaryId,
     blocks: Array<{
       blockHash: string;
       blockHeight: number;
@@ -2704,106 +2412,43 @@ export class ClickHouseWarehouseAdapter
     const rows = await this.queryRows<{
       blockHash: string;
       blockHeight: number;
-      networkId: PrimaryId;
     }>({
       query: `
           SELECT
-            network_id AS "networkId",
             block_height AS "blockHeight",
             block_hash AS "blockHash"
-          FROM applied_blocks_v2
-          WHERE network_id = {networkId:UInt64} AND block_height IN ({heights:Array(UInt64)})
+          FROM ${appliedBlocksTable}
+          WHERE block_height IN ({heights:Array(UInt64)})
         `,
-      query_params: { networkId, heights },
+      query_params: { heights },
       format: 'JSONEachRow',
     });
 
     const requested = new Set(
-      blocks.map((block) => projectionBlockIdentity(networkId, block.blockHeight, block.blockHash)),
+      blocks.map((block) => projectionBlockIdentity(block.blockHeight, block.blockHash)),
     );
     return new Set(
       rows
-        .map((row) => projectionBlockIdentity(row.networkId, row.blockHeight, row.blockHash))
+        .map((row) => projectionBlockIdentity(row.blockHeight, row.blockHash))
         .filter((identity) => requested.has(identity)),
     );
   }
 
-  public async getAppliedBlockTail(networkId: PrimaryId): Promise<number | null> {
+  public async getAppliedBlockTail(): Promise<number | null> {
     const rows = await this.queryRows<{ blockHeight: number | null }>({
       query: `
           SELECT max(block_height) AS "blockHeight"
-          FROM applied_blocks_v2
-          WHERE network_id = {networkId:UInt64}
+          FROM ${appliedBlocksTable}
         `,
-      query_params: { networkId },
       format: 'JSONEachRow',
     });
 
     return appliedBlockTail(rows);
   }
 
-  public async listDirectLinksFromAddresses(networkId: PrimaryId, fromAddresses: string[]) {
-    if (fromAddresses.length === 0) {
-      return [];
-    }
-
-    const rowChunks: DirectLinkRecord[][] = await Promise.all(
-      chunkQueryValues(fromAddresses).map((chunk) =>
-        this.queryRows<DirectLinkRecord>({
-          query: `
-              SELECT
-                {networkId:UInt64} AS "networkId",
-                from_address AS "fromAddress",
-                to_address AS "toAddress",
-                asset_address AS "assetAddress",
-                transfer_count AS "transferCount",
-                total_amount_base AS "totalAmountBase",
-                first_seen_block_height AS "firstSeenBlockHeight",
-                last_seen_block_height AS "lastSeenBlockHeight"
-              FROM direct_links_v2
-              WHERE network_id = {networkId:UInt64} AND from_address IN ({fromAddresses:Array(String)})
-              ORDER BY from_address ASC, to_address ASC, asset_address ASC, version DESC
-              LIMIT 1 BY network_id, from_address, to_address, asset_address
-            `,
-          query_params: { networkId, fromAddresses: chunk },
-          format: 'JSONEachRow',
-        }),
-      ),
-    );
-    const rows = rowChunks.flat();
-
-    return rows;
-  }
-
-  public async listSourceSeedIdsReachingAddresses(
-    networkId: PrimaryId,
-    addresses: string[],
-  ): Promise<PrimaryId[]> {
-    if (addresses.length === 0) {
-      return [];
-    }
-
-    const rowChunks: Array<Array<{ sourceAddressId: PrimaryId }>> = await Promise.all(
-      chunkQueryValues(addresses).map((chunk) =>
-        this.queryRows<{ sourceAddressId: PrimaryId }>({
-          query: `
-              SELECT DISTINCT source_address_id AS "sourceAddressId"
-              FROM source_links
-              WHERE network_id = {networkId:UInt64} AND to_address IN ({addresses:Array(String)})
-            `,
-          query_params: { networkId, addresses: chunk },
-          format: 'JSONEachRow',
-        }),
-      ),
-    );
-    const rows = rowChunks.flat();
-
-    return [...new Set(rows.map((row) => row.sourceAddressId))];
-  }
-
   public async applyProjectionWindow(batches: BlockProjectionBatch[]): Promise<void> {
-    const window = await resolvePendingProjectionWindow(batches, (networkId, blocks) =>
-      this.listAppliedBlockSet(networkId, blocks),
+    const window = await resolvePendingProjectionWindow(batches, (blocks) =>
+      this.listAppliedBlockSet(blocks),
     );
     if (window === null) {
       return;
@@ -2813,7 +2458,6 @@ export class ClickHouseWarehouseAdapter
   }
 
   private async applyPendingProjectionWindow(window: {
-    networkId: PrimaryId;
     pendingBatches: BlockProjectionBatch[];
   }): Promise<void> {
     const windowEnd = pendingProjectionWindowEnd(window.pendingBatches);
@@ -2822,50 +2466,21 @@ export class ClickHouseWarehouseAdapter
       VersionedBalanceRow
     >({
       batches: window.pendingBatches,
-      keyForMovement: (movement) =>
-        balanceKey(movement.networkId, movement.address, movement.assetAddress),
-      loadBalances: (keys) => this.getBalanceRowsByKeys(window.networkId, keys),
-      loadOutputs: (networkId, outputKeys) => this.getUtxoOutputs(networkId, outputKeys),
-      networkId: window.networkId,
-      toSnapshotKey: (key) => balanceKey(window.networkId, key.address, key.assetAddress),
+      keyForMovement: (movement) => balanceKey(movement.address, movement.assetAddress),
+      loadBalances: (keys) => this.getBalanceRowsByKeys(keys),
+      loadOutputs: (outputKeys) => this.getUtxoOutputs(outputKeys),
+      toSnapshotKey: (key) => balanceKey(key.address, key.assetAddress),
       toStoredSnapshot: (snapshot) => ({
         ...snapshot,
         version: windowEnd,
       }),
     });
 
-    const directLinkKeys = collectProjectionDirectLinkSnapshotKeys(window.pendingBatches)
-      .map(parseProjectionDirectLinkSnapshotKey)
-      .map((key) =>
-        directLinkKey(window.networkId, key.fromAddress, key.toAddress, key.assetAddress),
-      );
-    const currentDirectLinks = await this.getDirectLinkRowsByKeys(window.networkId, directLinkKeys);
-    const nextDirectLinks = new Map<string, VersionedDirectLinkRow>();
-    applyDirectLinkDeltasToSnapshots({
-      currentDirectLinks,
-      directLinkDeltas: window.pendingBatches.flatMap((batch) => batch.directLinkDeltas),
-      keyForDelta: (delta) =>
-        directLinkKey(delta.networkId, delta.fromAddress, delta.toAddress, delta.assetAddress),
-      nextDirectLinks,
-      toStoredRecord: (record) => ({
-        ...record,
-        version: windowEnd,
-      }),
-    });
-
     await this.insertRows(
-      'address_movements_v2',
+      addressMovementsTable,
       window.pendingBatches.flatMap((batch) =>
         batch.addressMovements.map(toAddressMovementInsertRow),
       ),
-    );
-    await this.insertRows(
-      'transfers_v2',
-      window.pendingBatches.flatMap((batch) => batch.transfers.map(toTransferInsertRow)),
-    );
-    await this.insertRows(
-      'utxo_outputs_v2',
-      [...nextOutputs.values()].map((row) => toUtxoInsertRow(row, windowEnd)),
     );
     await this.insertRows(
       utxoCurrentStateTable,
@@ -2876,8 +2491,8 @@ export class ClickHouseWarehouseAdapter
       [...nextBalances.values()].map((row) => toBalanceInsertRow(row, row.version)),
     );
     await this.insertRows(
-      'direct_links_v2',
-      [...nextDirectLinks.values()].map((row) => toDirectLinkInsertRow(row, row.version)),
+      analyticsBalancesCurrentTable,
+      [...nextBalances.values()].map((row) => toAnalyticsBalanceCurrentInsertRow(row, row.version)),
     );
     await this.insertRows(
       appliedBlocksTable,
@@ -2887,13 +2502,8 @@ export class ClickHouseWarehouseAdapter
 
   public async applyProjectionFacts(window: ProjectionFactWindow): Promise<void> {
     await this.insertRows(
-      'address_movements_v2',
+      addressMovementsTable,
       window.addressMovements.map(toAddressMovementInsertRow),
-    );
-    await this.insertRows('transfers_v2', window.transfers.map(toTransferInsertRow));
-    await this.insertRows(
-      'utxo_outputs_v2',
-      window.utxoOutputs.map((row) => toUtxoInsertRow(row, row.spentInBlock ?? row.blockHeight)),
     );
     await this.insertRows(
       utxoCurrentStateTable,
@@ -2904,8 +2514,8 @@ export class ClickHouseWarehouseAdapter
       window.balances.map((row) => toBalanceInsertRow(row, row.asOfBlockHeight)),
     );
     await this.insertRows(
-      'direct_links_v2',
-      window.directLinks.map((row) => toDirectLinkInsertRow(row, row.lastSeenBlockHeight)),
+      analyticsBalancesCurrentTable,
+      window.balances.map((row) => toAnalyticsBalanceCurrentInsertRow(row, row.asOfBlockHeight)),
     );
     await this.insertRows(appliedBlocksTable, window.appliedBlocks.map(toAppliedBlockInsertRow));
   }
@@ -2914,42 +2524,11 @@ export class ClickHouseWarehouseAdapter
     await this.applyProjectionWindow([batch]);
   }
 
-  public async replaceSourceLinks(
-    networkId: PrimaryId,
-    sourceAddressId: PrimaryId,
-    rows: SourceLinkRecord[],
-  ): Promise<void> {
-    await this.executeCommand({
-      query: `
-        ALTER TABLE source_links
-        DELETE WHERE network_id = {networkId:UInt64} AND source_address_id = {sourceAddressId:UInt64}
-      `,
-      query_params: { networkId, sourceAddressId },
-    });
-    await this.insertRows(
-      'source_links',
-      rows.map((row) => ({
-        network_id: row.networkId,
-        source_address_id: row.sourceAddressId,
-        source_address: row.sourceAddress,
-        to_address: row.toAddress,
-        hop_count: row.hopCount,
-        path_transfer_count: row.pathTransferCount,
-        path_addresses: row.pathAddresses,
-        first_seen_block_height: row.firstSeenBlockHeight,
-        last_seen_block_height: row.lastSeenBlockHeight,
-      })),
-    );
-  }
-
-  public async exportProjectionStateSnapshot(
-    networkId: PrimaryId,
-  ): Promise<ProjectionStateBootstrapSnapshot> {
-    const [utxoOutputs, balances, directLinks, sourceLinks] = await Promise.all([
+  public async exportProjectionStateSnapshot(): Promise<ProjectionStateBootstrapSnapshot> {
+    const [utxoOutputs, balances] = await Promise.all([
       this.queryRows<ProjectionUtxoOutput>({
         query: `
             SELECT
-              network_id AS "networkId",
               block_height AS "blockHeight",
               block_hash AS "blockHash",
               block_time AS "blockTime",
@@ -2966,64 +2545,22 @@ export class ClickHouseWarehouseAdapter
               spent_in_block AS "spentInBlock",
               spent_input_index AS "spentInputIndex"
             FROM ${utxoCurrentStateTable}
-            WHERE network_id = {networkId:UInt64}
             ORDER BY output_key ASC, version DESC
             LIMIT 1 BY output_key
           `,
-        query_params: { networkId },
         format: 'JSONEachRow',
       }),
       this.queryRows<ProjectionBalanceSnapshot>({
         query: `
             SELECT
-              network_id AS "networkId",
               address,
               asset_address AS "assetAddress",
               balance,
               as_of_block_height AS "asOfBlockHeight"
-            FROM balances_v2
-            WHERE network_id = {networkId:UInt64}
+            FROM ${balancesTable}
             ORDER BY address ASC, asset_address ASC, version DESC
-            LIMIT 1 BY network_id, address, asset_address
+            LIMIT 1 BY address, asset_address
           `,
-        query_params: { networkId },
-        format: 'JSONEachRow',
-      }),
-      this.queryRows<DirectLinkRecord>({
-        query: `
-            SELECT
-              network_id AS "networkId",
-              from_address AS "fromAddress",
-              to_address AS "toAddress",
-              asset_address AS "assetAddress",
-              transfer_count AS "transferCount",
-              total_amount_base AS "totalAmountBase",
-              first_seen_block_height AS "firstSeenBlockHeight",
-              last_seen_block_height AS "lastSeenBlockHeight"
-            FROM direct_links_v2
-            WHERE network_id = {networkId:UInt64}
-            ORDER BY from_address ASC, to_address ASC, asset_address ASC, version DESC
-            LIMIT 1 BY network_id, from_address, to_address, asset_address
-          `,
-        query_params: { networkId },
-        format: 'JSONEachRow',
-      }),
-      this.queryRows<SourceLinkRecord>({
-        query: `
-            SELECT
-              network_id AS "networkId",
-              source_address_id AS "sourceAddressId",
-              source_address AS "sourceAddress",
-              to_address AS "toAddress",
-              hop_count AS "hopCount",
-              path_transfer_count AS "pathTransferCount",
-              path_addresses AS "pathAddresses",
-              first_seen_block_height AS "firstSeenBlockHeight",
-              last_seen_block_height AS "lastSeenBlockHeight"
-            FROM source_links
-            WHERE network_id = {networkId:UInt64}
-          `,
-        query_params: { networkId },
         format: 'JSONEachRow',
       }),
     ]);
@@ -3032,31 +2569,19 @@ export class ClickHouseWarehouseAdapter
       appliedBlocks: [],
       utxoOutputs,
       balances,
-      directLinks,
-      sourceLinks: sourceLinks.map((row) => ({
-        ...row,
-        pathAddresses: Array.isArray(row.pathAddresses) ? row.pathAddresses : [],
-      })),
     };
   }
 
   public async listCurrentUtxoOutputsPage(
-    networkId: PrimaryId,
     cursorOutputKey: string | null,
     limit: number,
     context?: ProjectionPageRequestContext,
   ): Promise<ProjectionCurrentUtxoPage> {
-    const rows = await this.queryCurrentUtxoOutputPageRows(
-      networkId,
-      cursorOutputKey,
-      limit,
-      context,
-    );
+    const rows = await this.queryCurrentUtxoOutputPageRows(cursorOutputKey, limit, context);
     return toCurrentUtxoPage(rows, limit);
   }
 
   private async queryCurrentUtxoOutputPageRows(
-    networkId: PrimaryId,
     cursorOutputKey: string | null,
     limit: number,
     context?: ProjectionPageRequestContext,
@@ -3066,7 +2591,6 @@ export class ClickHouseWarehouseAdapter
       {
         query: `
           SELECT
-            {networkId:UInt64} AS "networkId",
             block_height AS "blockHeight",
             block_hash AS "blockHash",
             block_time AS "blockTime",
@@ -3102,7 +2626,7 @@ export class ClickHouseWarehouseAdapter
               version
             FROM ${utxoCurrentStateTable}
             WHERE
-              network_id = {networkId:UInt64}
+              1 = 1
               ${clickHouseOutputKeyCursorClause(cursorOutputKey)}
             ORDER BY output_key ASC, version DESC
             LIMIT 1 BY output_key
@@ -3110,7 +2634,7 @@ export class ClickHouseWarehouseAdapter
           ORDER BY output_key ASC
           LIMIT {limit:UInt64}
         `,
-        query_params: clickHouseOutputPageParams(networkId, cursorOutputKey, limit),
+        query_params: clickHouseOutputPageParams(cursorOutputKey, limit),
         format: 'JSONEachRow',
         clickhouse_settings: {
           max_execution_time: toClickHouseMaxExecutionTimeSeconds(timeoutMs),
@@ -3121,7 +2645,6 @@ export class ClickHouseWarehouseAdapter
   }
 
   public async listCurrentBalancesPage(
-    networkId: PrimaryId,
     cursor: ProjectionBalanceCursor | null,
     limit: number,
     context?: ProjectionPageRequestContext,
@@ -3131,30 +2654,28 @@ export class ClickHouseWarehouseAdapter
       {
         query: `
           SELECT
-            network_id AS "networkId",
             address,
             asset_address AS "assetAddress",
             balance,
             as_of_block_height AS "asOfBlockHeight"
           FROM (
             SELECT
-              network_id,
               address,
               asset_address,
               balance,
               as_of_block_height,
               version
-            FROM balances_v2
+            FROM ${balancesTable}
             WHERE
-              network_id = {networkId:UInt64}
+              1 = 1
               ${clickHouseBalanceCursorClause(cursor)}
             ORDER BY address ASC, asset_address ASC, version DESC
-            LIMIT 1 BY network_id, address, asset_address
+            LIMIT 1 BY address, asset_address
           )
           ORDER BY address ASC, asset_address ASC
           LIMIT {limit:UInt64}
         `,
-        query_params: clickHouseBalancePageParams(networkId, cursor, limit),
+        query_params: clickHouseBalancePageParams(cursor, limit),
         format: 'JSONEachRow',
         clickhouse_settings: {
           max_execution_time: toClickHouseMaxExecutionTimeSeconds(timeoutMs),
@@ -3167,7 +2688,6 @@ export class ClickHouseWarehouseAdapter
   }
 
   private async getBalanceRowsByKeys(
-    networkId: PrimaryId,
     keys: string[],
     requestContext?: ClickHouseRequestContext,
   ): Promise<Map<string, VersionedBalanceRow>> {
@@ -3191,19 +2711,16 @@ export class ClickHouseWarehouseAdapter
           {
             query: `
               SELECT
-                network_id AS "networkId",
                 address,
                 asset_address AS "assetAddress",
                 balance,
                 as_of_block_height AS "asOfBlockHeight",
                 version
-              FROM balances_v2
-              WHERE network_id = {networkId:UInt64}
-                AND (address, asset_address) IN ${formatBalanceTupleList(chunk)}
+              FROM ${balancesTable}
+              WHERE (address, asset_address) IN ${formatBalanceTupleList(chunk)}
               ORDER BY address ASC, asset_address ASC, version DESC
-              LIMIT 1 BY network_id, address, asset_address
+              LIMIT 1 BY address, asset_address
           `,
-            query_params: { networkId },
             format: 'JSONEachRow',
           },
           requestContext,
@@ -3214,9 +2731,8 @@ export class ClickHouseWarehouseAdapter
 
     return new Map(
       rows.map((row) => [
-        balanceKey(row.networkId, row.address, row.assetAddress),
+        balanceKey(row.address, row.assetAddress),
         {
-          networkId: row.networkId,
           address: row.address,
           assetAddress: row.assetAddress,
           balance: row.balance,
@@ -3227,83 +2743,16 @@ export class ClickHouseWarehouseAdapter
     );
   }
 
-  private async getDirectLinkRowsByKeys(
-    networkId: PrimaryId,
-    keys: string[],
-  ): Promise<Map<string, VersionedDirectLinkRow>> {
-    if (keys.length === 0) {
-      return new Map();
-    }
-
-    const rowChunks: Array<
-      Array<
-        DirectLinkRecord & {
-          version: number;
-        }
-      >
-    > = await Promise.all(
-      chunkQueryValues(keys).map((chunk) =>
-        this.queryRows<
-          DirectLinkRecord & {
-            version: number;
-          }
-        >({
-          query: `
-              SELECT
-                network_id AS "networkId",
-                from_address AS "fromAddress",
-                to_address AS "toAddress",
-                asset_address AS "assetAddress",
-                transfer_count AS "transferCount",
-                total_amount_base AS "totalAmountBase",
-                first_seen_block_height AS "firstSeenBlockHeight",
-                last_seen_block_height AS "lastSeenBlockHeight",
-                version
-              FROM direct_links_v2
-              WHERE network_id = {networkId:UInt64}
-                AND (from_address, to_address, asset_address) IN ${formatDirectLinkTupleList(chunk)}
-              ORDER BY from_address ASC, to_address ASC, asset_address ASC, version DESC
-              LIMIT 1 BY network_id, from_address, to_address, asset_address
-            `,
-          query_params: { networkId },
-          format: 'JSONEachRow',
-        }),
-      ),
-    );
-    const rows = rowChunks.flat();
-
-    return new Map(
-      rows.map((row) => [
-        directLinkKey(row.networkId, row.fromAddress, row.toAddress, row.assetAddress),
-        {
-          networkId: row.networkId,
-          fromAddress: row.fromAddress,
-          toAddress: row.toAddress,
-          assetAddress: row.assetAddress,
-          transferCount: row.transferCount,
-          totalAmountBase: row.totalAmountBase,
-          firstSeenBlockHeight: row.firstSeenBlockHeight,
-          lastSeenBlockHeight: row.lastSeenBlockHeight,
-          version: row.version,
-        },
-      ]),
-    );
-  }
-
-  private assertCoreWindowShape(
-    networkId: PrimaryId,
-    applications: CoreDogecoinBlockApplication[],
-  ): void {
+  private assertCoreWindowShape(applications: CoreDogecoinBlockApplication[]): void {
     const state = createCoreWindowShapeState();
 
     for (const application of applications) {
-      assertCoreApplicationShape(networkId, application, state);
+      assertCoreApplicationShape(application, state);
       rememberCoreApplicationShape(application, state);
     }
   }
 
   private async assertCoreWindowPreviousBlock(
-    networkId: PrimaryId,
     firstApplication: CoreDogecoinBlockApplication | undefined,
     requestContext?: ClickHouseRequestContext,
   ): Promise<void> {
@@ -3319,12 +2768,11 @@ export class ClickHouseWarehouseAdapter
             block_height AS "blockHeight",
             block_hash AS "blockHash"
           FROM ${coreProcessedBlocksTable}
-          WHERE network_id = {networkId:UInt64} AND block_height = {blockHeight:UInt64}
+          WHERE block_height = {blockHeight:UInt64}
           ORDER BY version DESC
           LIMIT 1
         `,
         query_params: {
-          networkId,
           blockHeight: previousHeight,
         },
         format: 'JSONEachRow',
@@ -3336,7 +2784,6 @@ export class ClickHouseWarehouseAdapter
   }
 
   private async assertCoreWindowPrevouts(
-    networkId: PrimaryId,
     applications: CoreDogecoinBlockApplication[],
     requestContext?: ClickHouseRequestContext,
   ): Promise<void> {
@@ -3346,15 +2793,14 @@ export class ClickHouseWarehouseAdapter
     }
 
     const [created, spent] = await Promise.all([
-      this.getCoreUtxoCreateRows(networkId, externalSpendKeys, requestContext),
-      this.getCoreUtxoSpendRows(networkId, externalSpendKeys, requestContext),
+      this.getCoreUtxoCreateRows(externalSpendKeys, requestContext),
+      this.getCoreUtxoSpendRows(externalSpendKeys, requestContext),
     ]);
     assertCorePrevoutsExist(externalSpendKeys, created);
     assertCorePrevoutsUnspent(externalSpendKeys, spent, coreSpendsInWindow(applications));
   }
 
   private async getCoreProcessedBlocks(
-    networkId: PrimaryId,
     blockHeights: number[],
     requestContext?: ClickHouseRequestContext,
   ): Promise<Map<number, CoreProcessedBlockRow>> {
@@ -3371,11 +2817,11 @@ export class ClickHouseWarehouseAdapter
               block_height AS "blockHeight",
               block_hash AS "blockHash"
             FROM ${coreProcessedBlocksTable}
-            WHERE network_id = {networkId:UInt64} AND block_height IN ({blockHeights:Array(UInt64)})
+            WHERE block_height IN ({blockHeights:Array(UInt64)})
             ORDER BY block_height ASC, version DESC
             LIMIT 1 BY block_height
           `,
-            query_params: { networkId, blockHeights: chunk },
+            query_params: { blockHeights: chunk },
             format: 'JSONEachRow',
           },
           requestContext,
@@ -3387,7 +2833,6 @@ export class ClickHouseWarehouseAdapter
   }
 
   private async getCoreUtxoCreateRows(
-    networkId: PrimaryId,
     outputKeys: string[],
     requestContext?: ClickHouseRequestContext,
   ): Promise<Map<string, CoreUtxoCreateRow>> {
@@ -3404,11 +2849,11 @@ export class ClickHouseWarehouseAdapter
               vout,
               output_key AS "outputKey"
             FROM ${coreUtxoCreatesTable}
-            WHERE network_id = {networkId:UInt64} AND output_key IN ({outputKeys:Array(String)})
+            WHERE output_key IN ({outputKeys:Array(String)})
             ORDER BY output_key ASC, version DESC
             LIMIT 1 BY output_key
           `,
-        query_params: { networkId, outputKeys: chunk },
+        query_params: { outputKeys: chunk },
         format: 'JSONEachRow',
       }),
       requestContext,
@@ -3416,7 +2861,6 @@ export class ClickHouseWarehouseAdapter
   }
 
   private async getCoreUtxoSpendRows(
-    networkId: PrimaryId,
     outputKeys: string[],
     requestContext?: ClickHouseRequestContext,
   ): Promise<Map<string, CoreUtxoSpendRow>> {
@@ -3430,11 +2874,11 @@ export class ClickHouseWarehouseAdapter
               spent_in_block AS "spentInBlock",
               spent_input_index AS "spentInputIndex"
             FROM ${coreUtxoSpendsTable}
-            WHERE network_id = {networkId:UInt64} AND spent_output_key IN ({outputKeys:Array(String)})
+            WHERE spent_output_key IN ({outputKeys:Array(String)})
             ORDER BY spent_output_key ASC, version DESC
             LIMIT 1 BY spent_output_key
           `,
-        query_params: { networkId, outputKeys: chunk },
+        query_params: { outputKeys: chunk },
         format: 'JSONEachRow',
       }),
       requestContext,
@@ -3481,9 +2925,12 @@ export class ClickHouseWarehouseAdapter
     );
   }
 
+  public async insertMempoolSamples(rows: MempoolSampleRow[]): Promise<void> {
+    await this.insertRows(mempoolSamplesTable, rows.map(toMempoolSampleInsertRow));
+  }
+
   private async queryUtxoOutputsFromTable(
     table: string,
-    networkId: PrimaryId,
     outputKeys: string[],
     requestContext?: ClickHouseRequestContext,
   ): Promise<ProjectionUtxoOutput[]> {
@@ -3496,7 +2943,6 @@ export class ClickHouseWarehouseAdapter
           {
             query: `
               SELECT
-                {networkId:UInt64} AS "networkId",
                 block_height AS "blockHeight",
                 block_hash AS "blockHash",
                 block_time AS "blockTime",
@@ -3513,11 +2959,11 @@ export class ClickHouseWarehouseAdapter
                 spent_in_block AS "spentInBlock",
                 spent_input_index AS "spentInputIndex"
               FROM ${table}
-              WHERE network_id = {networkId:UInt64} AND output_key IN ({outputKeys:Array(String)})
+              WHERE output_key IN ({outputKeys:Array(String)})
               ORDER BY output_key ASC, version DESC
               LIMIT 1 BY output_key
           `,
-            query_params: { networkId, outputKeys: chunk },
+            query_params: { outputKeys: chunk },
             format: 'JSONEachRow',
           },
           requestContext,
@@ -3537,7 +2983,6 @@ export class ClickHouseWarehouseAdapter
       utxoCurrentStateByAddressTable,
       `
         INSERT INTO ${utxoCurrentStateByAddressTable} (
-          network_id,
           block_height,
           block_hash,
           block_time,
@@ -3556,7 +3001,6 @@ export class ClickHouseWarehouseAdapter
           version
         )
         SELECT
-          network_id,
           block_height,
           block_hash,
           block_time,
@@ -3581,7 +3025,6 @@ export class ClickHouseWarehouseAdapter
       `
         INSERT INTO ${addressMovementsByAddressTable} (
           movement_id,
-          network_id,
           block_height,
           block_hash,
           block_time,
@@ -3597,7 +3040,6 @@ export class ClickHouseWarehouseAdapter
         )
         SELECT
           movement_id,
-          network_id,
           block_height,
           block_hash,
           block_time,
@@ -3610,7 +3052,7 @@ export class ClickHouseWarehouseAdapter
           amount_base,
           output_key,
           derivation_method
-        FROM address_movements_v2
+        FROM ${addressMovementsTable}
       `,
     );
   }
@@ -3644,14 +3086,12 @@ export class ClickHouseWarehouseAdapter
   }
 
   public async backfillAnalyticsTransactionFacts(input: {
-    networkId: PrimaryId;
     throughBlockHeight: number;
   }): Promise<{ rowsInserted: number | null; throughBlockHeight: number }> {
     await this.executeCommand({
       query: `
         ALTER TABLE ${analyticsTransactionsTable}
-        DELETE WHERE network_id = {networkId:UInt64}
-          AND block_height <= {throughBlockHeight:UInt64}
+        DELETE WHERE block_height <= {throughBlockHeight:UInt64}
       `,
       query_params: input,
       clickhouse_settings: {
@@ -3846,7 +3286,7 @@ export class ClickHouseWarehouseAdapter
 
 export async function createWarehouse(
   settings: WarehouseSettings,
-): Promise<InvestigationWarehousePort & ProjectionWarehousePort & ExplorerWarehousePort> {
+): Promise<ProjectionWarehousePort & ExplorerWarehousePort & MempoolSampleWarehousePort> {
   if (settings.driver === 'clickhouse') {
     const adapter = new ClickHouseWarehouseAdapter(settings);
     await adapter.boot();
@@ -3862,113 +3302,79 @@ export async function createFactWarehouse(
   settings: WarehouseSettings,
 ): Promise<
   AnalyticsWarehousePort &
+    MempoolSampleWarehousePort &
     ProjectionFactWarehousePort &
     Pick<
       ProjectionStateStorePort,
       | 'getCurrentAddressSummary'
       | 'getBalanceSnapshots'
-      | 'getDirectLinkSnapshots'
-      | 'getDistinctLinksByAddresses'
-      | 'getBalancesByAddresses'
       | 'getUtxoOutputs'
       | 'hasAppliedBlock'
       | 'listAddressUtxos'
       | 'listAppliedBlockSet'
-      | 'listDirectLinksFromAddresses'
-      | 'listSourceSeedIdsReachingAddresses'
     > &
-    InvestigationWarehousePort &
     ProjectionWarehousePort &
     ExplorerWarehousePort
 > {
   return createWarehouse(settings) as Promise<
     AnalyticsWarehousePort &
+      MempoolSampleWarehousePort &
       ProjectionFactWarehousePort &
       Pick<
         ProjectionStateStorePort,
         | 'getCurrentAddressSummary'
         | 'getBalanceSnapshots'
-        | 'getDirectLinkSnapshots'
-        | 'getDistinctLinksByAddresses'
-        | 'getBalancesByAddresses'
         | 'getUtxoOutputs'
         | 'hasAppliedBlock'
         | 'listAddressUtxos'
         | 'listAppliedBlockSet'
-        | 'listDirectLinksFromAddresses'
-        | 'listSourceSeedIdsReachingAddresses'
       > &
-      InvestigationWarehousePort &
       ProjectionWarehousePort &
       ExplorerWarehousePort
   >;
 }
 
 export class CompositeWarehouseAdapter
-  implements
-    InvestigationWarehousePort,
-    ExplorerWarehousePort,
-    Pick<ProjectionWarehousePort, 'getUtxoOutputs'>
+  implements ExplorerWarehousePort, Pick<ProjectionWarehousePort, 'getUtxoOutputs'>
 {
   public constructor(
     private readonly stateStore: Pick<
       ProjectionStateStorePort,
-      | 'getBalancesByAddresses'
-      | 'getCurrentAddressSummary'
-      | 'getDistinctLinksByAddresses'
-      | 'getUtxoOutputs'
-      | 'listAddressUtxos'
+      'getCurrentAddressSummary' | 'getUtxoOutputs' | 'listAddressUtxos'
     >,
-    private readonly historyWarehouse: InvestigationWarehousePort & ExplorerWarehousePort,
+    private readonly historyWarehouse: ExplorerWarehousePort,
   ) {}
 
-  public getBalancesByAddresses(addresses: string[]) {
-    return this.stateStore.getBalancesByAddresses(addresses);
+  public getUtxoOutputs(outputKeys: string[]) {
+    return this.stateStore.getUtxoOutputs(outputKeys);
   }
 
-  public getDistinctLinksByAddresses(addresses: string[]) {
-    return this.stateStore.getDistinctLinksByAddresses(addresses);
-  }
-
-  public getTokensByAddresses(addresses: string[]) {
-    return this.historyWarehouse.getTokensByAddresses(addresses);
-  }
-
-  public getUtxoOutputs(networkId: PrimaryId, outputKeys: string[]) {
-    return this.stateStore.getUtxoOutputs(networkId, outputKeys);
-  }
-
-  public async getAddressSummary(networkId: PrimaryId, address: string) {
+  public async getAddressSummary(address: string) {
     const [current, historical] = await Promise.all([
-      this.stateStore.getCurrentAddressSummary(networkId, address),
-      this.historyWarehouse.getAddressSummary(networkId, address),
+      this.stateStore.getCurrentAddressSummary(address),
+      this.historyWarehouse.getAddressSummary(address),
     ]);
     return combineAddressSummary(current, historical);
   }
 
-  public getAppliedBlockByHash(networkId: PrimaryId, blockHash: string) {
-    return this.historyWarehouse.getAppliedBlockByHash(networkId, blockHash);
+  public getAppliedBlockByHash(blockHash: string) {
+    return this.historyWarehouse.getAppliedBlockByHash(blockHash);
   }
 
-  public getTransactionRef(networkId: PrimaryId, txid: string) {
-    return this.historyWarehouse.getTransactionRef(networkId, txid);
+  public getTransactionRef(txid: string) {
+    return this.historyWarehouse.getTransactionRef(txid);
   }
 
-  public listAddressTransactions(
-    networkId: PrimaryId,
-    address: string,
-    offset?: number,
-    limit?: number,
-  ) {
-    return this.historyWarehouse.listAddressTransactions(networkId, address, offset, limit);
+  public listAddressTransactions(address: string, offset?: number, limit?: number) {
+    return this.historyWarehouse.listAddressTransactions(address, offset, limit);
   }
 
-  public listAddressUtxos(networkId: PrimaryId, address: string, offset?: number, limit?: number) {
-    return this.stateStore.listAddressUtxos(networkId, address, offset, limit);
+  public listAddressUtxos(address: string, offset?: number, limit?: number) {
+    return this.stateStore.listAddressUtxos(address, offset, limit);
   }
 
-  public listAppliedBlocks(networkId: PrimaryId, offset?: number, limit?: number) {
-    return this.historyWarehouse.listAppliedBlocks(networkId, offset, limit);
+  public listAppliedBlocks(offset?: number, limit?: number) {
+    return this.historyWarehouse.listAppliedBlocks(offset, limit);
   }
 }
 
@@ -4064,6 +3470,19 @@ function addressSummaryWithoutMovement(balance: string, utxoCount: number) {
   };
 }
 
+function toMempoolSampleInsertRow(row: MempoolSampleRow): Record<string, unknown> {
+  return {
+    sampled_at: row.sampledAt,
+    txid: row.txid,
+    entry_time: row.entryTime,
+    height: row.height,
+    size_bytes: row.sizeBytes,
+    fee_base: row.feeBase,
+    fee_rate_base_per_kilobyte: row.feeRateBasePerKilobyte,
+    raw_json: row.rawJson,
+  };
+}
+
 function hasAddressMovementSummary(
   movement: AddressMovementSummaryRow | undefined,
 ): movement is AddressMovementSummaryRow {
@@ -4089,205 +3508,110 @@ export class MirroredProjectionStateStore implements ProjectionStateStorePort {
       ProjectionStateStorePort,
       | 'getCurrentAddressSummary'
       | 'getBalanceSnapshots'
-      | 'getBalancesByAddresses'
-      | 'getDirectLinkSnapshots'
-      | 'getDistinctLinksByAddresses'
       | 'getUtxoOutputs'
       | 'hasAppliedBlock'
       | 'listAddressUtxos'
       | 'listAppliedBlockSet'
-      | 'listDirectLinksFromAddresses'
-      | 'listSourceSeedIdsReachingAddresses'
     >,
-    private readonly mirror?: Pick<ProjectionWarehousePort, 'replaceSourceLinks'>,
   ) {}
 
   public applyProjectionWindow(batches: BlockProjectionBatch[]) {
     return this.primary.applyProjectionWindow(batches);
   }
 
-  public applyDirectLinkDeltasWindow(batches: ProjectionDirectLinkBatch[]) {
-    return this.primary.applyDirectLinkDeltasWindow(batches);
+  public clearProjectionBootstrapState() {
+    return this.primary.clearProjectionBootstrapState();
   }
 
-  public clearProjectionBootstrapState(networkId: PrimaryId) {
-    return this.primary.clearProjectionBootstrapState(networkId);
+  public finalizeProjectionBootstrap(processTail: number) {
+    return this.primary.finalizeProjectionBootstrap(processTail);
   }
 
-  public finalizeProjectionBootstrap(networkId: PrimaryId, processTail: number) {
-    return this.primary.finalizeProjectionBootstrap(networkId, processTail);
-  }
-
-  public async getCurrentAddressSummary(networkId: PrimaryId, address: string) {
-    const primary = await this.primary.getCurrentAddressSummary(networkId, address);
+  public async getCurrentAddressSummary(address: string) {
+    const primary = await this.primary.getCurrentAddressSummary(address);
     if (primary) {
       return primary;
     }
 
-    return this.fallbackCurrentAddressSummary(networkId, address);
+    return this.fallbackCurrentAddressSummary(address);
   }
 
-  private async fallbackCurrentAddressSummary(networkId: PrimaryId, address: string) {
+  private async fallbackCurrentAddressSummary(address: string) {
     if (!this.fallback) {
       return null;
     }
 
-    return this.fallback.getCurrentAddressSummary(networkId, address);
+    return this.fallback.getCurrentAddressSummary(address);
   }
 
   public getBalanceSnapshots(
-    networkId: PrimaryId,
     keys: Array<{
       address: string;
       assetAddress: string;
     }>,
   ) {
     return this.withFallbackMap(
-      this.primary.getBalanceSnapshots(networkId, keys),
+      this.primary.getBalanceSnapshots(keys),
       keys,
       (missingKeys) =>
-        this.fallback
-          ? this.fallback.getBalanceSnapshots(networkId, missingKeys)
-          : Promise.resolve(new Map()),
+        this.fallback ? this.fallback.getBalanceSnapshots(missingKeys) : Promise.resolve(new Map()),
       ({ address, assetAddress }) => projectionBalanceSnapshotKey(address, assetAddress),
     );
   }
 
-  public getDirectLinkSnapshots(
-    networkId: PrimaryId,
-    keys: Array<{
-      assetAddress: string;
-      fromAddress: string;
-      toAddress: string;
-    }>,
-  ) {
+  public getProjectionBootstrapTail() {
+    return this.primary.getProjectionBootstrapTail();
+  }
+
+  public getUtxoOutputs(outputKeys: string[]) {
     return this.withFallbackMap(
-      this.primary.getDirectLinkSnapshots(networkId, keys),
-      keys,
-      (missingKeys) =>
-        this.fallback
-          ? this.fallback.getDirectLinkSnapshots(networkId, missingKeys)
-          : Promise.resolve(new Map()),
-      ({ fromAddress, toAddress, assetAddress }) =>
-        projectionDirectLinkSnapshotKey(fromAddress, toAddress, assetAddress),
-    );
-  }
-
-  public async getDistinctLinksByAddresses(addresses: string[]) {
-    const primaryRows = await this.primary.getDistinctLinksByAddresses(addresses);
-    const fallbackRows = this.fallback
-      ? await this.fallback.getDistinctLinksByAddresses(addresses)
-      : [];
-
-    return dedupeRecords(
-      [...fallbackRows, ...primaryRows],
-      (row) => `${row.networkId}:${row.fromAddress}:${row.toAddress}:${row.transferCount}`,
-    );
-  }
-
-  public async getBalancesByAddresses(addresses: string[]) {
-    const primaryRows = await this.primary.getBalancesByAddresses(addresses);
-    const fallbackRows = this.fallback ? await this.fallback.getBalancesByAddresses(addresses) : [];
-
-    return dedupeRecords(
-      [...fallbackRows, ...primaryRows],
-      (row) => `${row.networkId}:${row.assetAddress}:${row.balance}`,
-    );
-  }
-
-  public getProjectionBootstrapTail(networkId: PrimaryId) {
-    return this.primary.getProjectionBootstrapTail(networkId);
-  }
-
-  public getUtxoOutputs(networkId: PrimaryId, outputKeys: string[]) {
-    return this.withFallbackMap(
-      this.primary.getUtxoOutputs(networkId, outputKeys),
+      this.primary.getUtxoOutputs(outputKeys),
       outputKeys,
       (missingKeys) =>
-        this.fallback
-          ? this.fallback.getUtxoOutputs(networkId, missingKeys)
-          : Promise.resolve(new Map()),
+        this.fallback ? this.fallback.getUtxoOutputs(missingKeys) : Promise.resolve(new Map()),
       (outputKey) => outputKey,
     );
   }
 
-  public async hasAppliedBlock(networkId: PrimaryId, blockHeight: number, blockHash: string) {
-    if (await this.primary.hasAppliedBlock(networkId, blockHeight, blockHash)) {
+  public async hasAppliedBlock(blockHeight: number, blockHash: string) {
+    if (await this.primary.hasAppliedBlock(blockHeight, blockHash)) {
       return true;
     }
 
-    return this.fallbackHasAppliedBlock(networkId, blockHeight, blockHash);
+    return this.fallbackHasAppliedBlock(blockHeight, blockHash);
   }
 
-  private async fallbackHasAppliedBlock(
-    networkId: PrimaryId,
-    blockHeight: number,
-    blockHash: string,
-  ): Promise<boolean> {
+  private async fallbackHasAppliedBlock(blockHeight: number, blockHash: string): Promise<boolean> {
     if (!this.fallback) {
       return false;
     }
 
-    return this.fallback.hasAppliedBlock(networkId, blockHeight, blockHash);
+    return this.fallback.hasAppliedBlock(blockHeight, blockHash);
   }
 
   public async listAppliedBlockSet(
-    networkId: PrimaryId,
     blocks: Array<{
       blockHash: string;
       blockHeight: number;
     }>,
   ): Promise<Set<string>> {
-    const primaryRows = await this.primary.listAppliedBlockSet(networkId, blocks);
+    const primaryRows = await this.primary.listAppliedBlockSet(blocks);
     const fallbackRows = this.fallback
-      ? await this.fallback.listAppliedBlockSet(networkId, blocks)
+      ? await this.fallback.listAppliedBlockSet(blocks)
       : new Set<string>();
 
     return new Set([...fallbackRows, ...primaryRows]);
   }
 
-  public hasProjectionState(networkId: PrimaryId) {
-    return this.primary.hasProjectionState(networkId);
+  public hasProjectionState() {
+    return this.primary.hasProjectionState();
   }
 
   public importProjectionStateSnapshot(
-    networkId: PrimaryId,
     snapshot: ProjectionStateBootstrapSnapshot,
     processTail: number,
   ) {
-    return this.primary.importProjectionStateSnapshot(networkId, snapshot, processTail);
-  }
-
-  public async listDirectLinksFromAddresses(networkId: PrimaryId, fromAddresses: string[]) {
-    const primaryRows = await this.primary.listDirectLinksFromAddresses(networkId, fromAddresses);
-    const fallbackRows = this.fallback
-      ? await this.fallback.listDirectLinksFromAddresses(networkId, fromAddresses)
-      : [];
-
-    return dedupeRecords([...fallbackRows, ...primaryRows], (row) =>
-      directLinkKey(row.networkId, row.fromAddress, row.toAddress, row.assetAddress),
-    );
-  }
-
-  public async listSourceSeedIdsReachingAddresses(networkId: PrimaryId, addresses: string[]) {
-    const primaryIds = await this.primary.listSourceSeedIdsReachingAddresses(networkId, addresses);
-    const fallbackIds = this.fallback
-      ? await this.fallback.listSourceSeedIdsReachingAddresses(networkId, addresses)
-      : [];
-
-    return [...new Set([...fallbackIds, ...primaryIds])];
-  }
-
-  public async replaceSourceLinks(
-    networkId: PrimaryId,
-    sourceAddressId: PrimaryId,
-    rows: SourceLinkRecord[],
-  ) {
-    await this.primary.replaceSourceLinks(networkId, sourceAddressId, rows);
-    const mirror = this.mirror;
-    if (mirror) {
-      await mirror.replaceSourceLinks(networkId, sourceAddressId, rows);
-    }
+    return this.primary.importProjectionStateSnapshot(snapshot, processTail);
   }
 
   public upsertProjectionBootstrapBalances(rows: ProjectionBalanceSnapshot[]) {
@@ -4298,19 +3622,14 @@ export class MirroredProjectionStateStore implements ProjectionStateStorePort {
     return this.primary.upsertProjectionBootstrapUtxoOutputs(rows);
   }
 
-  public async listAddressUtxos(
-    networkId: PrimaryId,
-    address: string,
-    offset?: number,
-    limit?: number,
-  ) {
-    const primaryRows = await this.primary.listAddressUtxos(networkId, address, offset, limit);
+  public async listAddressUtxos(address: string, offset?: number, limit?: number) {
+    const primaryRows = await this.primary.listAddressUtxos(address, offset, limit);
     const fallback = this.fallback;
     if (shouldUsePrimaryAddressUtxos(primaryRows, fallback)) {
       return primaryRows;
     }
 
-    return fallbackAddressUtxos(fallback, networkId, address, offset, limit);
+    return fallbackAddressUtxos(fallback, address, offset, limit);
   }
 
   private async withFallbackMap<TKey, TValue>(
@@ -4343,17 +3662,8 @@ export class MirroredProjectionStateStore implements ProjectionStateStorePort {
   }
 }
 
-function balanceKey(networkId: PrimaryId, address: string, assetAddress: string): string {
-  return `${networkId}:${address}:${assetAddress}`;
-}
-
-function directLinkKey(
-  networkId: PrimaryId,
-  fromAddress: string,
-  toAddress: string,
-  assetAddress: string,
-): string {
-  return `${networkId}:${fromAddress}:${toAddress}:${assetAddress}`;
+function balanceKey(address: string, assetAddress: string): string {
+  return `${address}:${assetAddress}`;
 }
 
 function coreApplyContextOption(context: CoreDogecoinApplyContext | undefined): {
@@ -4452,7 +3762,6 @@ function shouldUsePrimaryAddressUtxos(
 
 async function fallbackAddressUtxos(
   fallback: Pick<ProjectionStateStorePort, 'listAddressUtxos'> | undefined,
-  networkId: PrimaryId,
   address: string,
   offset?: number,
   limit?: number,
@@ -4461,7 +3770,7 @@ async function fallbackAddressUtxos(
     return [];
   }
 
-  return fallback.listAddressUtxos(networkId, address, offset, limit);
+  return fallback.listAddressUtxos(address, offset, limit);
 }
 
 function shouldSkipFallbackMap<TKey>(fallback: unknown, keys: TKey[]): boolean {
@@ -4484,15 +3793,6 @@ function clickHouseBool(value: boolean): number {
   return 0;
 }
 
-function dedupeRecords<T>(rows: T[], keyFor: (row: T) => string): T[] {
-  const deduped = new Map<string, T>();
-  for (const row of rows) {
-    deduped.set(keyFor(row), row);
-  }
-
-  return [...deduped.values()];
-}
-
 function abortReason(signal: AbortSignal): Error {
   if (signal.reason instanceof Error) {
     return signal.reason;
@@ -4503,7 +3803,6 @@ function abortReason(signal: AbortSignal): Error {
 
 function toCoreUtxoCreateInsertRow(output: ProjectionUtxoOutput): Record<string, unknown> {
   return {
-    network_id: output.networkId,
     block_height: output.blockHeight,
     block_hash: output.blockHash,
     block_time: output.blockTime,
@@ -4521,11 +3820,9 @@ function toCoreUtxoCreateInsertRow(output: ProjectionUtxoOutput): Record<string,
 }
 
 function toCoreUtxoSpendInsertRow(
-  networkId: PrimaryId,
   spend: CoreDogecoinBlockApplication['utxoSpends'][number],
 ): Record<string, unknown> {
   return {
-    network_id: networkId,
     spent_output_key: spend.outputKey,
     spent_by_txid: spend.spentByTxid,
     spent_in_block: spend.spentInBlock,
@@ -4538,7 +3835,6 @@ function toCoreProcessedBlockInsertRow(
   input: CoreDogecoinBlockApplication,
 ): Record<string, unknown> {
   return {
-    network_id: input.networkId,
     block_height: input.blockHeight,
     block_hash: input.blockHash,
     block_time: input.blockTime,
@@ -4551,7 +3847,6 @@ function toAnalyticsTransactionFactInsertRow(
   row: AnalyticsTransactionFact,
 ): Record<string, unknown> {
   return {
-    network_id: row.networkId,
     block_height: row.blockHeight,
     block_hash: row.blockHash,
     block_time: row.blockTime,
@@ -4565,15 +3860,6 @@ function toAnalyticsTransactionFactInsertRow(
     fee_base: row.feeBase,
     version: row.version,
   };
-}
-
-function coreWindowNetworkId(input: CoreDogecoinBlockApplication[]): PrimaryId {
-  const [application] = input;
-  if (!application) {
-    return 0;
-  }
-
-  return application.networkId;
 }
 
 function unappliedCoreWindowResult(input: CoreDogecoinBlockApplication[]): CoreDogecoinApplyResult {
@@ -4620,7 +3906,6 @@ function coreWindowResultTail(
 }
 
 function isPendingCoreApplication(
-  networkId: PrimaryId,
   application: CoreDogecoinBlockApplication,
   existing: CoreProcessedBlockRow | undefined,
 ): boolean {
@@ -4628,7 +3913,7 @@ function isPendingCoreApplication(
     return true;
   }
 
-  assertPendingCoreApplicationHash(networkId, application, existing);
+  assertPendingCoreApplicationHash(application, existing);
   return false;
 }
 
@@ -4647,7 +3932,6 @@ function firstCoreReorgHeight(
 }
 
 function assertPendingCoreApplicationHash(
-  networkId: PrimaryId,
   application: CoreDogecoinBlockApplication,
   existing: CoreProcessedBlockRow,
 ): void {
@@ -4656,7 +3940,7 @@ function assertPendingCoreApplicationHash(
   }
 
   throw new Error(
-    `core block hash mismatch network=${networkId} height=${application.blockHeight} existing=${existing.blockHash} next=${application.blockHash}`,
+    `core block hash mismatch height=${application.blockHeight} existing=${existing.blockHash} next=${application.blockHash}`,
   );
 }
 
@@ -4720,8 +4004,7 @@ function coreCreateAddressMovement(output: ProjectionUtxoOutput): AddressMovemen
 
   return [
     {
-      movementId: `core-credit:${output.networkId}:${output.outputKey}`,
-      networkId: output.networkId,
+      movementId: `core-credit:${output.outputKey}`,
       blockHeight: output.blockHeight,
       blockHash: output.blockHash,
       blockTime: output.blockTime,
@@ -4751,8 +4034,7 @@ function coreSpendAddressMovement(
 
   return [
     {
-      movementId: `core-debit:${application.networkId}:${spend.outputKey}:${spend.spentByTxid}:${spend.spentInputIndex}`,
-      networkId: application.networkId,
+      movementId: `core-debit:${spend.outputKey}:${spend.spentByTxid}:${spend.spentInputIndex}`,
       blockHeight: application.blockHeight,
       blockHash: application.blockHash,
       blockTime: application.blockTime,
@@ -4826,7 +4108,6 @@ function coreTransactionFact(
   const isCoinbase = sortedOutputs.some((output) => output.isCoinbase);
 
   return {
-    networkId: application.networkId,
     blockHeight: application.blockHeight,
     blockHash: application.blockHash,
     blockTime: application.blockTime,
@@ -5001,20 +4282,18 @@ function spentCoreOutput(
 }
 
 function coreCurrentBalanceRows(
-  networkId: PrimaryId,
   windowEnd: number,
   balanceDeltas: Map<string, { address: string; amount: bigint; assetAddress: string }>,
   currentBalances: Map<string, BalanceRow>,
 ): VersionedBalanceRow[] {
   const nextBalances: VersionedBalanceRow[] = [];
   for (const [key, delta] of balanceDeltas) {
-    nextBalances.push(coreCurrentBalanceRow(networkId, windowEnd, key, delta, currentBalances));
+    nextBalances.push(coreCurrentBalanceRow(windowEnd, key, delta, currentBalances));
   }
   return nextBalances;
 }
 
 function coreCurrentBalanceRow(
-  networkId: PrimaryId,
   windowEnd: number,
   key: string,
   delta: { address: string; amount: bigint; assetAddress: string },
@@ -5023,11 +4302,10 @@ function coreCurrentBalanceRow(
   const currentBalance = coreCurrentBalanceAmount(currentBalances, key);
   const nextBalance = currentBalance + delta.amount;
   if (nextBalance < 0n) {
-    throw new Error(`negative balance for ${networkId}:${delta.address}:${delta.assetAddress}`);
+    throw new Error(`negative balance for ${delta.address}:${delta.assetAddress}`);
   }
 
   return {
-    networkId,
     address: delta.address,
     assetAddress: delta.assetAddress,
     balance: formatAmountBase(nextBalance),
@@ -5055,26 +4333,13 @@ function createCoreWindowShapeState(): CoreWindowShapeState {
 }
 
 function assertCoreApplicationShape(
-  networkId: PrimaryId,
   application: CoreDogecoinBlockApplication,
   state: CoreWindowShapeState,
 ): void {
-  assertCoreApplicationNetwork(networkId, application);
   assertCoreApplicationHeight(application, state.previousHeight);
   assertCoreApplicationPreviousHash(application, state);
   assertUniqueCoreOutputs(application, state.created);
   assertUniqueCoreSpends(application, state.spent);
-}
-
-function assertCoreApplicationNetwork(
-  networkId: PrimaryId,
-  application: CoreDogecoinBlockApplication,
-): void {
-  if (application.networkId !== networkId) {
-    throw new Error(
-      `mixed core dogecoin networks in window expected=${networkId} actual=${application.networkId}`,
-    );
-  }
 }
 
 function assertCoreApplicationHeight(
@@ -5301,7 +4566,6 @@ function sumNullableNumbers(values: Array<number | undefined>): number | null {
 function analyticsTransactionFactsBackfillSql(): string {
   return `
     INSERT INTO ${analyticsTransactionsTable} (
-      network_id,
       block_height,
       block_hash,
       block_time,
@@ -5318,7 +4582,6 @@ function analyticsTransactionFactsBackfillSql(): string {
     WITH
     latest_outputs AS (
       SELECT
-        network_id,
         block_height,
         block_hash,
         block_time,
@@ -5330,8 +4593,7 @@ function analyticsTransactionFactsBackfillSql(): string {
         is_coinbase,
         version
       FROM ${coreUtxoCreatesTable}
-      WHERE network_id = {networkId:UInt64}
-        AND block_height <= {throughBlockHeight:UInt64}
+      WHERE block_height <= {throughBlockHeight:UInt64}
       ORDER BY output_key ASC, version DESC
       LIMIT 1 BY output_key
     ),
@@ -5341,8 +4603,7 @@ function analyticsTransactionFactsBackfillSql(): string {
         spent_by_txid,
         version
       FROM ${coreUtxoSpendsTable}
-      WHERE network_id = {networkId:UInt64}
-        AND spent_in_block <= {throughBlockHeight:UInt64}
+      WHERE spent_in_block <= {throughBlockHeight:UInt64}
       ORDER BY spent_output_key ASC, version DESC
       LIMIT 1 BY spent_output_key
     ),
@@ -5357,7 +4618,6 @@ function analyticsTransactionFactsBackfillSql(): string {
       GROUP BY s.spent_by_txid
     )
     SELECT
-      any(o.network_id) AS network_id,
       any(o.block_height) AS block_height,
       any(o.block_hash) AS block_hash,
       any(o.block_time) AS block_time,
@@ -5391,7 +4651,7 @@ function addCoreBalanceDelta(
   }
 
   const assetAddress = '';
-  const key = balanceKey(output.networkId, output.address, assetAddress);
+  const key = balanceKey(output.address, assetAddress);
   applyCoreBalanceDelta(deltas, key, output.address, amount, assetAddress);
 }
 
@@ -5457,7 +4717,6 @@ function coreBenchmarkBootstrapStatements(tables: CoreBenchmarkTables): string[]
     `
       CREATE TABLE IF NOT EXISTS ${tables.creates}
       (
-        network_id UInt64,
         block_height UInt64,
         block_hash String,
         block_time UInt64,
@@ -5473,12 +4732,11 @@ function coreBenchmarkBootstrapStatements(tables: CoreBenchmarkTables): string[]
         version UInt64
       )
       ENGINE = MergeTree
-      ORDER BY (network_id, output_key)
+      ORDER BY (output_key)
     `,
     `
       CREATE TABLE IF NOT EXISTS ${tables.spends}
       (
-        network_id UInt64,
         spent_output_key String,
         spent_by_txid String,
         spent_in_block UInt64,
@@ -5486,12 +4744,11 @@ function coreBenchmarkBootstrapStatements(tables: CoreBenchmarkTables): string[]
         version UInt64
       )
       ENGINE = MergeTree
-      ORDER BY (network_id, spent_output_key)
+      ORDER BY (spent_output_key)
     `,
     `
       CREATE TABLE IF NOT EXISTS ${tables.processedBlocks}
       (
-        network_id UInt64,
         block_height UInt64,
         block_hash String,
         block_time UInt64,
@@ -5499,12 +4756,11 @@ function coreBenchmarkBootstrapStatements(tables: CoreBenchmarkTables): string[]
         version UInt64
       )
       ENGINE = MergeTree
-      ORDER BY (network_id, block_height)
+      ORDER BY (block_height)
     `,
     `
       CREATE TABLE IF NOT EXISTS ${tables.currentUtxos}
       (
-        network_id UInt64,
         block_height UInt64,
         block_hash String,
         block_time UInt64,
@@ -5523,12 +4779,11 @@ function coreBenchmarkBootstrapStatements(tables: CoreBenchmarkTables): string[]
         version UInt64
       )
       ENGINE = MergeTree
-      ORDER BY (network_id, output_key)
+      ORDER BY (output_key)
     `,
     `
       CREATE TABLE IF NOT EXISTS ${tables.balances}
       (
-        network_id UInt64,
         address String,
         asset_address String,
         balance String,
@@ -5536,60 +4791,24 @@ function coreBenchmarkBootstrapStatements(tables: CoreBenchmarkTables): string[]
         version UInt64
       )
       ENGINE = MergeTree
-      ORDER BY (network_id, address, asset_address)
+      ORDER BY (address, asset_address)
     `,
     `
       CREATE TABLE IF NOT EXISTS ${tables.appliedBlocks}
       (
-        network_id UInt64,
         block_height UInt64,
         block_hash String
       )
       ENGINE = MergeTree
-      ORDER BY (network_id, block_height, block_hash)
+      ORDER BY (block_height, block_hash)
     `,
   ];
 }
 
 const clickHouseWarehouseBootstrapStatements = [
   `
-    CREATE TABLE IF NOT EXISTS applied_blocks_v2
-    (
-      network_id UInt64,
-      block_height UInt64,
-      block_hash String
-    )
-    ENGINE = MergeTree
-    ORDER BY (network_id, block_height, block_hash)
-  `,
-  `
-    CREATE TABLE IF NOT EXISTS utxo_outputs_v2
-    (
-      network_id UInt64,
-      block_height UInt64,
-      block_hash String,
-      block_time UInt64,
-      txid String,
-      tx_index UInt64,
-      vout UInt64,
-      output_key String,
-      address String,
-      script_type String,
-      value_base String,
-      is_coinbase UInt8,
-      is_spendable UInt8,
-      spent_by_txid Nullable(String),
-      spent_in_block Nullable(UInt64),
-      spent_input_index Nullable(UInt64),
-      version UInt64
-    )
-    ENGINE = ReplacingMergeTree(version)
-    ORDER BY (network_id, output_key)
-  `,
-  `
     CREATE TABLE IF NOT EXISTS ${utxoCurrentStateTable}
     (
-      network_id UInt64,
       block_height UInt64,
       block_hash String,
       block_time UInt64,
@@ -5608,13 +4827,12 @@ const clickHouseWarehouseBootstrapStatements = [
       version UInt64
     )
     ENGINE = ReplacingMergeTree(version)
-    ORDER BY (network_id, output_key)
+    ORDER BY (output_key)
     SETTINGS old_parts_lifetime = 0
   `,
   `
     CREATE TABLE IF NOT EXISTS ${utxoCurrentStateByAddressTable}
     (
-      network_id UInt64,
       block_height UInt64,
       block_hash String,
       block_time UInt64,
@@ -5633,7 +4851,7 @@ const clickHouseWarehouseBootstrapStatements = [
       version UInt64
     )
     ENGINE = ReplacingMergeTree(version)
-    ORDER BY (network_id, address, output_key)
+    ORDER BY (address, output_key)
     SETTINGS old_parts_lifetime = 0
   `,
   `
@@ -5641,7 +4859,6 @@ const clickHouseWarehouseBootstrapStatements = [
     TO ${utxoCurrentStateByAddressTable}
     AS
     SELECT
-      network_id,
       block_height,
       block_hash,
       block_time,
@@ -5661,10 +4878,9 @@ const clickHouseWarehouseBootstrapStatements = [
     FROM ${utxoCurrentStateTable}
   `,
   `
-    CREATE TABLE IF NOT EXISTS address_movements_v2
+    CREATE TABLE IF NOT EXISTS ${addressMovementsTable}
     (
       movement_id String,
-      network_id UInt64,
       block_height UInt64,
       block_hash String,
       block_time UInt64,
@@ -5679,13 +4895,12 @@ const clickHouseWarehouseBootstrapStatements = [
       derivation_method String
     )
     ENGINE = MergeTree
-    ORDER BY (network_id, movement_id)
+    ORDER BY (movement_id)
   `,
   `
     CREATE TABLE IF NOT EXISTS ${addressMovementsByAddressTable}
     (
       movement_id String,
-      network_id UInt64,
       block_height UInt64,
       block_hash String,
       block_time UInt64,
@@ -5701,7 +4916,7 @@ const clickHouseWarehouseBootstrapStatements = [
       derivation_method String
     )
     ENGINE = MergeTree
-    ORDER BY (network_id, address, block_height, tx_index, entry_index, movement_id)
+    ORDER BY (address, block_height, tx_index, entry_index, movement_id)
   `,
   `
     CREATE MATERIALIZED VIEW IF NOT EXISTS ${addressMovementsByAddressTable}_mv
@@ -5709,7 +4924,6 @@ const clickHouseWarehouseBootstrapStatements = [
     AS
     SELECT
       movement_id,
-      network_id,
       block_height,
       block_hash,
       block_time,
@@ -5722,36 +4936,11 @@ const clickHouseWarehouseBootstrapStatements = [
       amount_base,
       output_key,
       derivation_method
-    FROM address_movements_v2
+    FROM ${addressMovementsTable}
   `,
   `
-    CREATE TABLE IF NOT EXISTS transfers_v2
+    CREATE TABLE IF NOT EXISTS ${balancesTable}
     (
-      transfer_id String,
-      network_id UInt64,
-      block_height UInt64,
-      block_hash String,
-      block_time UInt64,
-      txid String,
-      tx_index UInt64,
-      transfer_index UInt64,
-      asset_address String,
-      from_address String,
-      to_address String,
-      amount_base String,
-      derivation_method String,
-      confidence Float64,
-      is_change UInt8,
-      input_address_count UInt64,
-      output_address_count UInt64
-    )
-    ENGINE = MergeTree
-    ORDER BY (network_id, transfer_id)
-  `,
-  `
-    CREATE TABLE IF NOT EXISTS balances_v2
-    (
-      network_id UInt64,
       address String,
       asset_address String,
       balance String,
@@ -5759,44 +4948,20 @@ const clickHouseWarehouseBootstrapStatements = [
       version UInt64
     )
     ENGINE = ReplacingMergeTree(version)
-    ORDER BY (network_id, address, asset_address)
+    ORDER BY (address, asset_address)
   `,
   `
-    CREATE TABLE IF NOT EXISTS direct_links_v2
+    CREATE TABLE IF NOT EXISTS ${appliedBlocksTable}
     (
-      network_id UInt64,
-      from_address String,
-      to_address String,
-      asset_address String,
-      transfer_count UInt64,
-      total_amount_base String,
-      first_seen_block_height UInt64,
-      last_seen_block_height UInt64,
-      version UInt64
-    )
-    ENGINE = ReplacingMergeTree(version)
-    ORDER BY (network_id, from_address, to_address, asset_address)
-  `,
-  `
-    CREATE TABLE IF NOT EXISTS source_links
-    (
-      network_id UInt64,
-      source_address_id UInt64,
-      source_address String,
-      to_address String,
-      hop_count UInt64,
-      path_transfer_count UInt64,
-      path_addresses Array(String),
-      first_seen_block_height UInt64,
-      last_seen_block_height UInt64
+      block_height UInt64,
+      block_hash String
     )
     ENGINE = MergeTree
-    ORDER BY (network_id, source_address_id, to_address)
+    ORDER BY (block_height, block_hash)
   `,
   `
     CREATE TABLE IF NOT EXISTS ${coreUtxoCreatesTable}
     (
-      network_id UInt64,
       block_height UInt64,
       block_hash String,
       block_time UInt64,
@@ -5812,7 +4977,7 @@ const clickHouseWarehouseBootstrapStatements = [
       version UInt64
     )
     ENGINE = ReplacingMergeTree(version)
-    ORDER BY (network_id, output_key)
+    ORDER BY (output_key)
   `,
   `
     ALTER TABLE ${coreUtxoCreatesTable}
@@ -5821,7 +4986,6 @@ const clickHouseWarehouseBootstrapStatements = [
   `
     CREATE TABLE IF NOT EXISTS ${coreUtxoSpendsTable}
     (
-      network_id UInt64,
       spent_output_key String,
       spent_by_txid String,
       spent_in_block UInt64,
@@ -5829,12 +4993,11 @@ const clickHouseWarehouseBootstrapStatements = [
       version UInt64
     )
     ENGINE = ReplacingMergeTree(version)
-    ORDER BY (network_id, spent_output_key)
+    ORDER BY (spent_output_key)
   `,
   `
     CREATE TABLE IF NOT EXISTS ${coreProcessedBlocksTable}
     (
-      network_id UInt64,
       block_height UInt64,
       block_hash String,
       block_time UInt64,
@@ -5842,12 +5005,11 @@ const clickHouseWarehouseBootstrapStatements = [
       version UInt64
     )
     ENGINE = ReplacingMergeTree(version)
-    ORDER BY (network_id, block_height)
+    ORDER BY (block_height)
   `,
   `
     CREATE TABLE IF NOT EXISTS ${analyticsTransactionsTable}
     (
-      network_id UInt64,
       block_height UInt64,
       block_hash String,
       block_time UInt64,
@@ -5865,8 +5027,38 @@ const clickHouseWarehouseBootstrapStatements = [
       version UInt64
     )
     ENGINE = ReplacingMergeTree(version)
-    ORDER BY (network_id, block_time, block_height, tx_index, txid)
+    ORDER BY (block_time, block_height, tx_index, txid)
     SETTINGS old_parts_lifetime = 0
+  `,
+  `
+    CREATE TABLE IF NOT EXISTS analytics_balances_current_v1
+    (
+      address String,
+      asset_address String,
+      balance String,
+      balance_i256 Int256 MATERIALIZED toInt256(balance),
+      as_of_block_height UInt64,
+      version UInt64
+    )
+    ENGINE = ReplacingMergeTree(version)
+    ORDER BY (asset_address, balance_i256, address)
+    SETTINGS old_parts_lifetime = 0
+  `,
+  `
+    CREATE TABLE IF NOT EXISTS mempool_samples_v1
+    (
+      sampled_at DateTime,
+      txid String,
+      entry_time Nullable(UInt64),
+      height Nullable(UInt64),
+      size_bytes Nullable(UInt64),
+      fee_base Nullable(String),
+      fee_rate_base_per_kilobyte Nullable(String),
+      raw_json String
+    )
+    ENGINE = MergeTree
+    ORDER BY (sampled_at, txid)
+    TTL sampled_at + INTERVAL 1 HOUR
   `,
 ];
 
@@ -5876,21 +5068,29 @@ const clickHouseDestructiveResetTables = [
   'applied_blocks',
   'utxo_outputs',
   'address_movements',
-  'transfers',
   'balances',
-  'direct_links',
-  appliedBlocksTable,
+  'applied_blocks_v2',
   'utxo_outputs_v2',
-  utxoCurrentStateTable,
-  utxoCurrentStateByAddressTable,
+  'utxo_outputs_current_v2',
+  'utxo_outputs_current_by_address_v2',
   'address_movements_v2',
-  addressMovementsByAddressTable,
+  'address_movements_by_address_v2',
+  'balances_v2',
+  'transfers',
   'transfers_v2',
-  balancesTable,
+  'direct_links',
   'direct_links_v2',
   'source_links',
+  appliedBlocksTable,
+  utxoCurrentStateTable,
+  utxoCurrentStateByAddressTable,
+  addressMovementsTable,
+  addressMovementsByAddressTable,
+  balancesTable,
   coreUtxoCreatesTable,
   coreUtxoSpendsTable,
   coreProcessedBlocksTable,
   analyticsTransactionsTable,
+  'analytics_balances_current_v1',
+  'mempool_samples_v1',
 ];

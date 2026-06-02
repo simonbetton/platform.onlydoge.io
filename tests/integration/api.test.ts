@@ -6,14 +6,12 @@ import { AccessControlService, InMemoryApiKeyRateLimiter } from '@onlydoge/acces
 import { buildApiApp } from '@onlydoge/api';
 import { configKeyDogecoinHistoryReady } from '@onlydoge/indexing-pipeline';
 import { createRuntime } from '@onlydoge/platform';
-import { ApiSecret, InfrastructureError } from '@onlydoge/shared-kernel';
+import { ApiSecret } from '@onlydoge/shared-kernel';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import { dogecoinFixture } from '../fixtures/dogecoin';
 import {
   createAuthenticatedTestApp,
-  createDogecoinAddressBook,
-  createDogecoinTestNetwork,
   createTestApp,
   installRpcMock,
   readObjectArray as readObjectArrayField,
@@ -81,11 +79,11 @@ describe('api integration', () => {
   it('enforces auth after the first key is created and does not expose the API token after creation', async () => {
     const ctx = await createTestApp();
 
-    const deniedBeforeBootstrap = await request(ctx.app, '/v1/networks');
+    const deniedBeforeBootstrap = await request(ctx.app, '/v1/explorer/blocks');
     expect(deniedBeforeBootstrap.status).toBe(401);
     expect(deniedBeforeBootstrap.headers.get('cache-control')).toBe('no-store');
 
-    const deniedBeforeBootstrapWithSlash = await request(ctx.app, '/v1/networks/');
+    const deniedBeforeBootstrapWithSlash = await request(ctx.app, '/v1/explorer/blocks/');
     expect(deniedBeforeBootstrapWithSlash.status).toBe(401);
 
     const deniedKeyListBeforeBootstrap = await request(ctx.app, '/v1/keys');
@@ -122,19 +120,16 @@ describe('api integration', () => {
     expect(listedBeforeUseKeys).toHaveLength(1);
     expect(listedBeforeUseKeys[0]?.key).toBeUndefined();
 
-    const denied = await request(ctx.app, '/v1/networks');
+    const denied = await request(ctx.app, '/v1/explorer/blocks');
     expect(denied.status).toBe(401);
 
-    const deniedWithSlash = await request(ctx.app, '/v1/networks/');
+    const deniedWithSlash = await request(ctx.app, '/v1/explorer/blocks/');
     expect(deniedWithSlash.status).toBe(401);
 
-    const deniedInfo = await request(ctx.app, '/v1/info?q=test');
-    expect(deniedInfo.status).toBe(401);
-
-    const deniedExplorer = await request(ctx.app, '/v1/explorer/networks');
+    const deniedExplorer = await request(ctx.app, '/v1/explorer/search?q=test');
     expect(deniedExplorer.status).toBe(401);
 
-    const deniedInvalidToken = await request(ctx.app, '/v1/networks', {
+    const deniedInvalidToken = await request(ctx.app, '/v1/explorer/blocks', {
       headers: {
         'x-api-token': 'sk_invalid',
       },
@@ -148,7 +143,7 @@ describe('api integration', () => {
     const heartbeat = await request(ctx.app, '/v1/heartbeat');
     expect(heartbeat.status).toBe(204);
 
-    const allowed = await request(ctx.app, '/v1/networks', {
+    const allowed = await request(ctx.app, '/v1/keys', {
       headers: {
         'x-api-token': apiToken,
       },
@@ -191,18 +186,14 @@ describe('api integration', () => {
     const deniedKeyList = await request(ctx.app, '/v1/keys/', { headers: memberHeaders });
     expect(deniedKeyList.status).toBe(403);
 
-    const deniedNetworkCreate = await request(ctx.app, '/v1/networks/', {
+    const deniedKeyCreate = await request(ctx.app, '/v1/keys/', {
       method: 'POST',
       headers: memberHeaders,
       body: {
-        name: 'Denied Dogecoin',
-        architecture: 'dogecoin',
-        chainId: 0,
-        blockTime: 60,
-        rpcEndpoint: 'https://doge.example/rpc',
+        id: 'key_denied',
       },
     });
-    expect(deniedNetworkCreate.status).toBe(403);
+    expect(deniedKeyCreate.status).toBe(403);
 
     const lastAdminDeactivate = await request(ctx.app, `/v1/keys/${adminId}`, {
       method: 'PUT',
@@ -214,18 +205,12 @@ describe('api integration', () => {
       error: 'cannot remove the last active admin API key',
     });
 
-    await request(ctx.app, '/v1/networks/', {
+    await request(ctx.app, '/v1/keys/', {
       method: 'POST',
       headers: {
         'x-api-token': 'sk_invalid',
       },
-      body: {
-        name: 'Invalid Token Dogecoin',
-        architecture: 'dogecoin',
-        chainId: 1,
-        blockTime: 60,
-        rpcEndpoint: 'https://doge.example/rpc',
-      },
+      body: {},
     });
 
     const audit = await request(
@@ -249,133 +234,25 @@ describe('api integration', () => {
     await ctx.cleanup();
   });
 
-  it('enforces owner-scoped metadata writes and filters investigation overlays', async () => {
-    const { ctx, headers: adminHeaders } = await createAuthenticatedTestApp();
+  it('removes legacy network, token, label, and investigation routes', async () => {
+    const { ctx, headers } = await createAuthenticatedTestApp();
 
-    const memberOne = await request(ctx.app, '/v1/keys/', {
-      method: 'POST',
-      headers: adminHeaders,
-      body: {},
-    }).then(readJsonObject);
-    const memberTwo = await request(ctx.app, '/v1/keys/', {
-      method: 'POST',
-      headers: adminHeaders,
-      body: {},
-    }).then(readJsonObject);
-    const memberOneHeaders = { 'x-api-token': requireStringField(memberOne, 'key') };
-    const memberTwoHeaders = { 'x-api-token': requireStringField(memberTwo, 'key') };
+    const removedRoutes = [
+      '/v1/networks',
+      '/v1/tokens',
+      '/v1/entities',
+      '/v1/addresses',
+      '/v1/tags',
+      '/v1/info?q=DTestAddress123',
+      '/v1/stats/',
+      '/v1/explorer/networks',
+    ];
 
-    const network = await request(ctx.app, '/v1/networks/', {
-      method: 'POST',
-      headers: adminHeaders,
-      body: {
-        name: 'Dogecoin Mainnet',
-        architecture: 'dogecoin',
-        chainId: 0,
-        blockTime: 60,
-        rpcEndpoint: 'https://doge.example/rpc',
-      },
-    }).then(readJsonObject);
-    const networkId = requireStringField(network, 'id');
-
-    const memberOneTag = await request(ctx.app, '/v1/tags/', {
-      method: 'POST',
-      headers: memberOneHeaders,
-      body: { name: 'Shared Risk', riskLevel: 'high' },
-    }).then(readJsonObject);
-    const memberTwoTag = await request(ctx.app, '/v1/tags/', {
-      method: 'POST',
-      headers: memberTwoHeaders,
-      body: { name: 'Shared Risk', riskLevel: 'low' },
-    }).then(readJsonObject);
-    expect(requireStringField(memberTwoTag, 'name')).toBe('Shared Risk');
-
-    const memberOneEntityPayload = await request(ctx.app, '/v1/entities/', {
-      method: 'POST',
-      headers: memberOneHeaders,
-      body: {
-        name: 'Shared Entity',
-        description: 'Owned by member one',
-        tags: [requireStringField(memberOneTag, 'id')],
-      },
-    }).then(readJsonObject);
-    const memberOneEntity = readObjectField(memberOneEntityPayload, 'entity');
-    const memberOneEntityId = requireStringField(memberOneEntity, 'id');
-
-    const memberTwoEntityPayload = await request(ctx.app, '/v1/entities/', {
-      method: 'POST',
-      headers: memberTwoHeaders,
-      body: {
-        name: 'Shared Entity',
-        description: 'Owned by member two',
-        tags: [requireStringField(memberTwoTag, 'id')],
-      },
-    }).then(readJsonObject);
-    const memberTwoEntityId = requireStringField(
-      readObjectField(memberTwoEntityPayload, 'entity'),
-      'id',
-    );
-
-    const address = 'DOnlyDogeOwnerScoped123';
-    await request(ctx.app, '/v1/addresses/', {
-      method: 'POST',
-      headers: memberOneHeaders,
-      body: {
-        entity: memberOneEntityId,
-        network: networkId,
-        addresses: [{ address, description: 'Member one address' }],
-      },
-    });
-
-    expect(
-      (
-        await request(ctx.app, `/v1/entities/${memberOneEntityId}`, {
-          headers: memberTwoHeaders,
-        })
-      ).status,
-    ).toBe(404);
-    expect(
-      (
-        await request(ctx.app, `/v1/entities/${memberOneEntityId}`, {
-          method: 'PUT',
-          headers: adminHeaders,
-          body: { description: 'Admin cannot edit another owner record' },
-        })
-      ).status,
-    ).toBe(404);
-    expect(
-      (
-        await request(ctx.app, `/v1/entities/${memberOneEntityId}`, {
-          headers: adminHeaders,
-        })
-      ).status,
-    ).toBe(200);
-
-    const deniedBatch = await request(ctx.app, '/v1/entities/', {
-      method: 'DELETE',
-      headers: memberOneHeaders,
-      body: { entities: [memberOneEntityId, memberTwoEntityId] },
-    });
-    expect(deniedBatch.status).toBe(404);
-    expect(
-      (
-        await request(ctx.app, `/v1/entities/${memberOneEntityId}`, {
-          headers: memberOneHeaders,
-        })
-      ).status,
-    ).toBe(200);
-
-    const memberTwoInfo = await request(ctx.app, `/v1/info?q=${address}`, {
-      headers: memberTwoHeaders,
-    }).then(readJsonObject);
-    expect(readObjectArrayField(memberTwoInfo, 'entities')).toEqual([]);
-    expect(readObjectArrayField(memberTwoInfo, 'tags')).toEqual([]);
-
-    const memberOneInfo = await request(ctx.app, `/v1/info?q=${address}`, {
-      headers: memberOneHeaders,
-    }).then(readJsonObject);
-    expect(readObjectArrayField(memberOneInfo, 'entities')).toHaveLength(1);
-    expect(readObjectArrayField(memberOneInfo, 'tags')).toHaveLength(1);
+    for (const path of removedRoutes) {
+      const response = await request(ctx.app, path, { headers });
+      expect(response.status).toBe(404);
+      expect(await readJsonObject(response)).toEqual({ error: 'not found' });
+    }
 
     await ctx.cleanup();
   });
@@ -399,7 +276,7 @@ describe('api integration', () => {
         accessControl,
       });
 
-      const response = await request(app, '/v1/networks', {
+      const response = await request(app, '/v1/explorer/blocks', {
         headers: {
           'x-api-token': apiToken,
         },
@@ -432,7 +309,7 @@ describe('api integration', () => {
         accessControl,
       });
 
-      const response = await request(app, '/v1/networks', {
+      const response = await request(app, '/v1/keys', {
         headers: {
           'x-api-token': apiToken,
         },
@@ -536,7 +413,7 @@ describe('api integration', () => {
     if (!firstActor) {
       throw new TypeError('expected authenticated API key');
     }
-    const secondKey = await accessControl.createKey({}, firstActor);
+    const secondKey = await accessControl.createKey({ role: 'admin' }, firstActor);
     const secondToken = secondKey.key;
     if (!secondToken) {
       throw new TypeError('expected API tokens');
@@ -545,11 +422,11 @@ describe('api integration', () => {
     const secondHeaders = { 'x-api-token': secondToken };
 
     for (let requestNumber = 0; requestNumber < 2; requestNumber += 1) {
-      const response = await request(app, '/v1/networks', { headers: firstHeaders });
+      const response = await request(app, '/v1/keys', { headers: firstHeaders });
       expect(response.status).toBe(200);
     }
 
-    const limited = await request(app, '/v1/networks', { headers: firstHeaders });
+    const limited = await request(app, '/v1/keys', { headers: firstHeaders });
     expect(limited.status).toBe(429);
     expect(await readJsonObject(limited)).toEqual({
       error: 'rate limit exceeded',
@@ -560,7 +437,7 @@ describe('api integration', () => {
     expect(Number(limited.headers.get('retry-after'))).toBeGreaterThan(0);
     expect(limited.headers.get('cache-control')).toBe('no-store');
 
-    const otherKeyResponse = await request(app, '/v1/networks', { headers: secondHeaders });
+    const otherKeyResponse = await request(app, '/v1/keys', { headers: secondHeaders });
     expect(otherKeyResponse.status).toBe(200);
     expect(otherKeyResponse.headers.get('ratelimit-limit')).toBe('2');
     expect(otherKeyResponse.headers.get('ratelimit-remaining')).toBe('1');
@@ -568,91 +445,22 @@ describe('api integration', () => {
     await ctx.cleanup();
   });
 
-  it('creates networks, tags, entities, addresses, and resolves info queries', async () => {
+  it('returns not found for removed write routes with authenticated requests', async () => {
     const { ctx, headers } = await createAuthenticatedTestApp();
 
-    const networkResponse = await request(ctx.app, '/v1/networks', {
-      method: 'POST',
-      headers,
-      body: {
-        name: 'Dogecoin Mainnet',
-        architecture: 'dogecoin',
-        chainId: 0,
-        blockTime: 60,
-        rpcEndpoint: 'https://user:pass@doge.example/rpc',
-      },
-    });
-    const network = await readJsonObject(networkResponse);
-    const networkId = requireStringField(network, 'id');
-    expect(requireStringField(network, 'rpcEndpoint')).toContain('***');
-
-    const tagResponse = await request(ctx.app, '/v1/tags', {
-      method: 'POST',
-      headers,
-      body: {
-        name: 'Sanctions',
-        riskLevel: 'high',
-      },
-    });
-    const tag = await readJsonObject(tagResponse);
-    const tagId = requireStringField(tag, 'id');
-
-    const entityResponse = await request(ctx.app, '/v1/entities', {
-      method: 'POST',
-      headers,
-      body: {
-        name: 'Example Entity',
-        description: 'Tracked counterparty',
-        tags: [tagId],
-      },
-    });
-    const entityPayload = await readJsonObject(entityResponse);
-    const entity = readObjectField(entityPayload, 'entity');
-    const entityId = requireStringField(entity, 'id');
-
-    const addressResponse = await request(ctx.app, '/v1/addresses', {
-      method: 'POST',
-      headers,
-      body: {
-        entity: entityId,
-        network: networkId,
-        addresses: [
-          {
-            address: 'DTestAddress123',
-            description: 'Main wallet',
-          },
-        ],
-      },
-    });
-    expect(addressResponse.status).toBe(200);
-
-    const fetchedEntity = await request(ctx.app, `/v1/entities/${entityId}`, {
-      headers,
-    });
-    const fetchedEntityBody = await readJsonObject(fetchedEntity);
-    const fetchedEntityRecord = readObjectField(fetchedEntityBody, 'entity');
-    expect(readStringArrayField(fetchedEntityRecord, 'tags')).toEqual([tagId]);
-    expect(readStringArrayField(fetchedEntityRecord, 'addresses')).toHaveLength(1);
-
-    const infoResponse = await request(ctx.app, '/v1/info?q=DTestAddress123', {
-      headers,
-    });
-    expect(infoResponse.headers.get('cache-control')).toBe(
-      'private, max-age=15, stale-while-revalidate=30',
-    );
-    expect(infoResponse.headers.get('vary')).toBe('x-api-token');
-    const info = await readJsonObject(infoResponse);
-    expect(readStringArrayField(info, 'addresses')).toEqual(['DTestAddress123']);
-    const [infoEntity] = readObjectArrayField(info, 'entities');
-    const [infoTag] = readObjectArrayField(info, 'tags');
-    const risk = readObjectField(info, 'risk');
-    if (!infoEntity || !infoTag) {
-      throw new TypeError('missing info relationship records');
+    for (const [method, path] of [
+      ['POST', '/v1/networks'],
+      ['POST', '/v1/tags'],
+      ['POST', '/v1/entities'],
+      ['POST', '/v1/addresses'],
+      ['DELETE', '/v1/tags'],
+      ['DELETE', '/v1/entities'],
+      ['DELETE', '/v1/addresses'],
+    ] as const) {
+      const response = await request(ctx.app, path, { method, headers, body: {} });
+      expect(response.status).toBe(404);
+      expect(await readJsonObject(response)).toEqual({ error: 'not found' });
     }
-    expect(requireStringField(infoEntity, 'id')).toBe(entityId);
-    expect(requireStringField(infoTag, 'id')).toBe(tagId);
-    expect(requireStringField(risk, 'level')).toBe('high');
-    expect(readStringArrayField(risk, 'reasons')).toContain('entity');
 
     await ctx.cleanup();
   });
@@ -660,13 +468,13 @@ describe('api integration', () => {
   it('returns short-lived private cache headers for authenticated collection reads', async () => {
     const { ctx, headers } = await createAuthenticatedTestApp();
 
-    const response = await request(ctx.app, '/v1/networks', {
+    const response = await request(ctx.app, '/v1/explorer/blocks', {
       headers,
     });
 
     expect(response.status).toBe(200);
     expect(response.headers.get('cache-control')).toBe(
-      'private, max-age=30, stale-while-revalidate=60',
+      'private, max-age=30, stale-while-revalidate=120',
     );
     expect(response.headers.get('vary')).toBe('x-api-token');
 
@@ -677,14 +485,12 @@ describe('api integration', () => {
     const scenario = await createExplorerScenario();
 
     try {
-      await expectExplorerNetworks(scenario);
       await expectExplorerSearch(scenario);
       await expectExplorerBlocks(scenario);
       await expectExplorerMempool(scenario, restoreFetch);
       await expectExplorerTransaction(scenario);
       await expectExplorerAddress(scenario);
       await expectExplorerAddressHistoryAndUtxos(scenario);
-      await expectExplorerInfoAuth(scenario);
     } finally {
       await scenario.ctx.cleanup();
     }
@@ -694,13 +500,7 @@ describe('api integration', () => {
     const scenario = await createExplorerScenario();
 
     try {
-      const internalNetwork =
-        await scenario.ctx.runtime.metadata.getNetworkByName('Dogecoin Mainnet');
-      const networkId = internalNetwork?.networkId ?? 0;
-      await scenario.ctx.runtime.metadata.setJsonValue(
-        configKeyDogecoinHistoryReady(networkId),
-        false,
-      );
+      await scenario.ctx.runtime.metadata.setJsonValue(configKeyDogecoinHistoryReady(), false);
 
       const search = await request(scenario.ctx.app, '/v1/explorer/search?q=2', {
         headers: scenario.headers,
@@ -733,83 +533,18 @@ describe('api integration', () => {
     }
   });
 
-  it('returns a clean validation error when info is requested without q', async () => {
+  it('returns not found when removed info route is requested', async () => {
     const { ctx, headers } = await createAuthenticatedTestApp();
 
     const response = await request(ctx.app, '/v1/info/', {
       headers,
     });
 
-    expect(response.status).toBe(400);
+    expect(response.status).toBe(404);
     expect(await response.json()).toEqual({
-      error: 'missing input params',
+      error: 'not found',
     });
 
-    await ctx.cleanup();
-  });
-
-  it('returns a connection error when rpc health checks fail during network creation', async () => {
-    restoreFetch.mockRejectedValue(new Error('socket hang up'));
-    const consoleError = vi.spyOn(console, 'error').mockImplementation(() => {});
-    const { ctx, headers } = await createAuthenticatedTestApp();
-
-    const response = await request(ctx.app, '/v1/networks', {
-      method: 'POST',
-      headers,
-      body: {
-        name: 'Dogecoin Mainnet',
-        architecture: 'dogecoin',
-        chainId: 0,
-        blockTime: 60,
-        rpcEndpoint: 'https://user:pass@doge.example/rpc',
-      },
-    });
-
-    expect(response.status).toBe(500);
-    expect(await response.json()).toEqual({
-      error: 'could not connect to `https://***:***@doge.example/rpc`',
-    });
-    expect(consoleError).toHaveBeenCalledWith('[onlydoge] infrastructure error', {
-      route: 'POST /v1/networks',
-      code: 'UNKNOWN',
-      message: 'could not connect to `https://***:***@doge.example/rpc`',
-      cause: 'Error: socket hang up',
-    });
-
-    consoleError.mockRestore();
-    await ctx.cleanup();
-  });
-
-  it('masks rpc endpoint credentials in infrastructure error responses', async () => {
-    const consoleError = vi.spyOn(console, 'error').mockImplementation(() => {});
-    const { ctx, headers } = await createAuthenticatedTestApp();
-    const createNetwork = vi
-      .spyOn(ctx.runtime.networkCatalog, 'createNetwork')
-      .mockRejectedValueOnce(
-        new InfrastructureError(
-          'could not connect to `https://raw-user:raw-pass@doge.example/rpc`',
-        ),
-      );
-
-    const response = await request(ctx.app, '/v1/networks', {
-      method: 'POST',
-      headers,
-      body: {
-        name: 'Dogecoin Mainnet',
-        architecture: 'dogecoin',
-        chainId: 0,
-        blockTime: 60,
-        rpcEndpoint: 'https://doge.example/rpc',
-      },
-    });
-
-    expect(response.status).toBe(500);
-    expect(await response.json()).toEqual({
-      error: 'could not connect to `https://***:***@doge.example/rpc`',
-    });
-
-    createNetwork.mockRestore();
-    consoleError.mockRestore();
     await ctx.cleanup();
   });
 });
@@ -817,41 +552,28 @@ describe('api integration', () => {
 type ExplorerScenario = Awaited<ReturnType<typeof createExplorerScenario>>;
 
 async function createExplorerScenario() {
-  const { actor, ctx, headers } = await createAuthenticatedTestApp();
-  const network = await createDogecoinTestNetwork(ctx.runtime, actor);
-  const highRiskTag = await ctx.runtime.entityLabeling.createTag(actor, {
-    name: 'High Risk Source',
-    riskLevel: 'high',
-  });
-  const { targetAddressRecord } = await createDogecoinAddressBook(ctx.runtime, actor, network.id, {
-    sourceTags: [highRiskTag.id],
-  });
-  const internalNetwork = await ctx.runtime.metadata.getNetworkByName('Dogecoin Mainnet');
+  const { ctx, headers } = await createAuthenticatedTestApp();
 
-  expect(targetAddressRecord?.address).toBe(dogecoinFixture.targetAddress);
-  await runIndexerUntilProcessed(ctx, internalNetwork?.networkId ?? 0, 2);
+  await runIndexerUntilProcessed(ctx, 2);
+  await runIndexerUntilHistoryReady(ctx);
 
-  return { ctx, headers, network };
+  return { ctx, headers };
 }
 
-async function expectExplorerNetworks({ ctx, headers, network }: ExplorerScenario): Promise<void> {
-  const deniedNetworks = await request(ctx.app, '/v1/explorer/networks');
-  expect(deniedNetworks.status).toBe(401);
+async function runIndexerUntilHistoryReady(
+  ctx: Awaited<ReturnType<typeof createAuthenticatedTestApp>>['ctx'],
+): Promise<void> {
+  for (let attempt = 0; attempt < 4; attempt += 1) {
+    await ctx.runtime.indexingPipeline.runOnce();
+    const historyReady = await ctx.runtime.metadata.getJsonValue<boolean>(
+      configKeyDogecoinHistoryReady(),
+    );
+    if (historyReady === true) {
+      return;
+    }
+  }
 
-  const networks = await request(ctx.app, '/v1/explorer/networks', { headers });
-  expect(networks.status).toBe(200);
-  expect(networks.headers.get('cache-control')).toBe(
-    'private, max-age=30, stale-while-revalidate=120',
-  );
-  expect(networks.headers.get('vary')).toBe('x-api-token');
-  const networksBody = await readJsonObject(networks);
-  const [networkSummary] = readObjectArrayField(networksBody, 'networks');
-  expect(requireStringField(networkSummary ?? {}, 'id')).toBe(network.id);
-  expect(requireNumberField(networkSummary ?? {}, 'syncTail')).toBe(2);
-  expect(requireNumberField(networkSummary ?? {}, 'processTail')).toBe(2);
-  expect(requireNumberField(networkSummary ?? {}, 'finalizedBlockHeight')).toBe(-1);
-  expect(requireNumberField(networkSummary ?? {}, 'reprocessDepth')).toBe(10);
-  expect(requireNumberField(networkSummary ?? {}, 'tipLagBlocks')).toBe(0);
+  throw new Error('dogecoin history did not become ready');
 }
 
 async function expectExplorerSearch({ ctx, headers }: ExplorerScenario): Promise<void> {
@@ -865,7 +587,12 @@ async function expectExplorerSearch({ ctx, headers }: ExplorerScenario): Promise
   expect(requireStringField(heightMatch ?? {}, 'type')).toBe('block');
 
   const searchByTx = await request(ctx.app, '/v1/explorer/search?q=doge-tx-2', { headers });
-  expect(readObjectArrayField(await readJsonObject(searchByTx), 'matches')).toEqual([]);
+  const txMatch = readObjectArrayField(await readJsonObject(searchByTx), 'matches')[0];
+  expect(txMatch).toMatchObject({
+    type: 'transaction',
+    txid: 'doge-tx-2',
+    blockHeight: 2,
+  });
 
   const searchByAddress = await request(
     ctx.app,
@@ -889,7 +616,7 @@ async function expectExplorerBlocks({ ctx, headers }: ExplorerScenario): Promise
 }
 
 async function expectExplorerMempool(
-  { ctx, headers, network }: ExplorerScenario,
+  { ctx, headers }: ExplorerScenario,
   fetchMock: ReturnType<typeof installRpcMock>,
 ): Promise<void> {
   const denied = await request(ctx.app, '/v1/explorer/mempool');
@@ -902,7 +629,6 @@ async function expectExplorerMempool(
   expect(response.headers.get('cache-control')).toBe('no-store');
   expect(response.headers.get('vary')).toBe('x-api-token');
   const body = await readJsonObject(response);
-  expect(requireStringField(body, 'network')).toBe(network.id);
   expect(requireNumberField(body, 'totalCount')).toBe(3);
   expect(requireNumberField(body, 'offset')).toBe(0);
   expect(requireNumberField(body, 'limit')).toBe(2);
@@ -947,8 +673,34 @@ async function expectExplorerMempool(
 
 async function expectExplorerTransaction({ ctx, headers }: ExplorerScenario): Promise<void> {
   const transaction = await request(ctx.app, '/v1/explorer/transactions/doge-tx-2', { headers });
-  expect(transaction.status).toBe(404);
-  expect(await transaction.json()).toEqual({ error: 'transaction not found' });
+  expect(transaction.status).toBe(200);
+  const body = await readJsonObject(transaction);
+  expect(readObjectField(body, 'transaction')).toMatchObject({
+    txid: 'doge-tx-2',
+    blockHeight: 2,
+    totalInputBase: '4000000000',
+    totalOutputBase: '3900000000',
+    feeBase: '100000000',
+  });
+  expect(readObjectArrayField(body, 'inputs')).toEqual([
+    expect.objectContaining({
+      address: dogecoinFixture.intermediaryAddress,
+      outputKey: 'doge-tx-1:0',
+      valueBase: '4000000000',
+    }),
+  ]);
+  expect(readObjectArrayField(body, 'outputs')).toEqual([
+    expect.objectContaining({
+      address: dogecoinFixture.targetAddress,
+      outputKey: 'doge-tx-2:0',
+      valueBase: '2500000000',
+    }),
+    expect.objectContaining({
+      address: dogecoinFixture.intermediaryAddress,
+      outputKey: 'doge-tx-2:1',
+      valueBase: '1400000000',
+    }),
+  ]);
 }
 
 async function expectExplorerAddress({ ctx, headers }: ExplorerScenario): Promise<void> {
@@ -965,9 +717,6 @@ async function expectExplorerAddress({ ctx, headers }: ExplorerScenario): Promis
   const addressBody = await readJsonObject(address);
   const addressSummary = readObjectField(addressBody, 'address');
   expect(requireStringField(addressSummary, 'balance')).toBe('2500000000');
-  const overlay = readObjectField(addressBody, 'overlay');
-  const risk = readObjectField(overlay, 'risk');
-  expect(readStringArrayField(risk, 'reasons')).not.toContain('source');
 }
 
 async function expectExplorerAddressHistoryAndUtxos({
@@ -979,7 +728,15 @@ async function expectExplorerAddressHistoryAndUtxos({
     `/v1/explorer/addresses/${dogecoinFixture.targetAddress}/transactions`,
     { headers },
   );
-  expect(readObjectArrayField(await readJsonObject(history), 'transactions')).toEqual([]);
+  const [historyRow] = readObjectArrayField(await readJsonObject(history), 'transactions');
+  expect(historyRow).toMatchObject({
+    receivedBase: '2500000000',
+    sentBase: '0',
+  });
+  expect(readObjectField(historyRow ?? {}, 'transaction')).toMatchObject({
+    txid: 'doge-tx-2',
+    blockHeight: 2,
+  });
 
   const utxos = await request(
     ctx.app,
@@ -988,11 +745,6 @@ async function expectExplorerAddressHistoryAndUtxos({
   );
   const [utxo] = readObjectArrayField(await readJsonObject(utxos), 'utxos');
   expect(requireStringField(utxo ?? {}, 'outputKey')).toBe('doge-tx-2:0');
-}
-
-async function expectExplorerInfoAuth({ ctx }: ExplorerScenario): Promise<void> {
-  const deniedInfo = await request(ctx.app, `/v1/info?q=${dogecoinFixture.targetAddress}`);
-  expect(deniedInfo.status).toBe(401);
 }
 
 async function readJsonObject(response: Response): Promise<Record<string, unknown>> {

@@ -22,10 +22,7 @@
       "@onlydoge/platform": ["./packages/platform/src/index.ts"],
       "@onlydoge/analytics-query": ["./packages/modules/analytics-query/src/index.ts"],
       "@onlydoge/access-control": ["./packages/modules/access-control/src/index.ts"],
-      "@onlydoge/network-catalog": ["./packages/modules/network-catalog/src/index.ts"],
-      "@onlydoge/entity-labeling": ["./packages/modules/entity-labeling/src/index.ts"],
       "@onlydoge/explorer-query": ["./packages/modules/explorer-query/src/index.ts"],
-      "@onlydoge/investigation-query": ["./packages/modules/investigation-query/src/index.ts"],
       "@onlydoge/indexing-pipeline": ["./packages/modules/indexing-pipeline/src/index.ts"]
     }
   },

@@ -1,5 +1,3 @@
-import type { PrimaryId } from '@onlydoge/shared-kernel';
-
 import type {
   AnalyticsQueryEstimate,
   AnalyticsQueryExecutionResult,
@@ -8,27 +6,13 @@ import type {
   AnalyticsTransactionFact,
 } from '../domain/query-models';
 
-export interface AnalyticsNetworkPort {
-  listActiveNetworks(): Promise<
-    Array<{
-      architecture: 'dogecoin';
-      id: string;
-      name: string;
-      networkId: PrimaryId;
-    }>
-  >;
-}
-
 export interface AnalyticsConfigPort {
   getJsonValue<T>(key: string): Promise<T | null>;
   setJsonValue<T>(key: string, value: T): Promise<void>;
 }
 
 export interface AnalyticsWarehousePort {
-  backfillAnalyticsTransactionFacts(input: {
-    networkId: PrimaryId;
-    throughBlockHeight: number;
-  }): Promise<{
+  backfillAnalyticsTransactionFacts(input: { throughBlockHeight: number }): Promise<{
     rowsInserted: number | null;
     throughBlockHeight: number;
   }>;

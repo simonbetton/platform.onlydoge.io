@@ -4,13 +4,13 @@ export interface ClickHouseStringRange {
 }
 
 export const clickHouseCoreDogecoinTables = {
-  appliedBlocks: 'applied_blocks_v2',
-  balances: 'balances_v2',
-  coreProcessedBlocks: 'core_processed_blocks_v1',
-  coreUtxoCreates: 'core_utxo_creates_v1',
-  coreUtxoSpends: 'core_utxo_spends_v1',
-  currentUtxos: 'utxo_outputs_current_v2',
-  currentUtxosByAddress: 'utxo_outputs_current_by_address_v2',
+  appliedBlocks: 'dogecoin_applied_blocks_v1',
+  balances: 'dogecoin_balances_current_v1',
+  coreProcessedBlocks: 'dogecoin_core_processed_blocks_v1',
+  coreUtxoCreates: 'dogecoin_core_utxo_creates_v1',
+  coreUtxoSpends: 'dogecoin_core_utxo_spends_v1',
+  currentUtxos: 'dogecoin_utxo_outputs_current_v1',
+  currentUtxosByAddress: 'dogecoin_utxo_outputs_current_by_address_v1',
 } as const;
 
 export function buildCoreCurrentStateOutputKeyRanges(): ClickHouseStringRange[] {

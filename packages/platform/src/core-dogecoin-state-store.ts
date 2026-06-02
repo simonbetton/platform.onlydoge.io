@@ -10,7 +10,6 @@ import {
   configKeyDogecoinHistoryReady,
   type ProjectionUtxoOutput,
 } from '@onlydoge/indexing-pipeline';
-import type { PrimaryId } from '@onlydoge/shared-kernel';
 
 import type { RelationalMetadataStore } from './metadata-store';
 
@@ -19,12 +18,8 @@ export interface ClickHouseCoreDogecoinStore {
     input: CoreDogecoinBlockApplication[],
     context?: CoreDogecoinApplyContext,
   ): Promise<CoreDogecoinApplyResult>;
-  getUtxoOutputs(
-    networkId: PrimaryId,
-    outputKeys: string[],
-  ): Promise<Map<string, ProjectionUtxoOutput>>;
+  getUtxoOutputs(outputKeys: string[]): Promise<Map<string, ProjectionUtxoOutput>>;
   materializeCoreDogecoinCurrentState(
-    networkId: PrimaryId,
     asOfBlockHeight: number,
     context?: CoreDogecoinApplyContext,
   ): Promise<void>;
@@ -73,32 +68,31 @@ export class ClickHouseCoreDogecoinStateStore implements CoreDogecoinStateStoreP
     return this.clickhouse.applyCoreDogecoinWindow(input, context);
   }
 
-  public getCoreIndexerState(networkId: PrimaryId) {
-    return this.metadata.getCoreIndexerState(networkId);
+  public getCoreIndexerState() {
+    return this.metadata.getCoreIndexerState();
   }
 
-  public getCoreUtxoOutputs(networkId: PrimaryId, outputKeys: string[]) {
-    return this.clickhouse.getUtxoOutputs(networkId, outputKeys);
+  public getCoreUtxoOutputs(outputKeys: string[]) {
+    return this.clickhouse.getUtxoOutputs(outputKeys);
   }
 
   public async materializeCoreDogecoinCurrentState(
-    networkId: PrimaryId,
     asOfBlockHeight: number,
     context?: CoreDogecoinApplyContext,
   ) {
-    await this.clickhouse.materializeCoreDogecoinCurrentState(networkId, asOfBlockHeight, context);
+    await this.clickhouse.materializeCoreDogecoinCurrentState(asOfBlockHeight, context);
     await Promise.all([
-      this.metadata.setJsonValue(configKeyDogecoinCurrentStateReady(networkId), true),
-      this.metadata.setJsonValue(configKeyDogecoinHistoryReady(networkId), false),
+      this.metadata.setJsonValue(configKeyDogecoinCurrentStateReady(), true),
+      this.metadata.setJsonValue(configKeyDogecoinHistoryReady(), false),
     ]);
   }
 
-  public setCoreIndexerError(networkId: PrimaryId, error: string | null) {
-    return this.metadata.setCoreIndexerError(networkId, error);
+  public setCoreIndexerError(error: string | null) {
+    return this.metadata.setCoreIndexerError(error);
   }
 
-  public setCoreIndexerStage(networkId: PrimaryId, stage: CoreIndexerStage) {
-    return this.metadata.setCoreIndexerStage(networkId, stage);
+  public setCoreIndexerStage(stage: CoreIndexerStage) {
+    return this.metadata.setCoreIndexerStage(stage);
   }
 
   public upsertCoreBlock(record: CoreBlockRecord) {
@@ -107,7 +101,6 @@ export class ClickHouseCoreDogecoinStateStore implements CoreDogecoinStateStoreP
 
   public upsertCoreIndexerState(input: {
     lastError?: string | null;
-    networkId: PrimaryId;
     onlineTip?: number;
     processTail?: number;
     stage?: CoreIndexerStage;

@@ -1,6 +1,6 @@
-import type { PrimaryId } from '@onlydoge/shared-kernel';
-
 export const analyticsTransactionsTable = 'analytics_transactions_v1';
+export const analyticsBalancesCurrentTable = 'analytics_balances_current_v1';
+export const mempoolSamplesTable = 'mempool_samples_v1';
 export const analyticsQueryMaxWindowSeconds = 7 * 24 * 60 * 60;
 export const analyticsQueryDefaultLimit = 100;
 export const analyticsQueryMaxResultRows = 1_000;
@@ -20,7 +20,6 @@ export interface AnalyticsTransactionFact {
   grossOutputBase: string;
   inputCount: number;
   isCoinbase: boolean;
-  networkId: PrimaryId;
   outputCount: number;
   totalInputBase: string;
   txIndex: number;
@@ -31,7 +30,6 @@ export interface AnalyticsTransactionFact {
 export interface AnalyticsQueryInput {
   from: string;
   limit?: number;
-  network?: string;
   sql: string;
   to: string;
 }
@@ -40,7 +38,6 @@ export interface AnalyticsQueryParams {
   fromTime: number;
   limit: number;
   maxFinalizedHeight: number;
-  networkId: PrimaryId;
   toTime: number;
 }
 
@@ -84,7 +81,6 @@ export interface AnalyticsQueryResponse {
     finalizedBlockHeight: number;
     from: string;
     hash: string;
-    network: string;
     to: string;
   };
   rows: Array<Record<string, unknown>>;

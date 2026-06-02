@@ -244,34 +244,28 @@ function buildIndexerStatsCommand(plan: DeployPlan): string {
   const script = `
 const { createRuntime } = await import("@onlydoge/platform");
 const runtime = await createRuntime({ mode: "http" });
-const stats = await runtime.investigationQuery.stats();
-const networks = Array.isArray(stats.networks) ? stats.networks : [];
-if (networks.length === 0) {
-  console.log("[deploy:stats] no networks returned");
-}
-for (const network of networks) {
-  const blockHeight = numberOrUnknown(network.blockHeight);
-  const processTail = numberOrUnknown(network.processTail);
-  const factTail = numberOrUnknown(network.factTail);
-  const onlineTip = typeof network.onlineTip === "number" ? network.onlineTip : network.blockHeight;
-  const freshness =
-    typeof onlineTip === "number" && typeof network.processTail === "number"
-      ? onlineTip - network.processTail
-      : "unknown";
-  const lastError = network.lastError == null ? "null" : JSON.stringify(String(network.lastError));
-  console.log(
-    [
-      "[deploy:stats]",
-      String(network.name ?? network.id ?? "unknown"),
-      "stage=" + String(network.stage ?? "unknown"),
-      "blockHeight=" + blockHeight,
-      "processTail=" + processTail,
-      "factTail=" + factTail,
-      "freshnessBlocks=" + freshness,
-      "lastError=" + lastError,
-    ].join(" "),
-  );
-}
+const state = await runtime.metadata.getCoreIndexerState();
+const blockHeight = await runtime.metadata.getJsonValue("block_height");
+const factTail = await runtime.metadata.getJsonValue("dogecoin_analytics_facts_tail");
+const onlineTip = typeof state?.onlineTip === "number" ? state.onlineTip : blockHeight;
+const processTail = state?.processTail;
+const freshness =
+  typeof onlineTip === "number" && typeof processTail === "number"
+    ? onlineTip - processTail
+    : "unknown";
+const lastError = state?.lastError == null ? "null" : JSON.stringify(String(state.lastError));
+console.log(
+  [
+    "[deploy:stats]",
+    "Dogecoin",
+    "stage=" + String(state?.stage ?? "unknown"),
+    "blockHeight=" + numberOrUnknown(blockHeight),
+    "processTail=" + numberOrUnknown(processTail),
+    "factTail=" + numberOrUnknown(factTail),
+    "freshnessBlocks=" + freshness,
+    "lastError=" + lastError,
+  ].join(" "),
+);
 process.exit(0);
 
 function numberOrUnknown(value) {

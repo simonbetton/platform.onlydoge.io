@@ -1,28 +1,20 @@
 # OnlyDoge Context
 
-OnlyDoge is an authenticated Dogecoin investigation and explorer API. This language keeps client identity and credential terms distinct.
+OnlyDoge is an authenticated, single-chain Dogecoin block explorer and analytics API. The domain model is Dogecoin itself: blocks, transactions, inputs, outputs, spends, UTXOs, addresses, balances, mempool samples, and analytics facts.
 
 ## Language
 
 **API key**:
-An authenticated client's identity for calling protected OnlyDoge API routes. One API key owns one request budget.
+An authenticated client's identity for protected OnlyDoge API routes. One API key owns one request budget.
 _Avoid_: User, account, token
 
 **Admin API key**:
-An API key with authority over platform-owned lifecycle resources such as API keys, networks, and currency tokens. Admin API keys can inspect all owner-scoped metadata but do not own another API key's metadata.
+An API key with authority over platform lifecycle resources such as API keys and audit events. Admin API keys can inspect and manage API keys according to role rules.
 _Avoid_: Admin token, root token, superuser
 
-**Owner API key**:
-The API key that owns an investigation metadata graph. One owner API key owns its entities, risk tags, and address labels.
-_Avoid_: User, account owner, creator user
-
 **API token**:
-The secret credential a client presents to prove it controls an API key. An API token is not itself the client identity.
-_Avoid_: API key, token, user
-
-**Token**:
-A currency tracked on a network, such as DOGE. A token is not an authentication credential.
-_Avoid_: API token, API key
+The secret credential a client presents to prove it controls an API key. API tokens are returned once and OnlyDoge stores only token hashes.
+_Avoid_: API key, user
 
 **Rate-limit budget**:
 The request allowance assigned to one API key for a time window.
@@ -36,9 +28,21 @@ _Avoid_: SQL user limit, chat user budget, token analytics limit
 An activity record for a protected request after it has resolved to an active API key. An audit event identifies the acting API key without storing the API token or request body.
 _Avoid_: Access log, user event, token log
 
-**AI analytics query**:
-A guarded read-only ClickHouse query generated for the AI chat application against OnlyDoge's curated analytics schema. An AI analytics query is not free-form access to internal warehouse tables.
-_Avoid_: Raw SQL endpoint, warehouse query, admin SQL
+**Dogecoin config**:
+The singleton runtime configuration for Dogecoin Core RPC, ZMQ, RPS, reprocess depth, and mempool sampling.
+_Avoid_: Network catalog entry, chain registry row
+
+**Canonical output**:
+A Dogecoin transaction output stored with its txid/vout, script, address when extractable, value, creating block, and current spend status.
+_Avoid_: Transfer, token balance row
+
+**UTXO**:
+A canonical output that is spendable and not currently spent. Address balances are derived from current UTXOs.
+_Avoid_: Cached balance source, transaction history row
+
+**Address activity**:
+Confirmed credit/debit facts derived only from canonical outputs and resolved spends. Address received, sent, and transaction counts come from address activity.
+_Avoid_: Heuristic transfer, source link, label
 
 **Transaction fact**:
 A confirmed Dogecoin transaction summary stored for analytics, including block position, input/output counts, resolved input value, gross output value, and fee when resolvable.
@@ -48,6 +52,10 @@ _Avoid_: Raw transaction, transfer, UTXO
 The sum of all outputs in a transaction, including change outputs. Gross output value is used for "biggest transaction" analytics and is not a change-adjusted economic transfer amount.
 _Avoid_: Transfer value, sent amount, economic value
 
+**AI analytics query**:
+A guarded read-only ClickHouse query generated for the AI chat application against OnlyDoge's curated analytics schema. An AI analytics query is not free-form access to internal warehouse tables.
+_Avoid_: Raw SQL endpoint, warehouse mutation, admin SQL
+
 ## Example Dialogue
 
 Developer: "Should we rate limit the user?"
@@ -56,8 +64,8 @@ Domain expert: "OnlyDoge does not have users yet. Rate limit the API key resolve
 Developer: "If two clients use different API tokens, do they share budget?"
 Domain expert: "No. Each API token resolves to its own API key, and each API key has its own budget."
 
-Developer: "Can the admin API token edit a member's entity?"
-Domain expert: "The credential is an API token, but the actor is the admin API key. Admin API keys can inspect another owner API key's metadata, not edit it."
+Developer: "Can we compute address sent amount from transaction outputs?"
+Domain expert: "No. Sent amount comes from resolved spends of previous outputs controlled by that address."
 
-Developer: "Should failed owner checks be recorded?"
-Domain expert: "Yes. Once an active API key is resolved, the request produces an audit event even if authorization or validation fails."
+Developer: "Can a balance row be trusted by itself?"
+Domain expert: "Only if it agrees with the current UTXO set for the same address."

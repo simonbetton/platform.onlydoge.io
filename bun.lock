@@ -39,10 +39,7 @@
         "@elysiajs/openapi": "1.4.15",
         "@onlydoge/access-control": "workspace:*",
         "@onlydoge/analytics-query": "workspace:*",
-        "@onlydoge/entity-labeling": "workspace:*",
         "@onlydoge/explorer-query": "workspace:*",
-        "@onlydoge/investigation-query": "workspace:*",
-        "@onlydoge/network-catalog": "workspace:*",
         "@onlydoge/platform": "workspace:*",
         "@onlydoge/shared-kernel": "workspace:*",
         "elysia": "1.4.28",
@@ -80,20 +77,11 @@
         "node-sql-parser": "5.4.0",
       },
     },
-    "packages/modules/entity-labeling": {
-      "name": "@onlydoge/entity-labeling",
-      "dependencies": {
-        "@onlydoge/access-control": "workspace:*",
-        "@onlydoge/shared-kernel": "workspace:*",
-        "elysia": "1.4.28",
-      },
-    },
     "packages/modules/explorer-query": {
       "name": "@onlydoge/explorer-query",
       "dependencies": {
         "@onlydoge/access-control": "workspace:*",
         "@onlydoge/indexing-pipeline": "workspace:*",
-        "@onlydoge/investigation-query": "workspace:*",
         "@onlydoge/shared-kernel": "workspace:*",
         "elysia": "1.4.28",
       },
@@ -104,22 +92,6 @@
         "@onlydoge/shared-kernel": "workspace:*",
       },
     },
-    "packages/modules/investigation-query": {
-      "name": "@onlydoge/investigation-query",
-      "dependencies": {
-        "@onlydoge/access-control": "workspace:*",
-        "@onlydoge/shared-kernel": "workspace:*",
-        "elysia": "1.4.28",
-      },
-    },
-    "packages/modules/network-catalog": {
-      "name": "@onlydoge/network-catalog",
-      "dependencies": {
-        "@onlydoge/access-control": "workspace:*",
-        "@onlydoge/shared-kernel": "workspace:*",
-        "elysia": "1.4.28",
-      },
-    },
     "packages/platform": {
       "name": "@onlydoge/platform",
       "dependencies": {
@@ -128,11 +100,8 @@
         "@libsql/client": "^0.17.3",
         "@onlydoge/access-control": "workspace:*",
         "@onlydoge/analytics-query": "workspace:*",
-        "@onlydoge/entity-labeling": "workspace:*",
         "@onlydoge/explorer-query": "workspace:*",
         "@onlydoge/indexing-pipeline": "workspace:*",
-        "@onlydoge/investigation-query": "workspace:*",
-        "@onlydoge/network-catalog": "workspace:*",
         "@onlydoge/shared-kernel": "workspace:*",
         "drizzle-orm": "0.45.2",
         "mysql2": "^3.22.3",
@@ -353,17 +322,11 @@
 
     "@onlydoge/api": ["@onlydoge/api@workspace:apps/api"],
 
-    "@onlydoge/entity-labeling": ["@onlydoge/entity-labeling@workspace:packages/modules/entity-labeling"],
-
     "@onlydoge/explorer-query": ["@onlydoge/explorer-query@workspace:packages/modules/explorer-query"],
 
     "@onlydoge/indexer-app": ["@onlydoge/indexer-app@workspace:apps/indexer"],
 
     "@onlydoge/indexing-pipeline": ["@onlydoge/indexing-pipeline@workspace:packages/modules/indexing-pipeline"],
-
-    "@onlydoge/investigation-query": ["@onlydoge/investigation-query@workspace:packages/modules/investigation-query"],
-
-    "@onlydoge/network-catalog": ["@onlydoge/network-catalog@workspace:packages/modules/network-catalog"],
 
     "@onlydoge/onlydoge": ["@onlydoge/onlydoge@workspace:apps/onlydoge"],
 

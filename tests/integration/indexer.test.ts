@@ -20,9 +20,9 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import { dogecoinFixture } from '../fixtures/dogecoin';
 import {
-  createDogecoinTestNetwork,
   createTestApp,
   installRpcMock,
+  prepareDogecoinTestConfig,
   runIndexerUntilProcessed,
 } from '../helpers';
 
@@ -39,53 +39,41 @@ describe('core dogecoin indexer integration', () => {
 
   it('syncs raw blocks first, then processes deterministic core UTXO state', async () => {
     const ctx = await createTestApp('indexer');
-    const network = await createDogecoinTestNetwork(ctx.runtime);
+    await prepareDogecoinTestConfig(ctx.runtime);
 
     await expect(ctx.runtime.indexingPipeline.runOnce()).resolves.toBe(true);
-    const internalNetwork = await ctx.runtime.metadata.getNetworkByName('Dogecoin Mainnet');
-    expect(internalNetwork?.networkId).toBeDefined();
-    const networkId = internalNetwork?.networkId ?? 0;
 
+    await expect(ctx.runtime.metadata.getJsonValue<string>(configKeyIndexerStage())).resolves.toBe(
+      'sync_backfill',
+    );
     await expect(
-      ctx.runtime.metadata.getJsonValue<string>(configKeyIndexerStage(networkId)),
-    ).resolves.toBe('sync_backfill');
-    await expect(
-      ctx.runtime.metadata.getJsonValue<number>(configKeyIndexerSyncTail(networkId)),
+      ctx.runtime.metadata.getJsonValue<number>(configKeyIndexerSyncTail()),
     ).resolves.toBe(2);
     await expect(
-      ctx.runtime.metadata.getJsonValue<number>(configKeyIndexerProcessTail(networkId)),
+      ctx.runtime.metadata.getJsonValue<number>(configKeyIndexerProcessTail()),
     ).resolves.toBe(-1);
 
-    const snapshotPath = join(ctx.tempRoot, 'storage', String(networkId), '0', 'block.json.gz');
+    const snapshotPath = join(ctx.tempRoot, 'storage', '0', 'block.json.gz');
     const snapshot = await readFile(snapshotPath);
     expect(snapshot.byteLength).toBeGreaterThan(0);
 
-    await runIndexerUntilProcessed(ctx, networkId, 2);
+    await runIndexerUntilProcessed(ctx, 2);
+
+    await expect(ctx.runtime.metadata.getJsonValue<string>(configKeyIndexerStage())).resolves.toBe(
+      'process_backfill',
+    );
+    await expect(
+      ctx.runtime.explorerQuery.getAddress(dogecoinFixture.sourceAddress),
+    ).resolves.toMatchObject({ address: { balance: '5900000000', utxoCount: 1 } });
+    await expect(
+      ctx.runtime.explorerQuery.getAddress(dogecoinFixture.intermediaryAddress),
+    ).resolves.toMatchObject({ address: { balance: '1400000000', utxoCount: 1 } });
+    await expect(
+      ctx.runtime.explorerQuery.getAddress(dogecoinFixture.targetAddress),
+    ).resolves.toMatchObject({ address: { balance: '2500000000', utxoCount: 1 } });
 
     await expect(
-      ctx.runtime.metadata.getJsonValue<string>(configKeyIndexerStage(networkId)),
-    ).resolves.toBe('process_backfill');
-    await expect(
-      ctx.runtime.metadata.getCurrentAddressSummary(networkId, dogecoinFixture.sourceAddress),
-    ).resolves.toEqual({
-      balance: '5900000000',
-      utxoCount: 1,
-    });
-    await expect(
-      ctx.runtime.metadata.getCurrentAddressSummary(networkId, dogecoinFixture.intermediaryAddress),
-    ).resolves.toEqual({
-      balance: '1400000000',
-      utxoCount: 1,
-    });
-    await expect(
-      ctx.runtime.metadata.getCurrentAddressSummary(networkId, dogecoinFixture.targetAddress),
-    ).resolves.toEqual({
-      balance: '2500000000',
-      utxoCount: 1,
-    });
-
-    await expect(
-      ctx.runtime.explorerQuery.listAddressUtxos(dogecoinFixture.targetAddress, network.id),
+      ctx.runtime.explorerQuery.listAddressUtxos(dogecoinFixture.targetAddress),
     ).resolves.toMatchObject({
       utxos: [
         expect.objectContaining({
@@ -101,12 +89,12 @@ describe('core dogecoin indexer integration', () => {
 
   it('reclaims a stale primary lease and resumes raw sync', async () => {
     const ctx = await createTestApp('indexer');
-    await createDogecoinTestNetwork(ctx.runtime);
+    await prepareDogecoinTestConfig(ctx.runtime);
     await ctx.runtime.metadata.setJsonValue('primary', 'stale-instance-id');
 
-    const networkId = await runOnceAndGetDogecoinNetworkId(ctx);
+    await runOnce(ctx);
     await expect(
-      ctx.runtime.metadata.getJsonValue<number>(configKeyIndexerSyncTail(networkId)),
+      ctx.runtime.metadata.getJsonValue<number>(configKeyIndexerSyncTail()),
     ).resolves.toBe(2);
 
     await ctx.cleanup();
@@ -114,35 +102,32 @@ describe('core dogecoin indexer integration', () => {
 
   it('does not start core processing until raw sync reaches the tip window', async () => {
     const ctx = await createTestApp('indexer');
-    await createDogecoinTestNetwork(ctx.runtime);
+    await prepareDogecoinTestConfig(ctx.runtime);
     ctx.runtime.settings.indexer.coreSyncCompleteDistance = 0;
     ctx.runtime.settings.indexer.syncWindow = 1;
 
-    const networkId = await runOnceAndGetDogecoinNetworkId(ctx);
+    await runOnce(ctx);
 
     await expect(
-      ctx.runtime.metadata.getJsonValue<number>(configKeyIndexerSyncTail(networkId)),
+      ctx.runtime.metadata.getJsonValue<number>(configKeyIndexerSyncTail()),
     ).resolves.toBe(0);
     await expect(
-      ctx.runtime.metadata.getJsonValue<number>(configKeyIndexerProcessTail(networkId)),
+      ctx.runtime.metadata.getJsonValue<number>(configKeyIndexerProcessTail()),
     ).resolves.toBe(-1);
-    await expect(
-      ctx.runtime.metadata.getJsonValue<string>(configKeyIndexerStage(networkId)),
-    ).resolves.toBe('sync_backfill');
+    await expect(ctx.runtime.metadata.getJsonValue<string>(configKeyIndexerStage())).resolves.toBe(
+      'sync_backfill',
+    );
 
     await ctx.cleanup();
   });
 
   it('advances through already processed blocks idempotently', async () => {
     const ctx = await createTestApp('indexer');
-    await createDogecoinTestNetwork(ctx.runtime);
-    const network = await ctx.runtime.metadata.getNetworkByName('Dogecoin Mainnet');
-    const networkId = network?.networkId ?? 0;
-
-    await runIndexerUntilProcessed(ctx, networkId, 2);
+    await prepareDogecoinTestConfig(ctx.runtime);
+    await runIndexerUntilProcessed(ctx, 2);
     await expect(ctx.runtime.indexingPipeline.runOnce()).resolves.toBe(true);
     await expect(
-      ctx.runtime.metadata.getJsonValue<number>(configKeyIndexerProcessTail(networkId)),
+      ctx.runtime.metadata.getJsonValue<number>(configKeyIndexerProcessTail()),
     ).resolves.toBe(2);
 
     await ctx.cleanup();
@@ -150,9 +135,9 @@ describe('core dogecoin indexer integration', () => {
 
   it('catches up current-state tail without rerunning destructive materialization', async () => {
     const values = new Map<string, unknown>([
-      [configKeyDogecoinAnalyticsFactsReady(7), true],
-      [configKeyDogecoinCurrentStateReady(7), true],
-      [configKeyDogecoinHistoryReady(7), true],
+      [configKeyDogecoinAnalyticsFactsReady(), true],
+      [configKeyDogecoinCurrentStateReady(), true],
+      [configKeyDogecoinHistoryReady(), true],
       ['primary', null],
     ]);
     const materialize = vi.fn(async () => undefined);
@@ -162,7 +147,6 @@ describe('core dogecoin indexer integration', () => {
     const rawBlocks = new Map<number, Record<string, unknown>>();
     let state: CoreIndexerState = {
       lastError: null as string | null,
-      networkId: 7,
       onlineTip: 2,
       processTail: 2,
       stage: 'online' as const,
@@ -171,7 +155,7 @@ describe('core dogecoin indexer integration', () => {
     };
     const service = new CoreDogecoinIndexerService(
       memoryCoordinator(values),
-      dogecoinNetworkReader(),
+      dogecoinConfigReader(),
       memoryRawBlockStorage(rawBlocks),
       dogecoinTipReader(3),
       {
@@ -189,7 +173,7 @@ describe('core dogecoin indexer integration', () => {
           return new Map();
         },
         materializeCoreDogecoinCurrentState: materialize,
-        async setCoreIndexerError(_networkId, error) {
+        async setCoreIndexerError(error: string | null) {
           errors.push(error ?? '');
         },
         async setCoreIndexerStage() {},
@@ -234,19 +218,18 @@ describe('core dogecoin indexer integration', () => {
     expect(upserts).toContainEqual(
       expect.objectContaining({
         lastError: null,
-        networkId: 7,
         onlineTip: 3,
         stage: 'online',
       }),
     );
-    expect(values.get(configKeyIndexerFactTail(7))).toBe(3);
-    expect(values.get(configKeyDogecoinAnalyticsFactsTail(7))).toBe(2);
+    expect(values.get(configKeyIndexerFactTail())).toBe(3);
+    expect(values.get(configKeyDogecoinAnalyticsFactsTail())).toBe(2);
   });
 
   it('refreshes and processes the online reorg window to the node tip', async () => {
     const values = new Map<string, unknown>([
-      [configKeyDogecoinCurrentStateReady(7), true],
-      [configKeyDogecoinHistoryReady(7), true],
+      [configKeyDogecoinCurrentStateReady(), true],
+      [configKeyDogecoinHistoryReady(), true],
       ['primary', null],
     ]);
     const errors: string[] = [];
@@ -255,7 +238,6 @@ describe('core dogecoin indexer integration', () => {
     const rawBlocks = new Map<number, Record<string, unknown>>([[2, testDogecoinBlockSnapshot(2)]]);
     let state: CoreIndexerState = {
       lastError: null,
-      networkId: 7,
       onlineTip: 2,
       processTail: 2,
       stage: 'online',
@@ -264,7 +246,7 @@ describe('core dogecoin indexer integration', () => {
     };
     const service = new CoreDogecoinIndexerService(
       memoryCoordinator(values),
-      dogecoinNetworkReader(),
+      dogecoinConfigReader(),
       memoryRawBlockStorage(rawBlocks),
       dogecoinTipReader(8),
       {
@@ -283,7 +265,7 @@ describe('core dogecoin indexer integration', () => {
           return new Map();
         },
         async materializeCoreDogecoinCurrentState() {},
-        async setCoreIndexerError(_networkId, error) {
+        async setCoreIndexerError(error: string | null) {
           errors.push(error ?? '');
         },
         async setCoreIndexerStage() {},
@@ -325,14 +307,14 @@ describe('core dogecoin indexer integration', () => {
       stage: 'online',
       syncTail: 8,
     });
-    expect(values.get(configKeyIndexerSyncTail(7))).toBe(8);
-    expect(values.get(configKeyIndexerProcessTail(7))).toBe(8);
+    expect(values.get(configKeyIndexerSyncTail())).toBe(8);
+    expect(values.get(configKeyIndexerProcessTail())).toBe(8);
   });
 
   it('replays a stale online process tail even when raw sync already reached the tip', async () => {
     const values = new Map<string, unknown>([
-      [configKeyDogecoinCurrentStateReady(7), true],
-      [configKeyDogecoinHistoryReady(7), true],
+      [configKeyDogecoinCurrentStateReady(), true],
+      [configKeyDogecoinHistoryReady(), true],
       ['primary', null],
     ]);
     const errors: string[] = [];
@@ -348,7 +330,6 @@ describe('core dogecoin indexer integration', () => {
     let state: CoreIndexerState = {
       lastError:
         'non-contiguous core dogecoin chain previous_height=5 previous_hash=stale-doge-block-5 next_height=6 next_previous=doge-block-5',
-      networkId: 7,
       onlineTip: 12,
       processTail: 5,
       stage: 'online',
@@ -357,7 +338,7 @@ describe('core dogecoin indexer integration', () => {
     };
     const service = new CoreDogecoinIndexerService(
       memoryCoordinator(values),
-      dogecoinNetworkReader(),
+      dogecoinConfigReader(),
       memoryRawBlockStorage(rawBlocks),
       dogecoinTipReader(12, (blockHeight) => fetchedHeights.push(blockHeight)),
       {
@@ -376,7 +357,7 @@ describe('core dogecoin indexer integration', () => {
           return new Map();
         },
         async materializeCoreDogecoinCurrentState() {},
-        async setCoreIndexerError(_networkId, error) {
+        async setCoreIndexerError(error: string | null) {
           errors.push(error ?? '');
         },
         async setCoreIndexerStage() {},
@@ -417,7 +398,7 @@ describe('core dogecoin indexer integration', () => {
     const errors: string[] = [];
     const service = new CoreDogecoinIndexerService(
       memoryCoordinator(values),
-      dogecoinNetworkReader(),
+      dogecoinConfigReader(),
       {
         async getPart() {
           return new Promise<null>(() => {});
@@ -442,7 +423,6 @@ describe('core dogecoin indexer integration', () => {
         async getCoreIndexerState() {
           return {
             lastError: null,
-            networkId: 7,
             onlineTip: 0,
             processTail: -1,
             stage: 'process_backfill',
@@ -454,7 +434,7 @@ describe('core dogecoin indexer integration', () => {
           return new Map();
         },
         async materializeCoreDogecoinCurrentState() {},
-        async setCoreIndexerError(_networkId, error) {
+        async setCoreIndexerError(error: string | null) {
           errors.push(error ?? '');
         },
         async setCoreIndexerStage() {},
@@ -462,7 +442,6 @@ describe('core dogecoin indexer integration', () => {
         async upsertCoreIndexerState(input) {
           return {
             lastError: input.lastError ?? null,
-            networkId: input.networkId,
             onlineTip: input.onlineTip ?? 0,
             processTail: input.processTail ?? -1,
             stage: input.stage ?? 'process_backfill',
@@ -492,10 +471,10 @@ describe('core dogecoin indexer integration', () => {
     const errors: string[] = [];
     const service = new CoreDogecoinIndexerService(
       memoryCoordinator(values),
-      dogecoinNetworkReader(),
+      dogecoinConfigReader(),
       {
         async getPart() {
-          throw new Error('raw block storage get timed out key=storage/7/0/block.json.gz');
+          throw new Error('raw block storage get timed out key=storage/0/block.json.gz');
         },
         async putPart() {},
       },
@@ -517,7 +496,6 @@ describe('core dogecoin indexer integration', () => {
         async getCoreIndexerState() {
           return {
             lastError: null,
-            networkId: 7,
             onlineTip: 0,
             processTail: -1,
             stage: 'process_backfill',
@@ -529,7 +507,7 @@ describe('core dogecoin indexer integration', () => {
           return new Map();
         },
         async materializeCoreDogecoinCurrentState() {},
-        async setCoreIndexerError(_networkId, error) {
+        async setCoreIndexerError(error: string | null) {
           errors.push(error ?? '');
         },
         async setCoreIndexerStage() {},
@@ -537,7 +515,6 @@ describe('core dogecoin indexer integration', () => {
         async upsertCoreIndexerState(input) {
           return {
             lastError: input.lastError ?? null,
-            networkId: input.networkId,
             onlineTip: input.onlineTip ?? 0,
             processTail: input.processTail ?? -1,
             stage: input.stage ?? 'process_backfill',
@@ -550,16 +527,12 @@ describe('core dogecoin indexer integration', () => {
     );
 
     await expect(service.runOnce()).rejects.toThrow('raw block storage get timed out');
-    expect(errors.at(-1)).toBe('raw block storage get timed out key=storage/7/0/block.json.gz');
+    expect(errors.at(-1)).toBe('raw block storage get timed out key=storage/0/block.json.gz');
   });
 });
 
-async function runOnceAndGetDogecoinNetworkId(
-  ctx: Awaited<ReturnType<typeof createTestApp>>,
-): Promise<number> {
+async function runOnce(ctx: Awaited<ReturnType<typeof createTestApp>>): Promise<void> {
   await expect(ctx.runtime.indexingPipeline.runOnce()).resolves.toBe(true);
-  const network = await ctx.runtime.metadata.getNetworkByName('Dogecoin Mainnet');
-  return network?.networkId ?? 0;
 }
 
 function testIndexerSettings(
@@ -634,19 +607,18 @@ function rangeForTest(start: number, end: number): number[] {
   return Array.from({ length: end - start + 1 }, (_value, index) => start + index);
 }
 
-function dogecoinNetworkReader() {
+function dogecoinConfigReader() {
   return {
-    async listActiveNetworks() {
-      return [
-        {
-          architecture: 'dogecoin' as const,
-          blockTime: 60,
-          id: 'net_doge',
-          networkId: 7,
-          rpcEndpoint: 'https://doge.example/rpc',
-          rps: 10,
-        },
-      ];
+    async getDogecoinConfig() {
+      return {
+        architecture: 'dogecoin' as const,
+        blockTime: 60,
+        chainId: 3,
+        id: 'dogecoin',
+        name: 'Dogecoin',
+        rpcEndpoint: 'https://doge.example/rpc',
+        rps: 10,
+      };
     },
   };
 }
@@ -655,14 +627,10 @@ function memoryRawBlockStorage(
   rawBlocks: Map<number, Record<string, unknown>>,
 ): RawBlockStoragePort {
   return {
-    async getPart<T extends Record<string, unknown>>(
-      _networkId: number,
-      blockHeight: number,
-    ): Promise<T | null> {
+    async getPart<T extends Record<string, unknown>>(blockHeight: number): Promise<T | null> {
       return (rawBlocks.get(blockHeight) as T | undefined) ?? null;
     },
     async putPart(
-      _networkId: number,
       blockHeight: number,
       _part: string,
       payload: Record<string, unknown>,
@@ -680,7 +648,7 @@ function dogecoinTipReader(
     async getBlockHeight() {
       return tip;
     },
-    async getBlockSnapshot(_network, blockHeight) {
+    async getBlockSnapshot(_dogecoin, blockHeight) {
       onBlockSnapshot?.(blockHeight);
       return testDogecoinBlockSnapshot(blockHeight);
     },

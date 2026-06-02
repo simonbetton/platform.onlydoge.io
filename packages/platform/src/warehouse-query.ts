@@ -1,8 +1,6 @@
 import type { createClient } from '@clickhouse/client';
 import type {
   AddressMovement,
-  BlockProjectionBatch,
-  DirectLinkRecord,
   ProjectionAppliedBlock,
   ProjectionBalanceCursor,
   ProjectionBalanceSnapshot,
@@ -11,7 +9,6 @@ import type {
   ProjectionPageRequestContext,
   ProjectionUtxoOutput,
 } from '@onlydoge/indexing-pipeline';
-import type { PrimaryId } from '@onlydoge/shared-kernel';
 
 import type { WarehouseSettings } from './settings';
 
@@ -44,16 +41,14 @@ export function clickHouseOutputKeyCursorClause(cursorOutputKey: string | null):
 }
 
 export function clickHouseOutputPageParams(
-  networkId: PrimaryId,
   cursorOutputKey: string | null,
   limit: number,
 ): Record<string, number | string> {
   if (cursorOutputKey === null) {
-    return { networkId, limit };
+    return { limit };
   }
 
   return {
-    networkId,
     limit,
     cursorOutputKey,
   };
@@ -94,16 +89,14 @@ export function clickHouseBalanceCursorClause(cursor: ProjectionBalanceCursor | 
 }
 
 export function clickHouseBalancePageParams(
-  networkId: PrimaryId,
   cursor: ProjectionBalanceCursor | null,
   limit: number,
 ): Record<string, number | string> {
   if (cursor === null) {
-    return { networkId, limit };
+    return { limit };
   }
 
   return {
-    networkId,
     limit,
     cursorAddress: cursor.address,
     cursorAssetAddress: cursor.assetAddress,
@@ -302,17 +295,8 @@ export function toClickHouseMaxExecutionTimeSeconds(timeoutMs: number): number {
 export function formatBalanceTupleList(keys: string[]): string {
   return formatTupleList(
     keys.map((key) => {
-      const [, address = '', assetAddress = ''] = key.split(':');
+      const [address = '', assetAddress = ''] = key.split(':');
       return [address, assetAddress];
-    }),
-  );
-}
-
-export function formatDirectLinkTupleList(keys: string[]): string {
-  return formatTupleList(
-    keys.map((key) => {
-      const [, fromAddress = '', toAddress = '', assetAddress = ''] = key.split(':');
-      return [fromAddress, toAddress, assetAddress];
     }),
   );
 }
@@ -337,7 +321,6 @@ export function toUtxoInsertRow(
   version: number,
 ): Record<string, unknown> {
   return {
-    network_id: row.networkId,
     block_height: row.blockHeight,
     block_hash: row.blockHash,
     block_time: row.blockTime,
@@ -364,7 +347,6 @@ function clickHouseBoolean(value: boolean): 0 | 1 {
 export function toAddressMovementInsertRow(row: AddressMovement): Record<string, unknown> {
   return {
     movement_id: row.movementId,
-    network_id: row.networkId,
     block_height: row.blockHeight,
     block_hash: row.blockHash,
     block_time: row.blockTime,
@@ -380,36 +362,11 @@ export function toAddressMovementInsertRow(row: AddressMovement): Record<string,
   };
 }
 
-export function toTransferInsertRow(
-  row: BlockProjectionBatch['transfers'][number],
-): Record<string, unknown> {
-  return {
-    transfer_id: row.transferId,
-    network_id: row.networkId,
-    block_height: row.blockHeight,
-    block_hash: row.blockHash,
-    block_time: row.blockTime,
-    txid: row.txid,
-    tx_index: row.txIndex,
-    transfer_index: row.transferIndex,
-    asset_address: row.assetAddress,
-    from_address: row.fromAddress,
-    to_address: row.toAddress,
-    amount_base: row.amountBase,
-    derivation_method: row.derivationMethod,
-    confidence: row.confidence,
-    is_change: row.isChange ? 1 : 0,
-    input_address_count: row.inputAddressCount,
-    output_address_count: row.outputAddressCount,
-  };
-}
-
 export function toBalanceInsertRow(
   row: ProjectionBalanceSnapshot,
   version: number,
 ): Record<string, unknown> {
   return {
-    network_id: row.networkId,
     address: row.address,
     asset_address: row.assetAddress,
     balance: row.balance,
@@ -418,26 +375,21 @@ export function toBalanceInsertRow(
   };
 }
 
-export function toDirectLinkInsertRow(
-  row: DirectLinkRecord,
+export function toAnalyticsBalanceCurrentInsertRow(
+  row: ProjectionBalanceSnapshot,
   version: number,
 ): Record<string, unknown> {
   return {
-    network_id: row.networkId,
-    from_address: row.fromAddress,
-    to_address: row.toAddress,
+    address: row.address,
     asset_address: row.assetAddress,
-    transfer_count: row.transferCount,
-    total_amount_base: row.totalAmountBase,
-    first_seen_block_height: row.firstSeenBlockHeight,
-    last_seen_block_height: row.lastSeenBlockHeight,
+    balance: row.balance,
+    as_of_block_height: row.asOfBlockHeight,
     version,
   };
 }
 
 export function toAppliedBlockInsertRow(row: ProjectionAppliedBlock): Record<string, unknown> {
   return {
-    network_id: row.networkId,
     block_height: row.blockHeight,
     block_hash: row.blockHash,
   };

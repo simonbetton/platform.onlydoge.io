@@ -20,7 +20,6 @@ describe('warehouse state helpers', () => {
     const state = mergeWarehouseState({
       balances: [
         {
-          networkId: 7,
           address: 'DAddress',
           assetAddress: '',
           balance: '10',
@@ -33,7 +32,6 @@ describe('warehouse state helpers', () => {
       ...emptyWarehouseState(),
       balances: [
         {
-          networkId: 7,
           address: 'DAddress',
           assetAddress: '',
           balance: '10',
@@ -43,25 +41,24 @@ describe('warehouse state helpers', () => {
     } satisfies WarehouseState);
   });
 
-  it('pages current balances by network, address, asset, and cursor', () => {
+  it('pages current balances by address, asset, and cursor', () => {
     const rows = currentBalancePageRows(
       [
-        balanceRow('DCharlie', '', 7),
-        balanceRow('DAlice', 'TOKEN', 7),
-        balanceRow('DAlice', '', 7),
-        balanceRow('DBob', '', 9),
+        balanceRow('DCharlie', ''),
+        balanceRow('DAlice', 'TOKEN'),
+        balanceRow('DAlice', ''),
+        balanceRow('DBob', ''),
       ],
-      7,
       { address: 'DAlice', assetAddress: '' },
       2,
     );
 
     expect(rows.map((row) => `${row.address}:${row.assetAddress}`)).toEqual([
       'DAlice:TOKEN',
-      'DCharlie:',
+      'DBob:',
     ]);
     expect(currentBalanceNextCursor(rows, 2)).toEqual({
-      address: 'DCharlie',
+      address: 'DBob',
       assetAddress: '',
     });
     expect(currentBalanceNextCursor(rows.slice(0, 1), 2)).toBeNull();
@@ -115,14 +112,13 @@ describe('warehouse state helpers', () => {
     expect(nextBalanceAmount(undefined, credit)).toBe(15n);
     expect(nextBalanceAmount('15', debit)).toBe(9n);
     expect(() => assertNonNegativeBalance(overdraft, -1n)).toThrow(
-      'negative balance for 7:DAddress:',
+      'negative balance for DAddress:',
     );
   });
 });
 
-function balanceRow(address: string, assetAddress: string, networkId: number) {
+function balanceRow(address: string, assetAddress: string) {
   return {
-    networkId,
     address,
     assetAddress,
     balance: '1',
@@ -134,7 +130,6 @@ function movement(overrides: Partial<AddressMovement>): AddressMovement {
   const blockHeight = overrides.blockHeight ?? 1;
   return {
     movementId: `${overrides.txid ?? 'tx'}:${overrides.direction ?? 'credit'}`,
-    networkId: 7,
     blockHeight,
     blockHash: `block-${blockHeight}`,
     blockTime: 1_700_000_000 + blockHeight,

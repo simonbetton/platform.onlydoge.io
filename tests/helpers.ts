@@ -59,14 +59,12 @@ type TestActor = NonNullable<Awaited<ReturnType<TestRuntime['accessControl']['au
 
 export async function runIndexerUntilProcessed(
   ctx: { runtime: TestRuntime },
-  networkId: number,
   targetTail: number,
 ): Promise<void> {
   for (let attempt = 0; attempt < 8; attempt += 1) {
     await ctx.runtime.indexingPipeline.runOnce();
     const processTail =
-      (await ctx.runtime.metadata.getJsonValue<number>(configKeyIndexerProcessTail(networkId))) ??
-      -1;
+      (await ctx.runtime.metadata.getJsonValue<number>(configKeyIndexerProcessTail())) ?? -1;
     if (processTail >= targetTail) {
       return;
     }
@@ -107,58 +105,12 @@ export async function createTestAdminActor(runtime: TestRuntime): Promise<TestAc
   return actor;
 }
 
-export async function createDogecoinTestNetwork(runtime: TestRuntime, actor?: TestActor) {
-  const admin = actor ?? (await createTestAdminActor(runtime));
-  return runtime.networkCatalog.createNetwork(admin, {
-    name: 'Dogecoin Mainnet',
-    architecture: 'dogecoin',
-    chainId: 0,
-    blockTime: 60,
-    rpcEndpoint: 'https://doge.example/rpc',
-  });
-}
-
-export async function createDogecoinAddressBook(
-  runtime: TestRuntime,
-  actor: TestActor,
-  networkId: string,
-  options: { sourceTags?: string[] } = {},
-) {
-  const sourceEntity = await runtime.entityLabeling.createEntity(actor, {
-    name: 'Source Entity',
-    description: 'Known source',
-    ...(options.sourceTags ? { tags: options.sourceTags } : {}),
-  });
-  const targetEntity = await runtime.entityLabeling.createEntity(actor, {
-    name: 'Target Entity',
-    description: 'Known target',
-  });
-
-  await runtime.entityLabeling.createAddresses(actor, {
-    entity: sourceEntity.entity.id,
-    network: networkId,
-    addresses: [
-      {
-        address: dogecoinFixture.sourceAddress,
-        description: 'Source wallet',
-      },
-    ],
-  });
-  const [targetAddressRecord] = await runtime.entityLabeling.createAddresses(actor, {
-    entity: targetEntity.entity.id,
-    network: networkId,
-    addresses: [
-      {
-        address: dogecoinFixture.targetAddress,
-        description: 'Target wallet',
-      },
-    ],
-  });
-
+export async function prepareDogecoinTestConfig(runtime: TestRuntime, actor?: TestActor) {
+  void runtime;
+  void actor;
   return {
-    sourceEntity,
-    targetAddressRecord,
-    targetEntity,
+    id: 'dogecoin',
+    name: 'Dogecoin',
   };
 }
 

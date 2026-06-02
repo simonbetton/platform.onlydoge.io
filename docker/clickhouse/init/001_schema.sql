@@ -1,131 +1,7 @@
 CREATE DATABASE IF NOT EXISTS onlydoge;
 
-CREATE TABLE IF NOT EXISTS onlydoge.applied_blocks
+CREATE TABLE IF NOT EXISTS onlydoge.dogecoin_utxo_outputs_current_v1
 (
-  network_id UInt64,
-  block_height UInt64,
-  block_hash String
-)
-ENGINE = MergeTree
-ORDER BY (network_id, block_height, block_hash);
-
-CREATE TABLE IF NOT EXISTS onlydoge.utxo_outputs
-(
-  network_id UInt64,
-  block_height UInt64,
-  block_hash String,
-  block_time UInt64,
-  txid String,
-  tx_index UInt64,
-  vout UInt64,
-  output_key String,
-  address String,
-  script_type String,
-  value_base String,
-  is_coinbase UInt8,
-  is_spendable UInt8,
-  spent_by_txid Nullable(String),
-  spent_in_block Nullable(UInt64),
-  spent_input_index Nullable(UInt64)
-)
-ENGINE = MergeTree
-ORDER BY (network_id, output_key);
-
-CREATE TABLE IF NOT EXISTS onlydoge.address_movements
-(
-  movement_id String,
-  network_id UInt64,
-  block_height UInt64,
-  block_hash String,
-  block_time UInt64,
-  txid String,
-  tx_index UInt64,
-  entry_index UInt64,
-  address String,
-  asset_address String,
-  direction String,
-  amount_base String,
-  output_key Nullable(String),
-  derivation_method String
-)
-ENGINE = MergeTree
-ORDER BY (network_id, movement_id);
-
-CREATE TABLE IF NOT EXISTS onlydoge.transfers
-(
-  transfer_id String,
-  network_id UInt64,
-  block_height UInt64,
-  block_hash String,
-  block_time UInt64,
-  txid String,
-  tx_index UInt64,
-  transfer_index UInt64,
-  asset_address String,
-  from_address String,
-  to_address String,
-  amount_base String,
-  derivation_method String,
-  confidence Float64,
-  is_change UInt8,
-  input_address_count UInt64,
-  output_address_count UInt64
-)
-ENGINE = MergeTree
-ORDER BY (network_id, transfer_id);
-
-CREATE TABLE IF NOT EXISTS onlydoge.balances
-(
-  network_id UInt64,
-  address String,
-  asset_address String,
-  balance String,
-  as_of_block_height UInt64
-)
-ENGINE = MergeTree
-ORDER BY (network_id, address, asset_address);
-
-CREATE TABLE IF NOT EXISTS onlydoge.direct_links
-(
-  network_id UInt64,
-  from_address String,
-  to_address String,
-  asset_address String,
-  transfer_count UInt64,
-  total_amount_base String,
-  first_seen_block_height UInt64,
-  last_seen_block_height UInt64
-)
-ENGINE = MergeTree
-ORDER BY (network_id, from_address, to_address, asset_address);
-
-CREATE TABLE IF NOT EXISTS onlydoge.source_links
-(
-  network_id UInt64,
-  source_address_id UInt64,
-  source_address String,
-  to_address String,
-  hop_count UInt64,
-  path_transfer_count UInt64,
-  path_addresses Array(String),
-  first_seen_block_height UInt64,
-  last_seen_block_height UInt64
-)
-ENGINE = MergeTree
-ORDER BY (network_id, source_address_id, to_address);
-
-CREATE TABLE IF NOT EXISTS onlydoge.applied_blocks_v2
-(
-  network_id UInt64,
-  block_height UInt64,
-  block_hash String
-)
-ENGINE = MergeTree
-ORDER BY (network_id, block_height, block_hash);
-
-CREATE TABLE IF NOT EXISTS onlydoge.utxo_outputs_v2
-(
-  network_id UInt64,
   block_height UInt64,
   block_hash String,
   block_time UInt64,
@@ -144,12 +20,11 @@ CREATE TABLE IF NOT EXISTS onlydoge.utxo_outputs_v2
   version UInt64
 )
 ENGINE = ReplacingMergeTree(version)
-ORDER BY (network_id, output_key)
+ORDER BY output_key
 SETTINGS old_parts_lifetime = 0;
 
-CREATE TABLE IF NOT EXISTS onlydoge.utxo_outputs_current_v2
+CREATE TABLE IF NOT EXISTS onlydoge.dogecoin_utxo_outputs_current_by_address_v1
 (
-  network_id UInt64,
   block_height UInt64,
   block_hash String,
   block_time UInt64,
@@ -168,38 +43,13 @@ CREATE TABLE IF NOT EXISTS onlydoge.utxo_outputs_current_v2
   version UInt64
 )
 ENGINE = ReplacingMergeTree(version)
-ORDER BY (network_id, output_key)
+ORDER BY (address, output_key)
 SETTINGS old_parts_lifetime = 0;
 
-CREATE TABLE IF NOT EXISTS onlydoge.utxo_outputs_current_by_address_v2
-(
-  network_id UInt64,
-  block_height UInt64,
-  block_hash String,
-  block_time UInt64,
-  txid String,
-  tx_index UInt64,
-  vout UInt64,
-  output_key String,
-  address String,
-  script_type String,
-  value_base String,
-  is_coinbase UInt8,
-  is_spendable UInt8,
-  spent_by_txid Nullable(String),
-  spent_in_block Nullable(UInt64),
-  spent_input_index Nullable(UInt64),
-  version UInt64
-)
-ENGINE = ReplacingMergeTree(version)
-ORDER BY (network_id, address, output_key)
-SETTINGS old_parts_lifetime = 0;
-
-CREATE MATERIALIZED VIEW IF NOT EXISTS onlydoge.utxo_outputs_current_by_address_v2_mv
-TO onlydoge.utxo_outputs_current_by_address_v2
+CREATE MATERIALIZED VIEW IF NOT EXISTS onlydoge.dogecoin_utxo_outputs_current_by_address_v1_mv
+TO onlydoge.dogecoin_utxo_outputs_current_by_address_v1
 AS
 SELECT
-  network_id,
   block_height,
   block_hash,
   block_time,
@@ -216,12 +66,11 @@ SELECT
   spent_in_block,
   spent_input_index,
   version
-FROM onlydoge.utxo_outputs_current_v2;
+FROM onlydoge.dogecoin_utxo_outputs_current_v1;
 
-CREATE TABLE IF NOT EXISTS onlydoge.address_movements_v2
+CREATE TABLE IF NOT EXISTS onlydoge.dogecoin_address_movements_v1
 (
   movement_id String,
-  network_id UInt64,
   block_height UInt64,
   block_hash String,
   block_time UInt64,
@@ -236,12 +85,11 @@ CREATE TABLE IF NOT EXISTS onlydoge.address_movements_v2
   derivation_method String
 )
 ENGINE = MergeTree
-ORDER BY (network_id, movement_id);
+ORDER BY movement_id;
 
-CREATE TABLE IF NOT EXISTS onlydoge.address_movements_by_address_v2
+CREATE TABLE IF NOT EXISTS onlydoge.dogecoin_address_movements_by_address_v1
 (
   movement_id String,
-  network_id UInt64,
   block_height UInt64,
   block_hash String,
   block_time UInt64,
@@ -257,14 +105,13 @@ CREATE TABLE IF NOT EXISTS onlydoge.address_movements_by_address_v2
   derivation_method String
 )
 ENGINE = MergeTree
-ORDER BY (network_id, address, block_height, tx_index, entry_index, movement_id);
+ORDER BY (address, block_height, tx_index, entry_index, movement_id);
 
-CREATE MATERIALIZED VIEW IF NOT EXISTS onlydoge.address_movements_by_address_v2_mv
-TO onlydoge.address_movements_by_address_v2
+CREATE MATERIALIZED VIEW IF NOT EXISTS onlydoge.dogecoin_address_movements_by_address_v1_mv
+TO onlydoge.dogecoin_address_movements_by_address_v1
 AS
 SELECT
   movement_id,
-  network_id,
   block_height,
   block_hash,
   block_time,
@@ -277,34 +124,10 @@ SELECT
   amount_base,
   output_key,
   derivation_method
-FROM onlydoge.address_movements_v2;
+FROM onlydoge.dogecoin_address_movements_v1;
 
-CREATE TABLE IF NOT EXISTS onlydoge.transfers_v2
+CREATE TABLE IF NOT EXISTS onlydoge.dogecoin_balances_current_v1
 (
-  transfer_id String,
-  network_id UInt64,
-  block_height UInt64,
-  block_hash String,
-  block_time UInt64,
-  txid String,
-  tx_index UInt64,
-  transfer_index UInt64,
-  asset_address String,
-  from_address String,
-  to_address String,
-  amount_base String,
-  derivation_method String,
-  confidence Float64,
-  is_change UInt8,
-  input_address_count UInt64,
-  output_address_count UInt64
-)
-ENGINE = MergeTree
-ORDER BY (network_id, transfer_id);
-
-CREATE TABLE IF NOT EXISTS onlydoge.balances_v2
-(
-  network_id UInt64,
   address String,
   asset_address String,
   balance String,
@@ -312,26 +135,18 @@ CREATE TABLE IF NOT EXISTS onlydoge.balances_v2
   version UInt64
 )
 ENGINE = ReplacingMergeTree(version)
-ORDER BY (network_id, address, asset_address);
+ORDER BY (address, asset_address);
 
-CREATE TABLE IF NOT EXISTS onlydoge.direct_links_v2
+CREATE TABLE IF NOT EXISTS onlydoge.dogecoin_applied_blocks_v1
 (
-  network_id UInt64,
-  from_address String,
-  to_address String,
-  asset_address String,
-  transfer_count UInt64,
-  total_amount_base String,
-  first_seen_block_height UInt64,
-  last_seen_block_height UInt64,
-  version UInt64
+  block_height UInt64,
+  block_hash String
 )
-ENGINE = ReplacingMergeTree(version)
-ORDER BY (network_id, from_address, to_address, asset_address);
+ENGINE = MergeTree
+ORDER BY (block_height, block_hash);
 
-CREATE TABLE IF NOT EXISTS onlydoge.core_utxo_creates_v1
+CREATE TABLE IF NOT EXISTS onlydoge.dogecoin_core_utxo_creates_v1
 (
-  network_id UInt64,
   block_height UInt64,
   block_hash String,
   block_time UInt64,
@@ -347,11 +162,13 @@ CREATE TABLE IF NOT EXISTS onlydoge.core_utxo_creates_v1
   version UInt64
 )
 ENGINE = ReplacingMergeTree(version)
-ORDER BY (network_id, output_key);
+ORDER BY output_key;
 
-CREATE TABLE IF NOT EXISTS onlydoge.core_utxo_spends_v1
+ALTER TABLE onlydoge.dogecoin_core_utxo_creates_v1
+ADD INDEX IF NOT EXISTS core_utxo_creates_address_idx address TYPE bloom_filter(0.01) GRANULARITY 4;
+
+CREATE TABLE IF NOT EXISTS onlydoge.dogecoin_core_utxo_spends_v1
 (
-  network_id UInt64,
   spent_output_key String,
   spent_by_txid String,
   spent_in_block UInt64,
@@ -359,11 +176,10 @@ CREATE TABLE IF NOT EXISTS onlydoge.core_utxo_spends_v1
   version UInt64
 )
 ENGINE = ReplacingMergeTree(version)
-ORDER BY (network_id, spent_output_key);
+ORDER BY spent_output_key;
 
-CREATE TABLE IF NOT EXISTS onlydoge.core_processed_blocks_v1
+CREATE TABLE IF NOT EXISTS onlydoge.dogecoin_core_processed_blocks_v1
 (
-  network_id UInt64,
   block_height UInt64,
   block_hash String,
   block_time UInt64,
@@ -371,11 +187,10 @@ CREATE TABLE IF NOT EXISTS onlydoge.core_processed_blocks_v1
   version UInt64
 )
 ENGINE = ReplacingMergeTree(version)
-ORDER BY (network_id, block_height);
+ORDER BY block_height;
 
 CREATE TABLE IF NOT EXISTS onlydoge.analytics_transactions_v1
 (
-  network_id UInt64,
   block_height UInt64,
   block_hash String,
   block_time UInt64,
@@ -393,5 +208,33 @@ CREATE TABLE IF NOT EXISTS onlydoge.analytics_transactions_v1
   version UInt64
 )
 ENGINE = ReplacingMergeTree(version)
-ORDER BY (network_id, block_time, block_height, tx_index, txid)
+ORDER BY (block_time, block_height, tx_index, txid)
 SETTINGS old_parts_lifetime = 0;
+
+CREATE TABLE IF NOT EXISTS onlydoge.analytics_balances_current_v1
+(
+  address String,
+  asset_address String,
+  balance String,
+  balance_i256 Int256 MATERIALIZED toInt256(balance),
+  as_of_block_height UInt64,
+  version UInt64
+)
+ENGINE = ReplacingMergeTree(version)
+ORDER BY (asset_address, balance_i256, address)
+SETTINGS old_parts_lifetime = 0;
+
+CREATE TABLE IF NOT EXISTS onlydoge.mempool_samples_v1
+(
+  sampled_at DateTime,
+  txid String,
+  entry_time Nullable(UInt64),
+  height Nullable(UInt64),
+  size_bytes Nullable(UInt64),
+  fee_base Nullable(String),
+  fee_rate_base_per_kilobyte Nullable(String),
+  raw_json String
+)
+ENGINE = MergeTree
+ORDER BY (sampled_at, txid)
+TTL sampled_at + INTERVAL 1 HOUR;

@@ -1,19 +1,17 @@
 import { AccessControlService } from '@onlydoge/access-control';
 import { AnalyticsQueryService } from '@onlydoge/analytics-query';
-import { EntityLabelingService } from '@onlydoge/entity-labeling';
 import { ExplorerQueryService } from '@onlydoge/explorer-query';
 import { CoreDogecoinIndexerService } from '@onlydoge/indexing-pipeline';
-import { InvestigationQueryService } from '@onlydoge/investigation-query';
-import { NetworkCatalogService } from '@onlydoge/network-catalog';
 
 import {
   ClickHouseCoreDogecoinStateStore,
   isClickHouseCoreDogecoinStore,
 } from './core-dogecoin-state-store';
+import { DogecoinMempoolSamplerService } from './mempool-sampler';
 import { RelationalMetadataStore } from './metadata-store';
 import { createRawBlockStorage } from './raw-block-storage';
 import { HttpBlockchainRpcGateway } from './rpc';
-import { type AppSettings, loadSettings } from './settings';
+import { type AppSettings, type DogecoinSettings, loadSettings } from './settings';
 import {
   CompositeWarehouseAdapter,
   createFactWarehouse,
@@ -23,12 +21,9 @@ import {
 export interface Runtime {
   accessControl: AccessControlService;
   analyticsQuery: AnalyticsQueryService;
-  entityLabeling: EntityLabelingService;
   explorerQuery: ExplorerQueryService;
   indexingPipeline: Pick<CoreDogecoinIndexerService, 'runOnce' | 'start'>;
-  investigationQuery: InvestigationQueryService;
   metadata: RelationalMetadataStore;
-  networkCatalog: NetworkCatalogService;
   settings: AppSettings;
 }
 
@@ -42,7 +37,7 @@ export async function createRuntime(input?: {
   const rawBlockStorage = createRawBlockStorage(settings.storage);
   const rpc = new HttpBlockchainRpcGateway();
   const factWarehouse = await createFactWarehouse(settings.warehouse);
-  const stateStore = new MirroredProjectionStateStore(metadata, factWarehouse, factWarehouse);
+  const stateStore = new MirroredProjectionStateStore(metadata, factWarehouse);
   const explorerStateStore =
     settings.warehouse.driver === 'clickhouse' ? factWarehouse : stateStore;
   const explorerWarehouse = new CompositeWarehouseAdapter(explorerStateStore, factWarehouse);
@@ -50,49 +45,75 @@ export async function createRuntime(input?: {
 
   const accessControl = new AccessControlService(metadata);
   await accessControl.deleteExpiredAuditEvents(settings.auditRetentionDays);
-  const entityLabeling = new EntityLabelingService(
-    metadata,
-    metadata,
-    metadata,
-    metadata,
-    metadata,
-    metadata,
-  );
-  const networkCatalog = new NetworkCatalogService(metadata, metadata, rpc, {
-    markNetworksUpdated: () => metadata.setJsonValue('networks_updated', 1),
-    softDeleteAddressesByNetworkIds: (networkIds) =>
-      entityLabeling.softDeleteAddressesByNetworkIds(networkIds),
-  });
-  const analyticsQuery = new AnalyticsQueryService(metadata, metadata, factWarehouse);
-  const investigationQuery = new InvestigationQueryService(metadata, explorerWarehouse, metadata);
+  const dogecoin = new SingletonDogecoinConfig(settings.dogecoin);
+  const analyticsQuery = new AnalyticsQueryService(metadata, factWarehouse);
   const explorerQuery = new ExplorerQueryService(
-    metadata,
-    metadata,
+    dogecoin,
     explorerWarehouse,
     rawBlockStorage,
     metadata,
     rpc,
   );
-  const indexingPipeline = new CoreDogecoinIndexerService(
+  const coreIndexer = new CoreDogecoinIndexerService(
     metadata,
-    metadata,
+    dogecoin,
     rawBlockStorage,
     rpc,
     coreStateStore,
     settings.indexer,
   );
+  const mempoolSampler = new DogecoinMempoolSamplerService(
+    dogecoin,
+    rpc,
+    factWarehouse,
+    settings.dogecoin,
+  );
+  const indexingPipeline = new DogecoinIndexerRuntime(coreIndexer, mempoolSampler);
 
   return {
     settings,
     metadata,
     accessControl,
     analyticsQuery,
-    networkCatalog,
-    entityLabeling,
     explorerQuery,
-    investigationQuery,
     indexingPipeline,
   };
+}
+
+class DogecoinIndexerRuntime {
+  public constructor(
+    private readonly coreIndexer: Pick<CoreDogecoinIndexerService, 'runOnce' | 'start'>,
+    private readonly mempoolSampler: Pick<DogecoinMempoolSamplerService, 'start'>,
+  ) {}
+
+  public runOnce(): Promise<boolean> {
+    return this.coreIndexer.runOnce();
+  }
+
+  public async start(signal?: AbortSignal): Promise<void> {
+    await Promise.all([this.coreIndexer.start(signal), this.mempoolSampler.start(signal)]);
+  }
+}
+
+class SingletonDogecoinConfig {
+  public constructor(private readonly settings: DogecoinSettings) {}
+
+  public async getDogecoinConfig() {
+    return this.dogecoinRef();
+  }
+
+  private dogecoinRef() {
+    return {
+      architecture: 'dogecoin' as const,
+      blockTime: this.settings.blockTime,
+      chainId: this.settings.chainId,
+      id: 'dogecoin',
+      name: 'Dogecoin',
+      rpcEndpoint: this.settings.rpcEndpoint,
+      rps: this.settings.rps,
+      zmqBlockEndpoint: this.settings.zmqBlockEndpoint ?? null,
+    };
+  }
 }
 
 function createCoreStateStore(
@@ -100,10 +121,7 @@ function createCoreStateStore(
   metadata: RelationalMetadataStore,
   factWarehouse: Awaited<ReturnType<typeof createFactWarehouse>>,
 ) {
-  if (settings.warehouse.driver !== 'clickhouse') {
-    return metadata;
-  }
-
+  void settings;
   return new ClickHouseCoreDogecoinStateStore(metadata, requireClickHouseCoreStore(factWarehouse));
 }
 

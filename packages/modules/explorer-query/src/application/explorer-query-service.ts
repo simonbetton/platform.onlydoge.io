@@ -1,11 +1,4 @@
-import type { AuthenticatedApiKey } from '@onlydoge/access-control';
 import {
-  configKeyBlockHeight,
-  configKeyIndexerFinalizedTail,
-  configKeyIndexerProcessProgress,
-  configKeyIndexerProcessTail,
-  configKeyIndexerReprocessDepth,
-  configKeyIndexerSyncProgress,
   configKeyIndexerSyncTail,
   type DogecoinTransaction,
   type DogecoinVin,
@@ -16,27 +9,14 @@ import {
   isDogecoinTransaction,
   type ParsedDogecoinBlock,
   type ProjectionUtxoOutput,
-  type ProjectionWarehousePort,
   parseAmountBase,
 } from '@onlydoge/indexing-pipeline';
-import {
-  buildInfoResponse,
-  type InfoResponse,
-  type InvestigationWarehousePort,
-} from '@onlydoge/investigation-query';
-import {
-  NotFoundError,
-  type PrimaryId,
-  type RiskLevel,
-  TooEarlyError,
-  ValidationError,
-} from '@onlydoge/shared-kernel';
+import { NotFoundError, TooEarlyError, ValidationError } from '@onlydoge/shared-kernel';
 
 import type {
-  ExplorerActiveNetworkPort,
   ExplorerConfigPort,
+  ExplorerDogecoinConfigPort,
   ExplorerMempoolRpcPort,
-  ExplorerMetadataPort,
   ExplorerRawBlockPort,
   ExplorerWarehousePort,
 } from '../contracts/ports';
@@ -45,10 +25,8 @@ import type {
   ExplorerAddressTransactionSummary,
   ExplorerAddressUtxo,
   ExplorerBlockSummary,
-  ExplorerLabelRef,
   ExplorerMempoolResponse,
   ExplorerMempoolTransaction,
-  ExplorerNetworkSummary,
   ExplorerSearchResult,
   ExplorerTransactionDetail,
   ExplorerTransactionInput,
@@ -58,34 +36,19 @@ import type {
 import {
   addressDetail,
   addressSearchResult,
-  buildExplorerTransferBasis,
-  type ExplorerProjectedTransfer,
   outputIndex,
   outputScriptType,
-  projectExplorerTransfers,
   spentByTxid,
   spentInBlock,
-  type WarehouseAddressSummary,
-  withTransactionLabels,
 } from './explorer-response-builders';
 
-export type ExplorerWarehouse = ExplorerWarehousePort &
-  InvestigationWarehousePort &
-  Pick<ProjectionWarehousePort, 'getUtxoOutputs'>;
-
-type ExplorerNetworkRef = {
+type ExplorerDogecoinRef = {
   architecture: 'dogecoin';
-  id: string;
-  name: string;
-  networkId: PrimaryId;
   rpcEndpoint: string;
   rps: number;
 };
 
-type CachedMempoolSnapshot = Omit<
-  ExplorerMempoolResponse,
-  'limit' | 'network' | 'offset' | 'returnedCount'
->;
+type CachedMempoolSnapshot = Omit<ExplorerMempoolResponse, 'limit' | 'offset' | 'returnedCount'>;
 
 type MempoolCacheEntry = {
   expiresAtMs: number;
@@ -97,74 +60,183 @@ const maxMempoolLimit = 500;
 const mempoolCacheTtlMs = 1_000;
 
 export class ExplorerQueryService {
-  private readonly mempoolSnapshots = new Map<PrimaryId, MempoolCacheEntry>();
+  private readonly mempoolSnapshots = new Map<string, MempoolCacheEntry>();
 
   public constructor(
-    private readonly networks: ExplorerActiveNetworkPort,
-    private readonly metadata: ExplorerMetadataPort,
-    private readonly warehouse: ExplorerWarehouse,
+    private readonly dogecoin: ExplorerDogecoinConfigPort,
+    private readonly warehouse: ExplorerWarehousePort,
     private readonly rawBlocks: ExplorerRawBlockPort,
     private readonly configs: ExplorerConfigPort,
     private readonly mempoolRpc: ExplorerMempoolRpcPort,
   ) {}
 
-  public async listNetworks(): Promise<{
-    networks: ExplorerNetworkSummary[];
-  }> {
-    const activeNetworks = (await this.networks.listActiveNetworks()).filter(
-      (network) => network.architecture === 'dogecoin',
-    );
-    const isSingleNetwork = activeNetworks.length === 1;
+  public async search(query: string | undefined): Promise<{ matches: ExplorerSearchResult[] }> {
+    const q = normalizeRequiredQuery(query);
+    await this.resolveDogecoin();
+    await this.assertHistoryReady();
+
+    if (/^\d+$/u.test(q)) {
+      const block = await this.getBlockByHeight(Number(q));
+      return { matches: block ? [blockSearchResult(block)] : [] };
+    }
+
+    const txMatch = await this.searchTransaction(q);
+    const blockMatch = await this.searchBlockHash(q);
+    const addressMatch = await this.searchAddress(q);
+    return { matches: [txMatch, blockMatch, addressMatch].filter(isExplorerSearchResult) };
+  }
+
+  public async listBlocks(
+    offset?: number,
+    limit?: number,
+  ): Promise<{ blocks: ExplorerBlockSummary[] }> {
+    await this.resolveDogecoin();
+    const syncTail = await this.configNumberOrDefault(configKeyIndexerSyncTail(), -1);
+    if (syncTail < 0) {
+      return this.listAppliedBlocks(offset, limit);
+    }
+
+    const heights = descendingBlockHeights(syncTail, offset ?? 0, limit ?? 20);
+    const blocks = await Promise.all(heights.map(async (height) => this.getBlockByHeight(height)));
+
+    return { blocks: blocks.filter((block): block is ExplorerBlockSummary => Boolean(block)) };
+  }
+
+  public async listMempool(offset?: number, limit?: number): Promise<ExplorerMempoolResponse> {
+    const dogecoin = await this.resolveDogecoin();
+    const page = mempoolPage(offset, limit);
+    const snapshot = await this.getCachedMempoolSnapshot(dogecoin);
+    const transactions = snapshot.transactions.slice(page.offset, page.offset + page.limit);
 
     return {
-      networks: await Promise.all(
-        activeNetworks.map((network) => this.networkSummary(network, isSingleNetwork)),
+      ...snapshot,
+      offset: page.offset,
+      limit: page.limit,
+      returnedCount: transactions.length,
+      transactions,
+    };
+  }
+
+  public async getBlock(
+    ref: string,
+  ): Promise<{ block: ExplorerBlockSummary; transactions: ExplorerTransactionSummary[] }> {
+    await this.resolveDogecoin();
+    await this.assertHistoryReady();
+    const parsed = await this.resolveBlockSnapshot(ref);
+    const inputMap = await this.loadResolvedInputs(parsed.tx);
+
+    return {
+      block: this.serializeBlock(parsed),
+      transactions: parsed.tx.map((transaction, txIndex) =>
+        this.serializeTransactionSummary(parsed, transaction, txIndex, inputMap),
       ),
     };
   }
 
-  private async networkSummary(
-    network: Awaited<ReturnType<ExplorerActiveNetworkPort['listActiveNetworks']>>[number],
-    isSingleNetwork: boolean,
-  ): Promise<ExplorerNetworkSummary> {
-    const blockHeight = await this.configNumberOrDefault(
-      configKeyBlockHeight(network.networkId),
-      0,
-    );
-    const processTail = await this.configNumberOrDefault(
-      configKeyIndexerProcessTail(network.networkId),
-      -1,
-    );
-    const syncTail = await this.configNumberOrDefault(
-      configKeyIndexerSyncTail(network.networkId),
-      -1,
-    );
-    const finalizedBlockHeight = await this.configNumberOrDefault(
-      configKeyIndexerFinalizedTail(network.networkId),
-      -1,
-    );
-    const reprocessDepth = await this.configNumberOrDefault(
-      configKeyIndexerReprocessDepth(network.networkId),
-      0,
+  public async getTransaction(txid: string): Promise<ExplorerTransactionDetail> {
+    const normalizedTxid = txid.trim();
+    await this.resolveDogecoin();
+    await this.assertHistoryReady();
+    const txRef = await this.requireTransactionRef(normalizedTxid);
+    const block = await this.loadBlockSnapshot(txRef.blockHeight);
+    const transaction = this.requireTransaction(block, normalizedTxid);
+    const inputMap = await this.loadResolvedInputs([transaction]);
+    const summary = this.serializeTransactionSummary(block, transaction, txRef.txIndex, inputMap);
+    const outputs = this.readOutputs(transaction.vout);
+    const outputKeys = outputs.map((_output, index) => `${normalizedTxid}:${index}`);
+    const currentOutputs = await this.warehouse.getUtxoOutputs(outputKeys);
+    const addresses = new Set<string>();
+    const inputs = this.serializeTransactionInputs(transaction, inputMap, addresses);
+    const serializedOutputs = this.serializeTransactionOutputs(
+      normalizedTxid,
+      outputs,
+      currentOutputs,
+      addresses,
     );
 
     return {
-      id: network.id,
-      name: network.name,
-      chainId: network.chainId,
-      blockTime: network.blockTime,
-      blockHeight,
-      finalizedBlockHeight,
-      syncTail,
-      processTail,
-      reprocessDepth,
-      tipLagBlocks: Math.max(0, blockHeight - processTail),
-      synced: await this.configNumberOrDefault(configKeyIndexerSyncProgress(network.networkId), 0),
-      processed: await this.configNumberOrDefault(
-        configKeyIndexerProcessProgress(network.networkId),
-        0,
-      ),
-      isDefault: isSingleNetwork,
+      transaction: summary,
+      inputs,
+      outputs: serializedOutputs,
+    };
+  }
+
+  public async getAddress(address: string): Promise<ExplorerAddressDetail> {
+    const normalizedAddress = requireExplorerAddress(address);
+    await this.resolveDogecoin();
+    const summary = await this.warehouse.getAddressSummary(normalizedAddress);
+    assertAddressExists(summary);
+
+    return {
+      address: addressDetail(normalizedAddress, summary),
+    };
+  }
+
+  public async listAddressTransactions(
+    address: string,
+    offset?: number,
+    limit?: number,
+  ): Promise<{ transactions: ExplorerAddressTransactionSummary[] }> {
+    const normalizedAddress = requireExplorerAddress(address);
+    await this.resolveDogecoin();
+    await this.assertHistoryReady();
+    const rows = await this.warehouse.listAddressTransactions(
+      normalizedAddress,
+      offset,
+      defaultAddressPageLimit(limit),
+    );
+    const snapshotsByHeight = await this.loadSnapshotsByHeight([
+      ...new Set(rows.map((row) => row.blockHeight)),
+    ]);
+
+    return {
+      transactions: rows
+        .flatMap((row) => this.addressTransactionSummary(row, snapshotsByHeight))
+        .sort(compareAddressTransactionSummaries),
+    };
+  }
+
+  public async listAddressUtxos(
+    address: string,
+    offset?: number,
+    limit?: number,
+  ): Promise<{ utxos: ExplorerAddressUtxo[] }> {
+    const normalizedAddress = requireExplorerAddress(address);
+    await this.resolveDogecoin();
+    const utxos = await this.warehouse.listAddressUtxos(
+      normalizedAddress,
+      offset,
+      defaultAddressPageLimit(limit),
+    );
+
+    return {
+      utxos: utxos.map((utxo) => ({
+        address: utxo.address,
+        blockHash: utxo.blockHash,
+        blockHeight: utxo.blockHeight,
+        blockTime: utxo.blockTime,
+        outputKey: utxo.outputKey,
+        scriptType: utxo.scriptType,
+        spentByTxid: utxo.spentByTxid,
+        spentInBlock: utxo.spentInBlock,
+        txid: utxo.txid,
+        txIndex: utxo.txIndex,
+        valueBase: utxo.valueBase,
+        vout: utxo.vout,
+      })),
+    };
+  }
+
+  private async resolveDogecoin(): Promise<ExplorerDogecoinRef> {
+    const dogecoin = await this.dogecoin.getDogecoinConfig();
+    if (!dogecoin) {
+      throw new NotFoundError('dogecoin config not found');
+    }
+
+    return {
+      architecture: 'dogecoin',
+      rpcEndpoint: dogecoin.rpcEndpoint,
+      rps: dogecoin.rps,
     };
   }
 
@@ -173,55 +245,32 @@ export class ExplorerQueryService {
     return value ?? fallback;
   }
 
-  public async search(
-    actor: AuthenticatedApiKey,
-    query: string | undefined,
-    networkId?: string,
-  ): Promise<{
-    matches: ExplorerSearchResult[];
-  }> {
-    const q = normalizeRequiredQuery(query);
-    const network = await this.resolveNetwork(networkId);
-    await this.assertHistoryReady(network.networkId);
-
-    if (/^\d+$/u.test(q)) {
-      return { matches: await this.searchBlockHeight(network, Number(q)) };
+  private async assertHistoryReady(): Promise<void> {
+    if (!(await this.configs.canReadDogecoinHistory())) {
+      throw new TooEarlyError('dogecoin history index is not ready');
     }
-
-    return { matches: await this.searchNonNumeric(actor, network, q) };
   }
 
-  private async searchBlockHeight(
-    network: ExplorerNetworkRef,
-    blockHeight: number,
-  ): Promise<ExplorerSearchResult[]> {
-    const block = await this.getBlockByHeight(network.networkId, network.id, blockHeight);
-    return block ? [blockSearchResult(block)] : [];
+  private async listAppliedBlocks(
+    offset?: number,
+    limit?: number,
+  ): Promise<{ blocks: ExplorerBlockSummary[] }> {
+    const refs = await this.warehouse.listAppliedBlocks(offset, limit ?? 20);
+    const blocks = await Promise.all(
+      refs.map(async (ref) => this.getBlockByHeight(ref.blockHeight)),
+    );
+
+    return { blocks: blocks.filter((block): block is ExplorerBlockSummary => Boolean(block)) };
   }
 
-  private async searchNonNumeric(
-    actor: AuthenticatedApiKey,
-    network: ExplorerNetworkRef,
-    q: string,
-  ): Promise<ExplorerSearchResult[]> {
-    const txMatch = await this.searchTransaction(network, q);
-    const blockMatch = await this.searchBlockHash(network, q);
-    const addressMatch = await this.searchAddress(actor, network, q);
-    return [txMatch, blockMatch, addressMatch].filter(isExplorerSearchResult);
-  }
-
-  private async searchTransaction(
-    network: ExplorerNetworkRef,
-    q: string,
-  ): Promise<ExplorerSearchResult | null> {
-    const txRef = await this.warehouse.getTransactionRef(network.networkId, q);
+  private async searchTransaction(q: string): Promise<ExplorerSearchResult | null> {
+    const txRef = await this.warehouse.getTransactionRef(q);
     if (!txRef) {
       return null;
     }
 
     return {
       type: 'transaction',
-      network: network.id,
       txid: q,
       blockHeight: txRef.blockHeight,
       blockHash: txRef.blockHash,
@@ -229,116 +278,35 @@ export class ExplorerQueryService {
     };
   }
 
-  private async searchBlockHash(
-    network: ExplorerNetworkRef,
-    q: string,
-  ): Promise<ExplorerSearchResult | null> {
-    const blockRef = await this.warehouse.getAppliedBlockByHash(network.networkId, q);
+  private async searchBlockHash(q: string): Promise<ExplorerSearchResult | null> {
+    const blockRef = await this.warehouse.getAppliedBlockByHash(q);
     if (!blockRef) {
       return null;
     }
 
-    return this.searchResultForBlockHeight(network, blockRef.blockHeight);
+    const block = await this.getBlockByHeight(blockRef.blockHeight);
+    return block ? blockSearchResult(block) : null;
   }
 
-  private async searchResultForBlockHeight(
-    network: ExplorerNetworkRef,
-    blockHeight: number,
-  ): Promise<ExplorerSearchResult | null> {
-    const block = await this.getBlockByHeight(network.networkId, network.id, blockHeight);
-    return blockSearchResultOrNull(block);
-  }
-
-  private async searchAddress(
-    actor: AuthenticatedApiKey,
-    network: ExplorerNetworkRef,
-    q: string,
-  ): Promise<ExplorerSearchResult | null> {
-    const [summary, labelMap] = await Promise.all([
-      this.warehouse.getAddressSummary(network.networkId, q),
-      this.buildLabelMap(actor, network.networkId, [q]),
-    ]);
-
-    return addressSearchResult(network.id, q, summary, labelMap.get(q));
-  }
-
-  public async listBlocks(
-    networkId?: string,
-    offset?: number,
-    limit?: number,
-  ): Promise<{
-    blocks: ExplorerBlockSummary[];
-  }> {
-    const network = await this.resolveNetwork(networkId);
-    const syncTail = await this.configNumberOrDefault(
-      configKeyIndexerSyncTail(network.networkId),
-      -1,
-    );
-    if (syncTail < 0) {
-      return this.listAppliedBlocks(network, offset, limit);
-    }
-
-    const heights = descendingBlockHeights(syncTail, offset ?? 0, limit ?? 20);
-    const blocks = await Promise.all(
-      heights.map(async (height) => this.getBlockByHeight(network.networkId, network.id, height)),
-    );
-
-    return {
-      blocks: blocks.filter((block): block is ExplorerBlockSummary => Boolean(block)),
-    };
-  }
-
-  private async listAppliedBlocks(
-    network: ExplorerNetworkRef,
-    offset?: number,
-    limit?: number,
-  ): Promise<{ blocks: ExplorerBlockSummary[] }> {
-    const refs = await this.warehouse.listAppliedBlocks(network.networkId, offset, limit ?? 20);
-    const blocks = await Promise.all(
-      refs.map(async (ref) =>
-        this.getBlockByHeight(network.networkId, network.id, ref.blockHeight),
-      ),
-    );
-
-    return {
-      blocks: blocks.filter((block): block is ExplorerBlockSummary => Boolean(block)),
-    };
-  }
-
-  public async listMempool(
-    networkId?: string,
-    offset?: number,
-    limit?: number,
-  ): Promise<ExplorerMempoolResponse> {
-    const network = await this.resolveNetwork(networkId);
-    const page = mempoolPage(offset, limit);
-    const snapshot = await this.getCachedMempoolSnapshot(network);
-    const transactions = snapshot.transactions.slice(page.offset, page.offset + page.limit);
-
-    return {
-      ...snapshot,
-      network: network.id,
-      offset: page.offset,
-      limit: page.limit,
-      returnedCount: transactions.length,
-      transactions,
-    };
+  private async searchAddress(q: string): Promise<ExplorerSearchResult | null> {
+    const summary = await this.warehouse.getAddressSummary(q);
+    return addressSearchResult(q, summary);
   }
 
   private async getCachedMempoolSnapshot(
-    network: ExplorerNetworkRef,
+    dogecoin: ExplorerDogecoinRef,
   ): Promise<CachedMempoolSnapshot> {
     const now = Date.now();
-    const cached = this.mempoolSnapshots.get(network.networkId);
+    const cached = this.mempoolSnapshots.get('dogecoin');
     if (isFreshMempoolCacheEntry(cached, now)) {
       return cached.promise;
     }
 
-    const promise = this.loadMempoolSnapshot(network).catch((error) => {
-      this.deleteMempoolSnapshotIfCurrent(network, promise);
+    const promise = this.loadMempoolSnapshot(dogecoin).catch((error) => {
+      this.deleteMempoolSnapshotIfCurrent(promise);
       throw error;
     });
-    this.mempoolSnapshots.set(network.networkId, {
+    this.mempoolSnapshots.set('dogecoin', {
       expiresAtMs: now + mempoolCacheTtlMs,
       promise,
     });
@@ -346,18 +314,15 @@ export class ExplorerQueryService {
     return promise;
   }
 
-  private deleteMempoolSnapshotIfCurrent(
-    network: ExplorerNetworkRef,
-    promise: Promise<CachedMempoolSnapshot>,
-  ): void {
-    const cached = this.mempoolSnapshots.get(network.networkId);
+  private deleteMempoolSnapshotIfCurrent(promise: Promise<CachedMempoolSnapshot>): void {
+    const cached = this.mempoolSnapshots.get('dogecoin');
     if (isCurrentMempoolPromise(cached, promise)) {
-      this.mempoolSnapshots.delete(network.networkId);
+      this.mempoolSnapshots.delete('dogecoin');
     }
   }
 
-  private async loadMempoolSnapshot(network: ExplorerNetworkRef): Promise<CachedMempoolSnapshot> {
-    const snapshot = await this.mempoolRpc.getMempoolSnapshot(network);
+  private async loadMempoolSnapshot(dogecoin: ExplorerDogecoinRef): Promise<CachedMempoolSnapshot> {
+    const snapshot = await this.mempoolRpc.getMempoolSnapshot(dogecoin);
     const transactions = Object.entries(snapshot.entries)
       .map(([txid, entry]) => this.serializeMempoolTransaction(txid, entry))
       .sort(compareMempoolTransactions);
@@ -415,75 +380,8 @@ export class ExplorerQueryService {
     };
   }
 
-  public async getBlock(
-    ref: string,
-    networkId?: string,
-  ): Promise<{
-    block: ExplorerBlockSummary;
-    transactions: ExplorerTransactionSummary[];
-  }> {
-    const network = await this.resolveNetwork(networkId);
-    await this.assertHistoryReady(network.networkId);
-    const parsed = await this.resolveBlockSnapshot(network.networkId, ref);
-    const inputMap = await this.loadResolvedInputs(network.networkId, parsed.tx);
-
-    return {
-      block: this.serializeBlock(network.id, parsed),
-      transactions: parsed.tx.map((transaction, txIndex) =>
-        this.serializeTransactionSummary(network.id, parsed, transaction, txIndex, inputMap),
-      ),
-    };
-  }
-
-  public async getTransaction(
-    actor: AuthenticatedApiKey,
-    txid: string,
-    networkId?: string,
-  ): Promise<ExplorerTransactionDetail> {
-    const normalizedTxid = txid.trim();
-    const network = await this.resolveNetwork(networkId);
-    await this.assertHistoryReady(network.networkId);
-    const txRef = await this.requireTransactionRef(network.networkId, normalizedTxid);
-    const block = await this.loadBlockSnapshot(network.networkId, txRef.blockHeight);
-    const transaction = this.requireTransaction(block, normalizedTxid);
-    const inputMap = await this.loadResolvedInputs(network.networkId, [transaction]);
-    const summary = this.serializeTransactionSummary(
-      network.id,
-      block,
-      transaction,
-      txRef.txIndex,
-      inputMap,
-    );
-    const outputs = this.readOutputs(transaction.vout);
-    const outputKeys = outputs.map((_output, index) => `${normalizedTxid}:${index}`);
-    const currentOutputs = await this.warehouse.getUtxoOutputs(network.networkId, outputKeys);
-    const addresses = new Set<string>();
-    const inputs = this.serializeTransactionInputs(transaction, inputMap, addresses);
-    const serializedOutputs = this.serializeTransactionOutputs(
-      normalizedTxid,
-      outputs,
-      currentOutputs,
-      addresses,
-    );
-
-    const labelMap = await this.buildLabelMap(actor, network.networkId, [...addresses]);
-    const labeled = withTransactionLabels(inputs, serializedOutputs, labelMap);
-
-    const transfers = this.projectTransfers(summary, labeled.inputs, labeled.outputs);
-
-    return {
-      transaction: summary,
-      inputs: labeled.inputs,
-      outputs: labeled.outputs,
-      transfers,
-      overlay: {
-        labels: [...new Map([...labelMap.values()].map((label) => [label.entity, label])).values()],
-      },
-    };
-  }
-
-  private async requireTransactionRef(networkId: PrimaryId, txid: string) {
-    const txRef = await this.warehouse.getTransactionRef(networkId, txid);
+  private async requireTransactionRef(txid: string) {
+    const txRef = await this.warehouse.getTransactionRef(txid);
     if (!txRef) {
       throw new NotFoundError('transaction not found');
     }
@@ -519,14 +417,6 @@ export class ExplorerQueryService {
       return [];
     }
 
-    return this.resolvedTransactionInput(input, inputMap, addresses);
-  }
-
-  private resolvedTransactionInput(
-    input: DogecoinVin,
-    inputMap: Map<string, ProjectionUtxoOutput>,
-    addresses: Set<string>,
-  ): ExplorerTransactionInput[] {
     const outputKey = `${this.requireString(input.txid, 'vin.txid')}:${this.requireNumber(input.vout, 'vin.vout')}`;
     const resolved = inputMap.get(outputKey);
     if (!hasResolvedAddress(resolved)) {
@@ -580,72 +470,7 @@ export class ExplorerQueryService {
     };
   }
 
-  public async getAddress(
-    actor: AuthenticatedApiKey,
-    address: string,
-    networkId?: string,
-  ): Promise<ExplorerAddressDetail> {
-    const normalizedAddress = address.trim();
-    if (!normalizedAddress) {
-      throw new ValidationError('missing input params');
-    }
-
-    const network = await this.resolveNetwork(networkId);
-    const [summary, overlay, labeledRecord] = await Promise.all([
-      this.warehouse.getAddressSummary(network.networkId, normalizedAddress),
-      this.buildAddressOverlay(actor, network.networkId, normalizedAddress),
-      this.findLabeledAddress(actor, network.networkId, normalizedAddress),
-    ]);
-
-    assertAddressExists(summary, labeledRecord);
-
-    return {
-      address: addressDetail(network.id, normalizedAddress, summary),
-      overlay,
-    };
-  }
-
-  private async findLabeledAddress(
-    actor: AuthenticatedApiKey,
-    networkId: PrimaryId,
-    address: string,
-  ) {
-    return (await this.metadata.listAddressesByValues([address])).find(
-      (candidate) => candidate.networkId === networkId && canReadOwner(candidate, actor),
-    );
-  }
-
-  public async listAddressTransactions(
-    address: string,
-    networkId?: string,
-    offset?: number,
-    limit?: number,
-  ): Promise<{
-    transactions: ExplorerAddressTransactionSummary[];
-  }> {
-    const normalizedAddress = requireExplorerAddress(address);
-
-    const network = await this.resolveNetwork(networkId);
-    await this.assertHistoryReady(network.networkId);
-    const rows = await this.warehouse.listAddressTransactions(
-      network.networkId,
-      normalizedAddress,
-      offset,
-      defaultAddressPageLimit(limit),
-    );
-    const snapshotsByHeight = await this.loadSnapshotsByHeight(network.networkId, [
-      ...new Set(rows.map((row) => row.blockHeight)),
-    ]);
-
-    return {
-      transactions: rows
-        .flatMap((row) => this.addressTransactionSummary(network.id, row, snapshotsByHeight))
-        .sort(compareAddressTransactionSummaries),
-    };
-  }
-
   private addressTransactionSummary(
-    networkId: string,
     row: {
       blockHeight: number;
       receivedBase: string;
@@ -659,18 +484,6 @@ export class ExplorerQueryService {
       return [];
     }
 
-    return this.addressTransactionSummaryForBlock(networkId, row, block);
-  }
-
-  private addressTransactionSummaryForBlock(
-    networkId: string,
-    row: {
-      receivedBase: string;
-      sentBase: string;
-      txid: string;
-    },
-    block: ParsedDogecoinBlock,
-  ): ExplorerAddressTransactionSummary[] {
     const txIndex = block.tx.findIndex((candidate) => this.readString(candidate.txid) === row.txid);
     if (txIndex < 0) {
       return [];
@@ -679,7 +492,6 @@ export class ExplorerQueryService {
     return [
       {
         transaction: this.serializeTransactionSummary(
-          networkId,
           block,
           requireDogecoinTransactionAt(block, txIndex),
           txIndex,
@@ -690,111 +502,31 @@ export class ExplorerQueryService {
     ];
   }
 
-  public async listAddressUtxos(
-    address: string,
-    networkId?: string,
-    offset?: number,
-    limit?: number,
-  ): Promise<{
-    utxos: ExplorerAddressUtxo[];
-  }> {
-    const normalizedAddress = requireExplorerAddress(address);
-
-    const network = await this.resolveNetwork(networkId);
-    const utxos = await this.warehouse.listAddressUtxos(
-      network.networkId,
-      normalizedAddress,
-      offset,
-      defaultAddressPageLimit(limit),
-    );
-
-    return {
-      utxos: utxos.map((utxo) => ({
-        network: network.id,
-        address: utxo.address,
-        blockHash: utxo.blockHash,
-        blockHeight: utxo.blockHeight,
-        blockTime: utxo.blockTime,
-        outputKey: utxo.outputKey,
-        scriptType: utxo.scriptType,
-        spentByTxid: utxo.spentByTxid,
-        spentInBlock: utxo.spentInBlock,
-        txid: utxo.txid,
-        txIndex: utxo.txIndex,
-        valueBase: utxo.valueBase,
-        vout: utxo.vout,
-      })),
-    };
-  }
-
-  private async resolveNetwork(networkId?: string): Promise<ExplorerNetworkRef> {
-    const activeNetworks = (await this.networks.listActiveNetworks()).filter(
-      (network) => network.architecture === 'dogecoin',
-    );
-
-    if (networkId) {
-      return explorerNetworkRef(requireExplorerNetwork(activeNetworks, networkId));
-    }
-
-    return explorerNetworkRef(requireDefaultExplorerNetwork(activeNetworks));
-  }
-
-  private async assertHistoryReady(networkId: PrimaryId): Promise<void> {
-    if (!(await this.configs.canReadDogecoinHistory(networkId))) {
-      throw new TooEarlyError('dogecoin history index is not ready');
-    }
-  }
-
-  private async resolveBlockSnapshot(
-    networkId: PrimaryId,
-    ref: string,
-  ): Promise<ParsedDogecoinBlock> {
+  private async resolveBlockSnapshot(ref: string): Promise<ParsedDogecoinBlock> {
     const normalized = ref.trim();
     if (/^\d+$/u.test(normalized)) {
-      return this.loadBlockSnapshot(networkId, Number(normalized));
+      return this.loadBlockSnapshot(Number(normalized));
     }
 
-    return this.resolveBlockHashSnapshot(networkId, normalized);
-  }
-
-  private async resolveBlockHashSnapshot(
-    networkId: PrimaryId,
-    blockHash: string,
-  ): Promise<ParsedDogecoinBlock> {
-    const blockRef = await this.warehouse.getAppliedBlockByHash(networkId, blockHash);
+    const blockRef = await this.warehouse.getAppliedBlockByHash(normalized);
     if (!blockRef) {
       throw new NotFoundError('block not found');
     }
 
-    return this.loadBlockSnapshot(networkId, blockRef.blockHeight);
+    return this.loadBlockSnapshot(blockRef.blockHeight);
   }
 
-  private async getBlockByHeight(
-    networkId: PrimaryId,
-    externalNetworkId: string,
-    blockHeight: number,
-  ): Promise<ExplorerBlockSummary | null> {
-    const snapshot = await this.rawBlocks.getPart<Record<string, unknown>>(
-      networkId,
-      blockHeight,
-      'block',
-    );
+  private async getBlockByHeight(blockHeight: number): Promise<ExplorerBlockSummary | null> {
+    const snapshot = await this.rawBlocks.getPart<Record<string, unknown>>(blockHeight, 'block');
     if (!snapshot) {
       return null;
     }
 
-    return this.serializeBlock(externalNetworkId, this.parseBlock(snapshot));
+    return this.serializeBlock(this.parseBlock(snapshot));
   }
 
-  private async loadBlockSnapshot(
-    networkId: PrimaryId,
-    blockHeight: number,
-  ): Promise<ParsedDogecoinBlock> {
-    const snapshot = await this.rawBlocks.getPart<Record<string, unknown>>(
-      networkId,
-      blockHeight,
-      'block',
-    );
+  private async loadBlockSnapshot(blockHeight: number): Promise<ParsedDogecoinBlock> {
+    const snapshot = await this.rawBlocks.getPart<Record<string, unknown>>(blockHeight, 'block');
     if (!snapshot) {
       throw new NotFoundError('block not found');
     }
@@ -803,16 +535,12 @@ export class ExplorerQueryService {
   }
 
   private async loadSnapshotsByHeight(
-    networkId: PrimaryId,
     heights: number[],
   ): Promise<Map<number, ParsedDogecoinBlock>> {
     const snapshots = await Promise.all(
       heights.map(
         async (height) =>
-          [
-            height,
-            await this.rawBlocks.getPart<Record<string, unknown>>(networkId, height, 'block'),
-          ] as const,
+          [height, await this.rawBlocks.getPart<Record<string, unknown>>(height, 'block')] as const,
       ),
     );
 
@@ -823,9 +551,8 @@ export class ExplorerQueryService {
     );
   }
 
-  private serializeBlock(network: string, block: ParsedDogecoinBlock): ExplorerBlockSummary {
+  private serializeBlock(block: ParsedDogecoinBlock): ExplorerBlockSummary {
     return {
-      network,
       hash: block.hash,
       height: block.height,
       time: block.time,
@@ -834,7 +561,6 @@ export class ExplorerQueryService {
   }
 
   private async loadResolvedInputs(
-    networkId: PrimaryId,
     transactions: DogecoinTransaction[],
   ): Promise<Map<string, ProjectionUtxoOutput>> {
     const outputKeys = [
@@ -850,11 +576,10 @@ export class ExplorerQueryService {
       ),
     ];
 
-    return this.warehouse.getUtxoOutputs(networkId, outputKeys);
+    return this.warehouse.getUtxoOutputs(outputKeys);
   }
 
   private serializeTransactionSummary(
-    network: string,
     block: ParsedDogecoinBlock,
     transaction: DogecoinTransaction,
     txIndex: number,
@@ -868,7 +593,6 @@ export class ExplorerQueryService {
     const totalOutput = this.totalOutputBase(outputs);
 
     return {
-      network,
       txid,
       txIndex,
       blockHeight: block.height,
@@ -903,13 +627,6 @@ export class ExplorerQueryService {
       return 0n;
     }
 
-    return this.resolvedNonCoinbaseInputValue(input, resolvedInputs);
-  }
-
-  private resolvedNonCoinbaseInputValue(
-    input: DogecoinVin,
-    resolvedInputs?: Map<string, ProjectionUtxoOutput>,
-  ): bigint {
     const outputKey = `${this.requireString(input.txid, 'vin.txid')}:${this.requireNumber(input.vout, 'vin.vout')}`;
     const resolved = resolvedInputs?.get(outputKey);
     return resolvedInputAmount(resolved);
@@ -920,89 +637,6 @@ export class ExplorerQueryService {
       (sum, output) => sum + parseAmountBase(this.requireAmountBase(output.value)),
       0n,
     );
-  }
-
-  private projectTransfers(
-    summary: ExplorerTransactionSummary,
-    inputs: ExplorerTransactionInput[],
-    outputs: ExplorerTransactionOutput[],
-  ): ExplorerProjectedTransfer[] {
-    const basis = buildExplorerTransferBasis(summary, inputs, outputs);
-    if (!basis) {
-      return [];
-    }
-
-    return projectExplorerTransfers(outputs, basis);
-  }
-
-  private async buildLabelMap(
-    actor: AuthenticatedApiKey,
-    networkId: PrimaryId,
-    addresses: string[],
-  ): Promise<Map<string, ExplorerLabelRef>> {
-    const addressRecords = (
-      await this.metadata.listAddressesByValues([...new Set(addresses)])
-    ).filter((address) => isReadableNetworkAddress(address, actor, networkId));
-    if (addressRecords.length === 0) {
-      return new Map();
-    }
-
-    const entityIds = [...new Set(addressRecords.map((address) => address.entityId))];
-    const [entities, joinedTags] = await Promise.all([
-      this.metadata.listEntitiesByIds(entityIds),
-      this.metadata.listTagsByEntityIds(entityIds),
-    ]);
-    const entityById = new Map(entities.map((entity) => [entity.entityId, entity]));
-    const tagsByEntityId = tagsByExplorerEntityId(joinedTags);
-
-    return new Map(
-      addressRecords.flatMap((record) => explorerLabelMapEntry(record, entityById, tagsByEntityId)),
-    );
-  }
-
-  private async buildAddressOverlay(
-    actor: AuthenticatedApiKey,
-    networkId: PrimaryId,
-    address: string,
-  ): Promise<InfoResponse> {
-    const balances = (await this.warehouse.getBalancesByAddresses([address])).filter(
-      (balance) => balance.networkId === networkId,
-    );
-    const links = (await this.warehouse.getDistinctLinksByAddresses([address])).filter(
-      (link) => link.networkId === networkId,
-    );
-    const addressRecords = (
-      await this.metadata.listAddressesByValues([
-        ...new Set([address, ...links.map((link) => link.fromAddress)]),
-      ])
-    ).filter((candidate) => candidate.networkId === networkId && canReadOwner(candidate, actor));
-    const entityIds = [...new Set(addressRecords.map((candidate) => candidate.entityId))];
-    const [entities, joinedTags, networks] = await Promise.all([
-      this.metadata
-        .listEntitiesByIds(entityIds)
-        .then((records) => records.filter((record) => canReadOwner(record, actor))),
-      this.metadata.listTagsByEntityIds(entityIds),
-      this.metadata.listNetworksByInternalIds(
-        addressRecords.map((candidate) => candidate.networkId),
-      ),
-    ]);
-
-    const tokens = (
-      await this.warehouse.getTokensByAddresses(
-        balances.map((balance) => balance.assetAddress).filter(Boolean),
-      )
-    ).filter((token) => token.networkId === networkId);
-
-    return buildInfoResponse({
-      addresses: [address],
-      addressRecords,
-      balances,
-      entities,
-      joinedTags,
-      links,
-      networks,
-      tokens,
-    });
   }
 
   private parseBlock(snapshot: Record<string, unknown>): ParsedDogecoinBlock {
@@ -1028,15 +662,9 @@ export class ExplorerQueryService {
       throw new ValidationError('missing output value');
     }
 
-    return this.definedAmountBase(value);
-  }
-
-  private definedAmountBase(value: number | string): string {
-    if (typeof value === 'number') {
-      return decimalPartsToBase(value.toFixed(8).split('.'));
-    }
-
-    return stringDecimalToBase(value);
+    return typeof value === 'number'
+      ? decimalPartsToBase(value.toFixed(8).split('.'))
+      : stringDecimalToBase(value);
   }
 
   private requireNumber(value: number | undefined, field: string): number {
@@ -1074,7 +702,7 @@ export class ExplorerQueryService {
 }
 
 function normalizeRequiredQuery(query: string | undefined): string {
-  const q = trimOptionalString(query);
+  const q = query?.trim() ?? '';
   if (!q) {
     throw new ValidationError('missing input params');
   }
@@ -1096,26 +724,19 @@ function descendingBlockHeights(tail: number, offset: number, limit: number): nu
   return Array.from({ length: count }, (_value, index) => start - index);
 }
 
-function trimOptionalString(value: string | undefined): string {
-  if (!value) {
-    return '';
-  }
-
-  return value.trim();
-}
-
 function isExplorerSearchResult(
   result: ExplorerSearchResult | null,
 ): result is ExplorerSearchResult {
   return result !== null;
 }
 
-function blockSearchResultOrNull(block: ExplorerBlockSummary | null): ExplorerSearchResult | null {
-  if (!block) {
-    return null;
-  }
-
-  return blockSearchResult(block);
+function blockSearchResult(block: ExplorerBlockSummary): ExplorerSearchResult {
+  return {
+    type: 'block',
+    blockHeight: block.height,
+    blockHash: block.hash,
+    blockTime: block.time,
+  };
 }
 
 function mempoolPage(
@@ -1123,17 +744,9 @@ function mempoolPage(
   limit: number | undefined,
 ): { limit: number; offset: number } {
   return {
-    offset: optionalOffset(offset),
-    limit: Math.min(optionalMempoolLimit(limit), maxMempoolLimit),
+    offset: offset ?? 0,
+    limit: Math.min(limit ?? defaultMempoolLimit, maxMempoolLimit),
   };
-}
-
-function optionalOffset(offset: number | undefined): number {
-  return offset ?? 0;
-}
-
-function optionalMempoolLimit(limit: number | undefined): number {
-  return limit ?? defaultMempoolLimit;
 }
 
 function defaultAddressPageLimit(limit: number | undefined): number {
@@ -1153,40 +766,24 @@ function isFreshMempoolCacheEntry(
   cached: MempoolCacheEntry | undefined,
   now: number,
 ): cached is MempoolCacheEntry {
-  if (!cached) {
-    return false;
-  }
-
-  return cached.expiresAtMs > now;
+  return cached !== undefined && cached.expiresAtMs > now;
 }
 
 function isCurrentMempoolPromise(
   cached: MempoolCacheEntry | undefined,
   promise: Promise<CachedMempoolSnapshot>,
 ): cached is MempoolCacheEntry {
-  if (!cached) {
-    return false;
-  }
-
-  return cached.promise === promise;
+  return cached !== undefined && cached.promise === promise;
 }
 
 function hasResolvedAddress(
   resolved: ProjectionUtxoOutput | undefined,
 ): resolved is ProjectionUtxoOutput & { address: string } {
-  if (!resolved) {
-    return false;
-  }
-
-  return resolved.address !== '';
+  return resolved !== undefined && resolved.address !== '';
 }
 
 function resolvedInputAmount(resolved: ProjectionUtxoOutput | undefined): bigint {
-  if (!resolved) {
-    return 0n;
-  }
-
-  return parseAmountBase(resolved.valueBase);
+  return resolved ? parseAmountBase(resolved.valueBase) : 0n;
 }
 
 function compareAddressTransactionSummaries(
@@ -1216,154 +813,12 @@ function requireDogecoinTransactionAt(
   return transaction;
 }
 
-function isReadableNetworkAddress(
-  address: { networkId: PrimaryId; ownerApiKeyId: PrimaryId },
-  actor: AuthenticatedApiKey,
-  networkId: PrimaryId,
-): boolean {
-  return [address.networkId === networkId, canReadOwner(address, actor)].every(Boolean);
-}
-
-function tagsByExplorerEntityId(
-  joinedTags: Array<{ entityId: PrimaryId; id: string; riskLevel: RiskLevel }>,
-): Map<PrimaryId, Array<{ id: string; riskLevel: RiskLevel }>> {
-  const tagsByEntityId = new Map<PrimaryId, Array<{ id: string; riskLevel: RiskLevel }>>();
-  for (const tag of joinedTags) {
-    addExplorerTag(tagsByEntityId, tag);
-  }
-
-  return tagsByEntityId;
-}
-
-function addExplorerTag(
-  tagsByEntityId: Map<PrimaryId, Array<{ id: string; riskLevel: RiskLevel }>>,
-  tag: { entityId: PrimaryId; id: string; riskLevel: RiskLevel },
-): void {
-  const current = tagsByEntityId.get(tag.entityId);
-  if (current) {
-    current.push({ id: tag.id, riskLevel: tag.riskLevel });
-    return;
-  }
-
-  tagsByEntityId.set(tag.entityId, [{ id: tag.id, riskLevel: tag.riskLevel }]);
-}
-
-function explorerLabelMapEntry(
-  record: { address: string; entityId: PrimaryId },
-  entityById: Map<PrimaryId, { id: string; name: string | null }>,
-  tagsByEntityId: Map<PrimaryId, Array<{ id: string; riskLevel: RiskLevel }>>,
-): Array<readonly [string, ExplorerLabelRef]> {
-  const entity = entityById.get(record.entityId);
-  if (!entity) {
-    return [];
-  }
-
-  return [
-    [record.address, explorerLabelRef(entity, tagsForEntity(tagsByEntityId, record.entityId))],
-  ];
-}
-
-function tagsForEntity(
-  tagsByEntityId: Map<PrimaryId, Array<{ id: string; riskLevel: RiskLevel }>>,
-  entityId: PrimaryId,
-): Array<{ id: string; riskLevel: RiskLevel }> {
-  const tags = tagsByEntityId.get(entityId);
-  if (!tags) {
-    return [];
-  }
-
-  return tags;
-}
-
-function explorerLabelRef(
-  entity: { id: string; name: string | null },
-  tags: Array<{ id: string; riskLevel: RiskLevel }>,
-): ExplorerLabelRef {
-  return {
-    entity: entity.id,
-    name: entity.name,
-    tags: tags.map((tag) => tag.id),
-    riskLevel: tags.some((tag) => tag.riskLevel === 'high') ? 'high' : 'low',
-  };
-}
-
-function blockSearchResult(block: ExplorerBlockSummary): ExplorerSearchResult {
-  return {
-    type: 'block',
-    network: block.network,
-    blockHeight: block.height,
-    blockHash: block.hash,
-    blockTime: block.time,
-  };
-}
-
-function requireExplorerNetwork(
-  networks: Array<ExplorerNetworkRef & { architecture?: string }>,
-  networkId: string,
-): ExplorerNetworkRef {
-  const network = networks.find((candidate) => candidate.id === networkId);
-  if (!network) {
-    throw new ValidationError(`invalid parameter for \`network\`: ${networkId}`);
-  }
-
-  return network;
-}
-
-function requireDefaultExplorerNetwork(
-  networks: Array<ExplorerNetworkRef & { architecture?: string }>,
-): ExplorerNetworkRef {
-  assertExplorerNetworkExists(networks);
-  assertSingleExplorerNetwork(networks);
-  return networks[0] as ExplorerNetworkRef;
-}
-
-function assertExplorerNetworkExists(
-  networks: Array<ExplorerNetworkRef & { architecture?: string }>,
-): void {
-  if (networks.length === 0) {
-    throw new NotFoundError('dogecoin network not found');
-  }
-}
-
-function assertSingleExplorerNetwork(
-  networks: Array<ExplorerNetworkRef & { architecture?: string }>,
-): void {
-  if (networks.length > 1) {
-    throw new ValidationError('missing parameter for `network`');
-  }
-}
-
-function explorerNetworkRef(network: ExplorerNetworkRef): ExplorerNetworkRef {
-  return {
-    architecture: network.architecture,
-    id: network.id,
-    name: network.name,
-    networkId: network.networkId,
-    rpcEndpoint: network.rpcEndpoint,
-    rps: network.rps,
-  };
-}
-
-function assertAddressExists(
-  summary: WarehouseAddressSummary | null,
-  labeledRecord: unknown,
-): void {
-  if (hasAddressEvidence(summary, labeledRecord)) {
+function assertAddressExists(summary: unknown): void {
+  if (summary) {
     return;
   }
 
   throw new NotFoundError('address not found');
-}
-
-function hasAddressEvidence(
-  summary: WarehouseAddressSummary | null,
-  labeledRecord: unknown,
-): boolean {
-  return [Boolean(summary), Boolean(labeledRecord)].includes(true);
-}
-
-function canReadOwner(record: { ownerApiKeyId: PrimaryId }, actor: AuthenticatedApiKey): boolean {
-  return [actor.role === 'admin', record.ownerApiKeyId === actor.apiKeyId].includes(true);
 }
 
 function transactionFeeBase(
@@ -1371,15 +826,7 @@ function transactionFeeBase(
   totalInput: bigint,
   totalOutput: bigint,
 ): string | null {
-  if (isCoinbase) {
-    return null;
-  }
-
-  return nonCoinbaseTransactionFeeBase(totalInput, totalOutput);
-}
-
-function nonCoinbaseTransactionFeeBase(totalInput: bigint, totalOutput: bigint): string | null {
-  if (totalInput === 0n) {
+  if (isCoinbase || totalInput === 0n) {
     return null;
   }
 
@@ -1398,40 +845,17 @@ function decimalPartsToBase(parts: string[]): string {
 }
 
 function assertDecimalParts(raw: string, whole: string, fraction: string): void {
-  assertDecimalWholePart(raw, whole);
-  assertDecimalFractionPart(raw, fraction);
-}
-
-function assertDecimalWholePart(raw: string, whole: string): void {
-  if (!/^\d+$/u.test(whole)) {
-    throw new ValidationError(`invalid decimal amount: ${raw}`);
-  }
-}
-
-function assertDecimalFractionPart(raw: string, fraction: string): void {
-  if (!/^\d*$/u.test(fraction)) {
+  if (!/^\d+$/u.test(whole) || !/^\d*$/u.test(fraction)) {
     throw new ValidationError(`invalid decimal amount: ${raw}`);
   }
 }
 
 function isNonNegativeInteger(value: number | undefined): value is number {
-  if (value === undefined) {
-    return false;
-  }
-
-  return isNonNegativeIntegerValue(value);
-}
-
-function isNonNegativeIntegerValue(value: number): boolean {
-  return [Number.isInteger(value), value >= 0].every(Boolean);
+  return value !== undefined && Number.isInteger(value) && value >= 0;
 }
 
 function invalidNumberValue(value: number | undefined): string {
-  if (value === undefined) {
-    return '';
-  }
-
-  return String(value);
+  return value === undefined ? '' : String(value);
 }
 
 function compareMempoolTransactions(
@@ -1449,19 +873,7 @@ function mempoolTime(transaction: ExplorerMempoolTransaction): number {
 }
 
 function readNonNegativeInteger(value: unknown): number | null {
-  if (typeof value !== 'number') {
-    return null;
-  }
-
-  return nonNegativeIntegerOrNull(value);
-}
-
-function nonNegativeIntegerOrNull(value: number): number | null {
-  if (!isNonNegativeIntegerValue(value)) {
-    return null;
-  }
-
-  return value;
+  return typeof value === 'number' && Number.isInteger(value) && value >= 0 ? value : null;
 }
 
 function readOptionalRecord(value: unknown): Record<string, unknown> | null {
@@ -1473,12 +885,7 @@ function readOptionalRecord(value: unknown): Record<string, unknown> | null {
 }
 
 function readMempoolSizeBytes(entry: Record<string, unknown>): number | null {
-  const size = readNonNegativeInteger(entry.size);
-  if (size !== null) {
-    return size;
-  }
-
-  return readNonNegativeInteger(entry.vsize);
+  return readNonNegativeInteger(entry.size) ?? readNonNegativeInteger(entry.vsize);
 }
 
 function readMempoolAmount(
@@ -1500,35 +907,19 @@ function readMempoolAmountValue(
     return entry[entryKey];
   }
 
-  return readMempoolFeeValue(fees, feeKey);
-}
-
-function readMempoolFeeValue(fees: Record<string, unknown> | null, feeKey: string): unknown {
-  if (!fees) {
-    return undefined;
-  }
-
-  return fees[feeKey];
+  return fees?.[feeKey];
 }
 
 function readDecimalAmountBase(value: unknown): string | null {
-  if (!isDecimalAmountInput(value)) {
+  if (typeof value !== 'number' && typeof value !== 'string') {
     return null;
   }
 
-  return decimalAmountBaseOrNull(value);
-}
-
-function decimalAmountBaseOrNull(value: number | string): string | null {
   try {
     return fromDecimalUnits(value, 8);
   } catch {
     return null;
   }
-}
-
-function isDecimalAmountInput(value: unknown): value is number | string {
-  return [typeof value === 'number', typeof value === 'string'].includes(true);
 }
 
 function readStringArray(value: unknown): string[] {
@@ -1540,29 +931,13 @@ function readStringArray(value: unknown): string[] {
 }
 
 function feeRateBasePerKilobyte(feeBase: string | null, sizeBytes: number | null): string | null {
-  if (!feeBase) {
-    return null;
-  }
-
-  return feeRateForSizedTransaction(feeBase, sizeBytes);
-}
-
-function feeRateForSizedTransaction(feeBase: string, sizeBytes: number | null): string | null {
-  if (!isPositiveSizeBytes(sizeBytes)) {
+  if (!feeBase || !sizeBytes || sizeBytes <= 0) {
     return null;
   }
 
   return formatAmountBase((parseAmountBase(feeBase) * 1000n) / BigInt(sizeBytes));
 }
 
-function isPositiveSizeBytes(sizeBytes: number | null): sizeBytes is number {
-  if (sizeBytes === null) {
-    return false;
-  }
-
-  return sizeBytes > 0;
-}
-
 function isPlainRecord(value: unknown): value is Record<string, unknown> {
-  return [Object(value) === value, !Array.isArray(value)].every(Boolean);
+  return Boolean(value) && typeof value === 'object' && !Array.isArray(value);
 }

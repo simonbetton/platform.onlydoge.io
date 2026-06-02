@@ -10,13 +10,6 @@ const analyticsQueryBodySchema = t.Object({
     description:
       'Generated SQL. It must be a single SELECT against the curated analytics schema and use OnlyDoge placeholders.',
   }),
-  network: t.Optional(
-    t.String({
-      description:
-        'Network id. Omit when a single Dogecoin network is configured and should be used as the default.',
-      examples: ['net_dogecoin'],
-    }),
-  ),
   from: t.String({
     description: 'Inclusive window start as ISO-8601 or Unix seconds.',
     examples: ['2026-05-30T00:00:00.000Z'],

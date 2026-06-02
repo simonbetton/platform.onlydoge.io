@@ -12,11 +12,8 @@ import {
   type ProductionResponse,
   productionQueryPath,
   readNumberField,
-  readOptionalNumberField,
-  readOptionalStringField,
   readRecordArrayField,
   readRecordField,
-  readStringArrayField,
   readStringField,
   TeardownStack,
   verifyProductionImageDigest,
@@ -32,7 +29,7 @@ if (!config.enabled) {
   });
 } else {
   describe('production e2e', () => {
-    it('validates production API behavior and tears down disposable artifacts', async () => {
+    it('validates production Dogecoin explorer behavior', async () => {
       await runProductionE2E(config);
     }, 180_000);
   });
@@ -41,7 +38,6 @@ if (!config.enabled) {
 async function runProductionE2E(config: EnabledProductionConfig): Promise<void> {
   const client = new ProductionApiClient(config);
   const teardown = new TeardownStack();
-  const created: Partial<CreatedMetadata> = {};
   let ephemeralToken: string | undefined;
 
   try {
@@ -60,44 +56,20 @@ async function runProductionE2E(config: EnabledProductionConfig): Promise<void> 
     });
 
     await expectEphemeralKeyWorks(client, ephemeralToken);
-    const network = await expectProductionState(client, ephemeralToken);
-
-    Object.assign(
-      created,
-      await createDisposableMetadata(client, teardown, ephemeralToken, network),
-    );
-    await expectMetadataReads(client, ephemeralToken, created as CreatedMetadata);
-    await expectCurrentStateExplorerReads(
-      client,
-      ephemeralToken,
-      network,
-      created as CreatedMetadata,
-    );
-    await expectHistoryEndpointContract(
-      client,
-      ephemeralToken,
-      network,
-      created as CreatedMetadata,
-    );
+    await expectRemovedRoutes(client, ephemeralToken);
+    await expectExplorerReads(client, ephemeralToken);
+    await expectExternalParity(client, config, ephemeralToken);
   } finally {
     await teardown.run();
   }
 
-  await expectTeardownComplete(client, config.adminToken, created, ephemeralToken);
+  if (ephemeralToken) {
+    await client.get('/v1/explorer/blocks', {
+      expectedStatus: 401,
+      token: ephemeralToken,
+    });
+  }
 }
-
-type ExplorerNetwork = {
-  blockHeight: number;
-  id: string;
-  name: string;
-};
-
-type CreatedMetadata = {
-  address: string;
-  addressId: string;
-  entityId: string;
-  tagId: string;
-};
 
 async function expectPublicHealth(client: ProductionApiClient): Promise<void> {
   await eventually(
@@ -123,8 +95,8 @@ function expectProductionDigest(config: EnabledProductionConfig): void {
 }
 
 async function expectProtectedAuth(client: ProductionApiClient): Promise<void> {
-  await client.get('/v1/stats/', { expectedStatus: 401 });
-  await client.get('/v1/explorer/networks', { expectedStatus: 401 });
+  await client.get('/v1/explorer/blocks', { expectedStatus: 401 });
+  await client.get('/v1/analytics/schema', { expectedStatus: 401 });
 }
 
 async function createEphemeralKey(
@@ -157,312 +129,223 @@ async function expectEphemeralKeyWorks(
   client: ProductionApiClient,
   ephemeralToken: string,
 ): Promise<void> {
-  await client.get('/v1/stats/', { token: ephemeralToken });
-  await client.get('/v1/explorer/networks', { token: ephemeralToken });
+  await client.get('/v1/explorer/blocks', { token: ephemeralToken });
 }
 
-async function expectProductionState(
-  client: ProductionApiClient,
-  token: string,
-): Promise<ExplorerNetwork> {
-  const stats = assertRecord((await client.get('/v1/stats/', { token })).body, 'stats');
-  const statsNetwork = readRecordArrayField(stats, 'networks').find((candidate) =>
-    readStringField(candidate, 'name').toLowerCase().includes('dogecoin'),
-  );
-  if (!statsNetwork) {
-    throw new Error('Dogecoin network missing from /v1/stats/');
+async function expectRemovedRoutes(client: ProductionApiClient, token: string): Promise<void> {
+  for (const path of [
+    '/v1/networks',
+    '/v1/tokens',
+    '/v1/entities',
+    '/v1/addresses',
+    '/v1/tags',
+    '/v1/info?q=DRemovedRoute',
+    '/v1/stats/',
+    '/v1/explorer/networks',
+  ]) {
+    await client.get(path, { expectedStatus: 404, token });
   }
-
-  expect(readOptionalStringField(statsNetwork, 'stage')).toBe('online');
-  expect(statsNetwork.lastError ?? null).toBeNull();
-  const blockHeight = readNumberField(statsNetwork, 'blockHeight');
-  const processTail = readNumberField(statsNetwork, 'processTail');
-  const onlineTip = readOptionalNumberField(statsNetwork, 'onlineTip') ?? blockHeight;
-  expect(onlineTip - processTail).toBeLessThanOrEqual(12);
-
-  const networks = readRecordArrayField(
-    assertRecord((await client.get('/v1/explorer/networks', { token })).body, 'explorer networks'),
-    'networks',
-  );
-  const network = networks.find((candidate) =>
-    readStringField(candidate, 'name').toLowerCase().includes('dogecoin'),
-  );
-  if (!network) {
-    throw new Error('Dogecoin network missing from /v1/explorer/networks');
-  }
-
-  expect(readNumberField(network, 'blockHeight')).toBeGreaterThan(0);
-  return {
-    blockHeight: readNumberField(network, 'blockHeight'),
-    id: readStringField(network, 'id'),
-    name: readStringField(network, 'name'),
-  };
 }
 
-async function createDisposableMetadata(
-  client: ProductionApiClient,
-  teardown: TeardownStack,
-  token: string,
-  network: ExplorerNetwork,
-): Promise<CreatedMetadata> {
-  const runId = randomRunId();
-  const address = `DOnlyDogeE2E${runId}`;
-  const tag = assertRecord(
-    (
-      await client.post('/v1/tags/', {
-        body: {
-          name: `Production E2E ${runId}`,
-          riskLevel: 'low',
-        },
-        token,
-      })
-    ).body,
-    'created tag',
-  );
-  const tagId = readStringField(tag, 'id');
-  teardown.add('delete E2E tag', () =>
-    ignoreNotFound(async () => {
-      await client.delete('/v1/tags/', {
-        body: { tags: [tagId] },
-        expectedStatus: 204,
-        token,
-      });
-    }),
-  );
-
-  const entityPayload = assertRecord(
-    (
-      await client.post('/v1/entities/', {
-        body: {
-          data: {
-            purpose: 'production-e2e',
-            runId,
-          },
-          description: `Production E2E ${runId}`,
-          name: `Production E2E ${runId}`,
-          tags: [tagId],
-        },
-        token,
-      })
-    ).body,
-    'created entity payload',
-  );
-  const entityId = readStringField(readRecordField(entityPayload, 'entity'), 'id');
-  teardown.add('delete E2E entity', () =>
-    ignoreNotFound(async () => {
-      await client.delete('/v1/entities/', {
-        body: { entities: [entityId] },
-        expectedStatus: 204,
-        token,
-      });
-    }),
-  );
-
-  const addresses = assertRecordArray(
-    (
-      await client.post('/v1/addresses/', {
-        body: {
-          addresses: [
-            {
-              address,
-              data: {
-                purpose: 'production-e2e',
-                runId,
-              },
-              description: `Production E2E ${runId}`,
-            },
-          ],
-          entity: entityId,
-          network: network.id,
-        },
-        token,
-      })
-    ).body,
-    'created addresses',
-  );
-  const addressId = readStringField(addresses[0] ?? {}, 'id');
-  teardown.add('delete E2E address', () =>
-    ignoreNotFound(async () => {
-      await client.delete('/v1/addresses/', {
-        body: { addresses: [addressId] },
-        expectedStatus: 204,
-        token,
-      });
-    }),
-  );
-
-  return {
-    address,
-    addressId,
-    entityId,
-    tagId,
-  };
-}
-
-async function expectMetadataReads(
-  client: ProductionApiClient,
-  token: string,
-  created: CreatedMetadata,
-): Promise<void> {
-  const tagPayload = assertRecord(
-    (await client.get(`/v1/tags/${encodeURIComponent(created.tagId)}`, { token })).body,
-    'tag payload',
-  );
-  const tag = readRecordField(tagPayload, 'tag');
-  expect(readStringField(tag, 'id')).toBe(created.tagId);
-  expect(readStringField(tag, 'riskLevel')).toBe('low');
-
-  const entityPayload = assertRecord(
-    (await client.get(`/v1/entities/${encodeURIComponent(created.entityId)}`, { token })).body,
-    'entity payload',
-  );
-  const entity = readRecordField(entityPayload, 'entity');
-  expect(readStringField(entity, 'id')).toBe(created.entityId);
-  expect(readStringArrayField(entity, 'tags')).toContain(created.tagId);
-  expect(readStringArrayField(entity, 'addresses')).toContain(created.addressId);
-
-  const addressPayload = assertRecord(
-    (await client.get(`/v1/addresses/${encodeURIComponent(created.addressId)}`, { token })).body,
-    'address payload',
-  );
-  const address = readRecordField(addressPayload, 'address');
-  expect(readStringField(address, 'id')).toBe(created.addressId);
-  expect(readStringField(address, 'address')).toBe(created.address);
-}
-
-async function expectCurrentStateExplorerReads(
-  client: ProductionApiClient,
-  token: string,
-  network: ExplorerNetwork,
-  created: CreatedMetadata,
-): Promise<void> {
-  const addressPath = productionQueryPath(`/v1/explorer/addresses/${created.address}`, {
-    network: network.id,
-  });
-  const addressPayload = assertRecord(
-    (await client.get(addressPath, { token })).body,
-    'explorer address payload',
-  );
-  const address = readRecordField(addressPayload, 'address');
-  expect(readStringField(address, 'network')).toBe(network.id);
-  expect(readStringField(address, 'address')).toBe(created.address);
-  expect(readStringField(address, 'balance')).toBe('0');
-
-  const overlay = readRecordField(addressPayload, 'overlay');
-  expect(readStringArrayField(overlay, 'addresses')).toContain(created.address);
-  const [entity] = readRecordArrayField(overlay, 'entities');
-  expect(readStringField(entity ?? {}, 'id')).toBe(created.entityId);
-  const [tag] = readRecordArrayField(overlay, 'tags');
-  expect(readStringField(tag ?? {}, 'id')).toBe(created.tagId);
-
-  const utxoPath = productionQueryPath(`/v1/explorer/addresses/${created.address}/utxos`, {
-    limit: 5,
-    network: network.id,
-  });
-  const utxoPayload = assertRecord((await client.get(utxoPath, { token })).body, 'utxo payload');
-  expect(readRecordArrayField(utxoPayload, 'utxos')).toEqual([]);
-
-  const infoPayload = assertRecord(
-    (
-      await client.get(productionQueryPath('/v1/info', { q: created.address }), {
-        token,
-      })
-    ).body,
-    'info payload',
-  );
-  expect(readStringArrayField(infoPayload, 'addresses')).toContain(created.address);
-}
-
-async function expectHistoryEndpointContract(
-  client: ProductionApiClient,
-  token: string,
-  network: ExplorerNetwork,
-  created: CreatedMetadata,
-): Promise<void> {
+async function expectExplorerReads(client: ProductionApiClient, token: string): Promise<void> {
   const blocksPayload = assertRecord(
     (
-      await client.get(
-        productionQueryPath('/v1/explorer/blocks', { limit: 1, network: network.id }),
-        {
-          token,
-        },
-      )
+      await client.get(productionQueryPath('/v1/explorer/blocks', { limit: 1 }), {
+        token,
+      })
     ).body,
     'blocks payload',
   );
   const [block] = readRecordArrayField(blocksPayload, 'blocks');
   expect(block).toBeDefined();
-
-  const search = await client.get(
-    productionQueryPath('/v1/explorer/search', { network: network.id, q: created.address }),
-    {
-      expectedStatus: [200, 425],
-      token,
-    },
-  );
-  if (search.status === 425) {
-    expectTooEarly(search);
-  } else {
-    const matches = readRecordArrayField(assertRecord(search.body, 'search payload'), 'matches');
-    expect(matches.some((match) => match.address === created.address)).toBe(true);
-  }
-
   const blockHeight = readNumberField(block ?? {}, 'height');
-  const blockDetail = await client.get(
-    productionQueryPath(`/v1/explorer/blocks/${blockHeight}`, { network: network.id }),
-    {
-      expectedStatus: [200, 425],
-      token,
-    },
-  );
+
+  const blockDetail = await client.get(`/v1/explorer/blocks/${blockHeight}`, {
+    expectedStatus: [200, 425],
+    token,
+  });
   if (blockDetail.status === 425) {
     expectTooEarly(blockDetail);
-    return;
+  } else {
+    const blockDetailPayload = assertRecord(blockDetail.body, 'block detail payload');
+    expect(readNumberField(readRecordField(blockDetailPayload, 'block'), 'height')).toBe(
+      blockHeight,
+    );
   }
 
-  const blockDetailPayload = assertRecord(blockDetail.body, 'block detail payload');
-  expect(readNumberField(readRecordField(blockDetailPayload, 'block'), 'height')).toBe(blockHeight);
-  readRecordArrayField(blockDetailPayload, 'transactions');
+  const randomAddress = `DOnlyDogeE2E${randomUUID().replaceAll('-', '').slice(0, 16)}`;
+  await client.get(`/v1/explorer/addresses/${randomAddress}`, { token });
+  await ignoreNotFound(async () => {
+    await client.get(productionQueryPath('/v1/explorer/search', { q: randomAddress }), {
+      expectedStatus: [200, 425],
+      token,
+    });
+  });
 }
 
-async function expectTeardownComplete(
+async function expectExternalParity(
   client: ProductionApiClient,
-  adminToken: string,
-  created: Partial<CreatedMetadata>,
-  ephemeralToken: string | undefined,
+  config: EnabledProductionConfig,
+  token: string,
 ): Promise<void> {
-  if (created.addressId) {
-    await client.get(`/v1/addresses/${encodeURIComponent(created.addressId)}`, {
-      expectedStatus: 404,
-      token: adminToken,
-    });
+  await eventually(
+    'Dogecoin external parity',
+    async () => {
+      await expectLatestBlockParity(client, config, token);
+      await expectKnownAddressParity(client, token);
+    },
+    { timeoutMs: 90_000 },
+  );
+}
+
+async function expectLatestBlockParity(
+  client: ProductionApiClient,
+  config: EnabledProductionConfig,
+  token: string,
+): Promise<void> {
+  const [onlyDogeLatest, blockCypher] = await Promise.all([
+    latestOnlyDogeBlock(client, token),
+    blockCypherGet('/v1/doge/main'),
+  ]);
+  const chainHeight = readNumberField(blockCypher, 'height');
+  const chainHash = readStringField(blockCypher, 'hash');
+
+  expect(onlyDogeLatest.height).toBeGreaterThanOrEqual(chainHeight - config.maxParityBlockLag);
+  if (onlyDogeLatest.height === chainHeight) {
+    expect(onlyDogeLatest.hash).toBe(chainHash);
   }
-  if (created.entityId) {
-    await client.get(`/v1/entities/${encodeURIComponent(created.entityId)}`, {
-      expectedStatus: 404,
-      token: adminToken,
-    });
+}
+
+async function latestOnlyDogeBlock(
+  client: ProductionApiClient,
+  token: string,
+): Promise<{ hash: string; height: number }> {
+  const blocksPayload = assertRecord(
+    (
+      await client.get(productionQueryPath('/v1/explorer/blocks', { limit: 1 }), {
+        token,
+      })
+    ).body,
+    'blocks payload',
+  );
+  const [block] = readRecordArrayField(blocksPayload, 'blocks');
+  if (!block) {
+    throw new Error('OnlyDoge returned no latest block');
   }
-  if (created.tagId) {
-    await client.get(`/v1/tags/${encodeURIComponent(created.tagId)}`, {
-      expectedStatus: 404,
-      token: adminToken,
-    });
+
+  return {
+    hash: readStringField(block, 'hash'),
+    height: readNumberField(block, 'height'),
+  };
+}
+
+async function expectKnownAddressParity(client: ProductionApiClient, token: string): Promise<void> {
+  const address = 'D8AXXiGEZeZnMKTKnC9AWB3YUU4jfMAmYU';
+  const [onlyDogeAddress, onlyDogeUtxos, blockCypherBalance, blockCypherUtxos] = await Promise.all([
+    onlyDogeAddressSummary(client, token, address),
+    onlyDogeAddressUtxos(client, token, address),
+    blockCypherGet(`/v1/doge/main/addrs/${address}/balance`),
+    blockCypherGet(`/v1/doge/main/addrs/${address}?unspentOnly=true&limit=50`),
+  ]);
+
+  expect(onlyDogeAddress.balance).toBe(
+    String(readNumberField(blockCypherBalance, 'final_balance')),
+  );
+  expect(onlyDogeAddress.receivedBase).toBe(
+    String(readNumberField(blockCypherBalance, 'total_received')),
+  );
+  expect(onlyDogeAddress.sentBase).toBe(String(readNumberField(blockCypherBalance, 'total_sent')));
+  expect(onlyDogeAddress.txCount).toBe(readNumberField(blockCypherBalance, 'final_n_tx'));
+
+  const blockCypherOutputKeys = assertRecordArray(
+    blockCypherUtxos.txrefs ?? [],
+    'BlockCypher txrefs',
+  )
+    .map((output) => ({
+      outputKey: `${readStringField(output, 'tx_hash')}:${readNumberField(output, 'tx_output_n')}`,
+      valueBase: String(readNumberField(output, 'value')),
+    }))
+    .sort(compareOutputRefs);
+  const onlyDogeOutputKeys = onlyDogeUtxos
+    .map((output) => ({
+      outputKey: readStringField(output, 'outputKey'),
+      valueBase: readStringField(output, 'valueBase'),
+    }))
+    .sort(compareOutputRefs);
+
+  expect(onlyDogeAddress.utxoCount).toBeGreaterThanOrEqual(blockCypherOutputKeys.length);
+  expect(onlyDogeOutputKeys).toEqual(expect.arrayContaining(blockCypherOutputKeys));
+}
+
+async function onlyDogeAddressSummary(
+  client: ProductionApiClient,
+  token: string,
+  address: string,
+): Promise<{
+  balance: string;
+  receivedBase: string;
+  sentBase: string;
+  txCount: number;
+  utxoCount: number;
+}> {
+  const payload = assertRecord(
+    (await client.get(`/v1/explorer/addresses/${address}`, { token })).body,
+    'OnlyDoge address payload',
+  );
+  const summary = readRecordField(payload, 'address');
+  return {
+    balance: readStringField(summary, 'balance'),
+    receivedBase: readStringField(summary, 'receivedBase'),
+    sentBase: readStringField(summary, 'sentBase'),
+    txCount: readNumberField(summary, 'txCount'),
+    utxoCount: readNumberField(summary, 'utxoCount'),
+  };
+}
+
+async function onlyDogeAddressUtxos(
+  client: ProductionApiClient,
+  token: string,
+  address: string,
+): Promise<Array<Record<string, unknown>>> {
+  const payload = assertRecord(
+    (
+      await client.get(
+        productionQueryPath(`/v1/explorer/addresses/${address}/utxos`, { limit: 500 }),
+        { token },
+      )
+    ).body,
+    'OnlyDoge UTXO payload',
+  );
+  return readRecordArrayField(payload, 'utxos');
+}
+
+async function blockCypherGet(path: string): Promise<Record<string, unknown>> {
+  const url = new URL(path, 'https://api.blockcypher.com');
+  const response = await fetch(url, {
+    headers: {
+      accept: 'application/json',
+    },
+    signal: AbortSignal.timeout(15_000),
+  });
+  const body = assertRecord(await response.json(), `BlockCypher ${path}`);
+  if (response.status !== 200) {
+    throw new Error(`BlockCypher ${path} returned ${response.status}: ${JSON.stringify(body)}`);
   }
-  if (ephemeralToken) {
-    await client.get('/v1/stats/', {
-      expectedStatus: 401,
-      token: ephemeralToken,
-    });
-  }
+
+  return body;
+}
+
+function compareOutputRefs(
+  left: { outputKey: string; valueBase: string },
+  right: { outputKey: string; valueBase: string },
+): number {
+  return (
+    left.outputKey.localeCompare(right.outputKey) || left.valueBase.localeCompare(right.valueBase)
+  );
 }
 
 function expectTooEarly(response: ProductionResponse): void {
   expect(readStringField(assertRecord(response.body, 'too early payload'), 'error')).toBe(
     'dogecoin history index is not ready',
   );
-}
-
-function randomRunId(): string {
-  return `${Date.now().toString(36)}${randomUUID().replaceAll('-', '').slice(0, 12)}`;
 }

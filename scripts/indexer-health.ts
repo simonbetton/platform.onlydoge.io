@@ -5,41 +5,32 @@ import { loadSettings, RelationalMetadataStore } from '@onlydoge/platform';
 async function main() {
   const settings = loadSettings({ mode: 'indexer' });
   const metadata = await RelationalMetadataStore.connect(settings.database);
-  const networks = await metadata.listActiveNetworks();
-  const stale = await staleCoreIndexerProgress(
-    metadata,
-    networks,
-    settings.indexer.coreProgressWatchdogMs,
-  );
+  const stale = await staleCoreIndexerProgress(metadata, settings.indexer.coreProgressWatchdogMs);
   assertNoStaleCoreIndexerProgress(stale);
   console.log('ok');
 }
 
 async function staleCoreIndexerProgress(
   metadata: RelationalMetadataStore,
-  networks: Awaited<ReturnType<RelationalMetadataStore['listActiveNetworks']>>,
   watchdogMs: number,
 ): Promise<string[]> {
   const now = Date.now();
-  const stale = await Promise.all(
-    networks.map((network) => staleCoreIndexerNetwork(metadata, network, watchdogMs, now)),
-  );
-  return stale.filter(isStaleCoreIndexerProgress);
+  const stale = await staleCoreIndexerDogecoin(metadata, watchdogMs, now);
+  return stale === null ? [] : [stale];
 }
 
-async function staleCoreIndexerNetwork(
+async function staleCoreIndexerDogecoin(
   metadata: RelationalMetadataStore,
-  network: Awaited<ReturnType<RelationalMetadataStore['listActiveNetworks']>>[number],
   watchdogMs: number,
   now: number,
 ): Promise<string | null> {
-  const state = await metadata.getCoreIndexerState(network.networkId);
+  const state = await metadata.getCoreIndexerState();
   if (!isWatchedCoreIndexerState(state)) {
     return null;
   }
 
   const ageMs = coreIndexerStateAgeMs(state.updatedAt, now);
-  return staleCoreIndexerDescription(network.name, state, ageMs, watchdogMs);
+  return staleCoreIndexerDescription('Dogecoin', state, ageMs, watchdogMs);
 }
 
 function isBackfillStage(stage: string): boolean {
@@ -55,7 +46,7 @@ function isWatchedCoreIndexerState(
 }
 
 function staleCoreIndexerDescription(
-  networkName: string,
+  chainName: string,
   state: NonNullable<Awaited<ReturnType<RelationalMetadataStore['getCoreIndexerState']>>>,
   ageMs: number,
   watchdogMs: number,
@@ -64,11 +55,7 @@ function staleCoreIndexerDescription(
     return null;
   }
 
-  return `${networkName}: stage=${state.stage} sync_tail=${state.syncTail} process_tail=${state.processTail} age_ms=${ageMs}`;
-}
-
-function isStaleCoreIndexerProgress(value: string | null): value is string {
-  return value !== null;
+  return `${chainName}: stage=${state.stage} sync_tail=${state.syncTail} process_tail=${state.processTail} age_ms=${ageMs}`;
 }
 
 function coreIndexerStateAgeMs(updatedAtValue: string, now: number): number {

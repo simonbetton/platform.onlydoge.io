@@ -19,21 +19,9 @@ export default defineConfig({
         import.meta.dirname,
         'packages/modules/access-control/src/index.ts',
       ),
-      '@onlydoge/network-catalog': resolve(
-        import.meta.dirname,
-        'packages/modules/network-catalog/src/index.ts',
-      ),
-      '@onlydoge/entity-labeling': resolve(
-        import.meta.dirname,
-        'packages/modules/entity-labeling/src/index.ts',
-      ),
       '@onlydoge/explorer-query': resolve(
         import.meta.dirname,
         'packages/modules/explorer-query/src/index.ts',
-      ),
-      '@onlydoge/investigation-query': resolve(
-        import.meta.dirname,
-        'packages/modules/investigation-query/src/index.ts',
       ),
       '@onlydoge/indexing-pipeline': resolve(
         import.meta.dirname,

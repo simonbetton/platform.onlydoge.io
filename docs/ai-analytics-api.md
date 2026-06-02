@@ -1,6 +1,6 @@
 # AI Analytics API
 
-OnlyDoge exposes a guarded analytics SQL surface for AI chat tools. The chat app generates SQL from `GET /v1/analytics/schema`, then submits that SQL to `POST /v1/analytics/query` with server-owned network and time-window parameters.
+OnlyDoge exposes a guarded analytics SQL surface for AI chat tools. The chat app generates SQL from `GET /v1/analytics/schema`, then submits that SQL to `POST /v1/analytics/query` with server-owned time-window parameters.
 
 ## Routes
 
@@ -11,7 +11,13 @@ Both routes require `x-api-token`. Analytics requests use a separate per-API-key
 
 ## Query Surface
 
-V1 exposes the curated `analytics_transactions_v1` ClickHouse table. It contains finalized confirmed transaction facts only:
+V1 exposes curated ClickHouse tables for singleton Dogecoin analytics:
+
+- `analytics_transactions_v1` for finalized confirmed transaction facts,
+- `analytics_balances_current_v1` for richest-address and balance-distribution questions,
+- `mempool_samples_v1` for current and recent mempool samples.
+
+`analytics_transactions_v1` contains:
 
 - block position and time,
 - transaction id and transaction index,
@@ -26,20 +32,22 @@ Amounts ending in `_base_i256` are integer base units. For DOGE, `100000000` bas
 Generated SQL must:
 
 - be a single read-only `SELECT`,
-- query only `analytics_transactions_v1`,
-- include the placeholders `{networkId:UInt64}`, `{fromTime:UInt64}`, `{toTime:UInt64}`, and `{maxFinalizedHeight:UInt64}`,
-- use those placeholders in the concrete `network_id`, `block_time`, and `block_height` predicates shown by the schema examples,
+- query only the curated analytics tables returned by `GET /v1/analytics/schema`,
+- include the placeholders required by each referenced table,
+- constrain `analytics_transactions_v1` with concrete `block_time` lower/upper bounds and `block_height <= {maxFinalizedHeight:UInt64}`,
+- constrain `analytics_balances_current_v1` with `as_of_block_height <= {maxFinalizedHeight:UInt64}`,
+- constrain `mempool_samples_v1` with concrete `sampled_at` lower/upper bounds using `toDateTime({fromTime:UInt64})` or `fromUnixTimestamp({fromTime:UInt64})`,
 - stay within the request's maximum 7-day time window,
 - avoid `SELECT *`, `FINAL`, query-level `SETTINGS`, and query-level `FORMAT`.
 
-V1 does not answer mempool-to-confirmation latency or unconfirmed mempool analytics. Those need a persisted mempool observation model.
+Unconfirmed mempool analytics are answered only from persisted `mempool_samples_v1` observations and are limited to the configured retention window.
 
 ## Operations
 
-Existing history must be backfilled before analytics queries are available for a network:
+Existing history must be backfilled before analytics queries are available:
 
 ```bash
-bun run backfill:analytics-transactions -- --network net_dogecoin
+bun run backfill:analytics-transactions
 ```
 
 For self-managed ClickHouse, configure a read-only analytics user and set:

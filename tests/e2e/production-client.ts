@@ -11,6 +11,7 @@ export type ProductionE2EConfig =
       baseUrl: string;
       enabled: true;
       expectedImageDigest: string;
+      maxParityBlockLag: number;
       ssh?: {
         jump?: string;
         target: string;
@@ -152,6 +153,7 @@ export function loadProductionE2EConfig(env: Env = process.env): ProductionE2ECo
     baseUrl: normalizeBaseUrl(requireEnv(env, 'PROD_BASE_URL')),
     enabled: true,
     expectedImageDigest: normalizeDigest(requireEnv(env, 'EXPECTED_IMAGE_DIGEST')),
+    maxParityBlockLag: parseOptionalNonNegativeInteger(env.PROD_PARITY_MAX_BLOCK_LAG, 12),
     ...(ssh ? { ssh } : {}),
   };
 }
@@ -360,6 +362,19 @@ function normalizeBaseUrl(value: string): string {
 
 function normalizeDigest(value: string): string {
   return value.match(/sha256:[a-fA-F0-9]{64}/u)?.[0].toLowerCase() ?? value.trim();
+}
+
+function parseOptionalNonNegativeInteger(value: string | undefined, fallback: number): number {
+  if (!value?.trim()) {
+    return fallback;
+  }
+
+  const parsed = Number(value);
+  if (!Number.isInteger(parsed) || parsed < 0) {
+    throw new Error(`Invalid non-negative integer: ${value}`);
+  }
+
+  return parsed;
 }
 
 function redactSecrets(value: string, tokens: Array<string | undefined>): string {

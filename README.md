@@ -1,6 +1,6 @@
 # OnlyDoge
 
-OnlyDoge is a Bun-based investigation and explorer backend focused on Dogecoin. It indexes Dogecoin chain data, stores raw block snapshots, materializes current UTXO and balance state, and exposes authenticated APIs for explorer reads and investigation workflows.
+OnlyDoge is a Bun-based Dogecoin explorer backend. It indexes Dogecoin chain data, stores raw block snapshots, materializes current UTXO and balance state, and exposes authenticated APIs for explorer and analytics reads.
 
 The codebase is a modular monolith. Business logic lives in modules with explicit contracts, while infrastructure adapters live in `packages/platform`.
 
@@ -9,8 +9,8 @@ The codebase is a modular monolith. Business logic lives in modules with explici
 - Dogecoin current-state indexing is implemented with ClickHouse append-only core tables in the production warehouse path.
 - Production spendable UTXOs, balances, applied block identity, transaction lookup, and address history are backed by ClickHouse.
 - Raw block snapshots are stored in file storage locally and S3-compatible storage in production.
-- API authentication, network catalog, entity labeling, tags, stats, heartbeat, and OpenAPI are implemented.
-- Full transfer/direct-link graph materialization is not part of the current production indexer.
+- API authentication, explorer reads, analytics reads, heartbeat, and OpenAPI are implemented.
+- The runtime is single-chain Dogecoin; network catalog, token catalog, labels, tags, and investigation graph workflows are intentionally absent.
 
 Operational details live in:
 
@@ -31,10 +31,8 @@ packages/
   platform/       runtime wiring and infrastructure adapters
   modules/
     access-control/
-    network-catalog/
-    entity-labeling/
+    analytics-query/
     explorer-query/
-    investigation-query/
     indexing-pipeline/
 
 tests/
@@ -211,30 +209,17 @@ The repository also includes ClickHouse host log-retention files for self-hosted
 
 Those files codify the current memory and 3-day log-retention profile used for heavy Dogecoin backfills. The retention files are installed on the ClickHouse host with the commands in the production runbook; they are not mounted by `docker-compose.local.yml` or `docker-compose.prod.yml`.
 
-## Dogecoin Runsheet
+## Dogecoin Bootstrap
 
-Use the runsheet helper to create the first API key if needed, register Dogecoin, and verify stats:
-
-```bash
-bun run runsheet:dogecoin -- \
-  --base-url http://127.0.0.1:2277 \
-  --rpc-endpoint 'http://rpc-user:rpc-password@dogecoin-rpc.example.com:22555/' \
-  --name 'Dogecoin Mainnet' \
-  --chain-id 0 \
-  --block-time 60 \
-  --rps 25
-```
-
-If API keys already exist:
+Configure Dogecoin through environment variables, start the API/indexer, then create the first API key with `POST /v1/keys`.
 
 ```bash
-bun run runsheet:dogecoin -- \
-  --base-url http://127.0.0.1:2277 \
-  --api-token 'sk_...' \
-  --rpc-endpoint 'http://rpc-user:rpc-password@dogecoin-rpc.example.com:22555/'
+ONLYDOGE_DOGECOIN_RPC_ENDPOINT='http://rpc-user:rpc-password@dogecoin-rpc.example.com:22555/' \
+ONLYDOGE_DOGECOIN_RPC_RPS=25 \
+bun run dev:both
 ```
 
-OnlyDoge starts indexing after a network is created when the runtime is in `both` or `indexer` mode.
+OnlyDoge starts indexing Dogecoin immediately when the runtime is in `both` or `indexer` mode.
 
 ## Production
 
@@ -325,31 +310,9 @@ The image push script uses a `docker-container` Buildx builder named `onlydoge-m
 
 The production image defaults to `--mode=both` for compatibility, but production should run split API and indexer containers. The API container owns public HTTP health; the indexer container owns indexing progress and can restart independently.
 
-## Rebuild And Benchmarks
+## Rebuild
 
-Benchmark the ClickHouse core backfill:
-
-```bash
-bun run benchmark:clickhouse-core -- --networkId 1 --blocks 100 --ranges 3 --execute
-```
-
-Destructive Dogecoin current-state rebuild:
-
-```bash
-bun run rebuild:clickhouse-core -- --networkId 1 --execute
-```
-
-Materialize current state:
-
-```bash
-bun run materialize:clickhouse-core -- --networkId 1 --asOfBlockHeight <height> --reset --execute
-```
-
-Prepare core-backed history:
-
-```bash
-bun run scripts/prepare-clickhouse-core-history.ts -- --networkId 1 --execute --wait --mark-ready
-```
+The Dogecoin rebuild is a breaking reset: stop API/indexer, delete legacy metadata and ClickHouse tables, remove old raw-block object prefixes, rotate API keys, deploy the networkless schema, resync from Dogecoin Core, then run invariant and explorer-parity gates before serving traffic.
 
 See [docs/dogecoin-rebuild-runbook.md](docs/dogecoin-rebuild-runbook.md) before running destructive commands.
 
@@ -359,17 +322,11 @@ Current `/v1` route groups:
 
 - `/v1/heartbeat`
 - `/v1/explorer`
-- `/v1/stats`
-- `/v1/info`
 - `/v1/keys`
 - `/v1/audit`
-- `/v1/networks`
-- `/v1/entities`
-- `/v1/addresses`
-- `/v1/tokens`
-- `/v1/tags`
+- `/v1/analytics`
 
-`/v1/tokens` stores currency metadata such as DOGE. API tokens are authentication credentials returned once by `POST /v1/keys` in the response `key` field and sent in the `x-api-token` header.
+API tokens are authentication credentials returned once by `POST /v1/keys` in the response `key` field and sent in the `x-api-token` header.
 
 Error payload shape:
 
@@ -377,9 +334,7 @@ Error payload shape:
 {"error":"..."}
 ```
 
-Explorer endpoints:
-
-- `GET /v1/explorer/networks`
+Explorer endpoints are networkless and do not accept `network` query parameters.
 - `GET /v1/explorer/search?q=...`
 - `GET /v1/explorer/mempool`
 - `GET /v1/explorer/blocks`

@@ -6,24 +6,7 @@ import type { ExplorerQueryService } from '../application/explorer-query-service
 
 const explorerTag = 'Explorer';
 
-const networkQuerySchema = t.Object({
-  network: t.Optional(
-    t.String({
-      description:
-        'Network id. Omit when a single Dogecoin network is configured and should be used as the default.',
-      examples: ['net_dogecoin'],
-    }),
-  ),
-});
-
-const paginatedNetworkQuerySchema = t.Object({
-  network: t.Optional(
-    t.String({
-      description:
-        'Network id. Omit when a single Dogecoin network is configured and should be used as the default.',
-      examples: ['net_dogecoin'],
-    }),
-  ),
+const paginationQuerySchema = t.Object({
   offset: t.Optional(
     t.String({
       description: 'Zero-based number of records to skip.',
@@ -64,16 +47,12 @@ export function buildExplorerQueryHttp(
     });
 
   return new Elysia({ prefix: '/v1/explorer' })
-    .get('/networks', () => service.listNetworks(), {
-      detail: describeProtected(
-        'List explorer networks',
-        'Lists Dogecoin explorer networks and their indexing status. Use this first to discover the default network id.',
-      ),
-    })
     .get(
       '/search',
-      ({ query, request }) =>
-        service.search(resolveAuthenticatedApiKey(request), query.q, query.network),
+      ({ query, request }) => {
+        resolveAuthenticatedApiKey(request);
+        return service.search(query.q);
+      },
       {
         detail: describeProtected(
           'Search explorer',
@@ -86,13 +65,6 @@ export function buildExplorerQueryHttp(
               examples: ['123456', 'DTestAddress123'],
             }),
           ),
-          network: t.Optional(
-            t.String({
-              description:
-                'Network id. Omit when a single Dogecoin network is configured and should be used as the default.',
-              examples: ['net_dogecoin'],
-            }),
-          ),
         }),
       },
     )
@@ -100,7 +72,6 @@ export function buildExplorerQueryHttp(
       '/blocks',
       ({ query }) =>
         service.listBlocks(
-          query.network,
           parseNonNegativeInteger(query.offset),
           parseNonNegativeInteger(query.limit),
         ),
@@ -109,24 +80,24 @@ export function buildExplorerQueryHttp(
           'List blocks',
           'Lists recent raw-synced Dogecoin blocks in descending chain order.',
         ),
-        query: paginatedNetworkQuerySchema,
+        query: paginationQuerySchema,
       },
     )
     .get(
       '/mempool',
       ({ query }) => {
         const { limit, offset } = readPagination(query);
-        return service.listMempool(query.network, offset, limit);
+        return service.listMempool(offset, limit);
       },
       {
         detail: describeProtected(
           'List mempool transactions',
           'Returns a bounded realtime snapshot of the Dogecoin node mempool, ordered by newest node-reported entry time first.',
         ),
-        query: paginatedNetworkQuerySchema,
+        query: paginationQuerySchema,
       },
     )
-    .get('/blocks/:ref', ({ params, query }) => service.getBlock(params.ref, query.network), {
+    .get('/blocks/:ref', ({ params }) => service.getBlock(params.ref), {
       detail: describeProtected(
         'Get block',
         'Returns a block summary and transaction summaries by raw-synced height or indexed block hash.',
@@ -137,16 +108,17 @@ export function buildExplorerQueryHttp(
           examples: ['123456', '0000000000000000000000000000000000000000000000000000000000000000'],
         }),
       }),
-      query: networkQuerySchema,
     })
     .get(
       '/transactions/:txid',
-      ({ params, query, request }) =>
-        service.getTransaction(resolveAuthenticatedApiKey(request), params.txid, query.network),
+      ({ params, request }) => {
+        resolveAuthenticatedApiKey(request);
+        return service.getTransaction(params.txid);
+      },
       {
         detail: describeProtected(
           'Get transaction',
-          'Returns a Dogecoin transaction with inputs, outputs, and label overlays.',
+          'Returns a Dogecoin transaction with inputs, outputs, fees, and spend status.',
         ),
         params: t.Object({
           txid: t.String({
@@ -154,27 +126,24 @@ export function buildExplorerQueryHttp(
             examples: ['doge-tx-2'],
           }),
         }),
-        query: networkQuerySchema,
       },
     )
     .get(
       '/addresses/:address',
-      ({ params, query, request }) =>
-        service.getAddress(resolveAuthenticatedApiKey(request), params.address, query.network),
+      ({ params, request }) => {
+        resolveAuthenticatedApiKey(request);
+        return service.getAddress(params.address);
+      },
       {
-        detail: describeProtected(
-          'Get address',
-          'Returns an address balance summary with investigation overlay data.',
-        ),
+        detail: describeProtected('Get address', 'Returns a canonical address balance summary.'),
         params: addressParamsSchema,
-        query: networkQuerySchema,
       },
     )
     .get(
       '/addresses/:address/transactions',
       ({ params, query }) => {
         const { limit, offset } = readPagination(query);
-        return service.listAddressTransactions(params.address, query.network, offset, limit);
+        return service.listAddressTransactions(params.address, offset, limit);
       },
       {
         detail: describeProtected(
@@ -182,14 +151,14 @@ export function buildExplorerQueryHttp(
           'Returns reverse-chronological transaction history for a Dogecoin address.',
         ),
         params: addressParamsSchema,
-        query: paginatedNetworkQuerySchema,
+        query: paginationQuerySchema,
       },
     )
     .get(
       '/addresses/:address/utxos',
       ({ params, query }) => {
         const { limit, offset } = readPagination(query);
-        return service.listAddressUtxos(params.address, query.network, offset, limit);
+        return service.listAddressUtxos(params.address, offset, limit);
       },
       {
         detail: describeProtected(
@@ -197,7 +166,7 @@ export function buildExplorerQueryHttp(
           'Returns current spendable UTXOs for a Dogecoin address.',
         ),
         params: addressParamsSchema,
-        query: paginatedNetworkQuerySchema,
+        query: paginationQuerySchema,
       },
     );
 }

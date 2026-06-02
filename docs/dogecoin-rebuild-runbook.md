@@ -1,177 +1,44 @@
-# Dogecoin Current-State Rebuild Runbook
+# Networkless Dogecoin Rebuild Runbook
 
-This runbook covers the ClickHouse-only Dogecoin current-state rebuild path. It is intentionally destructive to the Dogecoin projection/read tables and should only be used when public explorer data can be reset or unavailable during rebuild.
+This rebuild is a destructive singleton Dogecoin reset. Do not run it against shared production services until API keys, storage, and ClickHouse retention have been reviewed.
 
-## What This Rebuild Produces
+## Reset Order
 
-The fast path writes append-only core tables first:
+1. Stop the API and indexer.
+2. Delete old raw block object prefixes.
+3. Delete metadata tables for API keys, audit events, labels, entities, tags, tokens, and old network catalog rows.
+4. Drop old ClickHouse v1/v2 tables before recreating the networkless schema.
+5. Deploy the singleton Dogecoin environment:
+   - `ONLYDOGE_DOGECOIN_RPC_ENDPOINT`
+   - `ONLYDOGE_DOGECOIN_RPC_RPS`
+   - `ONLYDOGE_DOGECOIN_ZMQ_BLOCK_ENDPOINT`
+   - `ONLYDOGE_CORE_REPROCESS_DEPTH`
+   - `ONLYDOGE_MEMPOOL_SAMPLE_INTERVAL_MS`
+   - `ONLYDOGE_MEMPOOL_RETENTION_SECONDS`
+6. Start the indexer and resync from Dogecoin Core.
+7. Bootstrap a new first admin key with `POST /v1/keys/`.
+8. Run invariant checks across blocks, transactions, outputs, spends, UTXOs, balances, and address summaries.
+9. Run external parity checks against BlockCypher's Dogecoin API and at least one other free Dogecoin explorer where practical, including `D8AXXiGEZeZnMKTKnC9AWB3YUU4jfMAmYU`.
+10. Mark the deployment ready only after internal invariants and external parity checks pass.
 
-- `core_utxo_creates_v1`
-- `core_utxo_spends_v1`
-- `core_processed_blocks_v1`
+## Local Verification
 
-Then it materializes current read state:
-
-- `utxo_outputs_current_v2`
-- `utxo_outputs_current_by_address_v2`
-- `balances_v2`
-- `applied_blocks_v2`
-
-History reads are core-backed after `prepare-clickhouse-core-history` completes. The old fully materialized transfer/direct-link graph is intentionally not rebuilt by this path.
-
-## Safety Gates
-
-Before resetting production:
-
-1. Confirm raw Dogecoin snapshots exist for the target range.
-2. Confirm ClickHouse has enough disk headroom.
-3. Pause or stop the indexer.
-4. Run the benchmark against worst-case large-block ranges.
-5. Require worst-case throughput of at least `50,000 blocks/hour`.
-
-If the benchmark misses the gate, do not reset production. Redesign first.
-
-## Benchmark
-
-Dry-run parses stored raw snapshots without writing benchmark tables:
+Run:
 
 ```bash
-bun run benchmark:clickhouse-core -- --networkId 1 --blocks 100 --ranges 3
+bun run lint
+bun run typecheck
+bun run test
 ```
 
-Execute mode writes isolated benchmark tables, materializes benchmark current state, reports throughput, then drops those tables unless `--keep` is passed:
+Run the optional ClickHouse smoke test when Docker is available:
 
 ```bash
-bun run benchmark:clickhouse-core -- --networkId 1 --blocks 100 --ranges 3 --execute
+bun run test:clickhouse-smoke
 ```
 
-Explicit range:
+Backfill finalized analytics after history is ready:
 
 ```bash
-bun run benchmark:clickhouse-core -- --networkId 1 --start 6000000 --end 6000099 --execute
-```
-
-The command reports:
-
-- blocks/hour,
-- rows inserted,
-- raw-load time,
-- parse time,
-- ClickHouse insert time,
-- final materialization time.
-
-## Destructive Reset
-
-Inspect the plan first:
-
-```bash
-bun run rebuild:clickhouse-core -- --networkId 1
-```
-
-Apply the reset only after the benchmark gate passes:
-
-```bash
-bun run rebuild:clickhouse-core -- --networkId 1 --execute
-```
-
-This drops and recreates ClickHouse Dogecoin projection/read/core tables, resets the core process tail to the beginning, and marks current state/history as not ready.
-
-## Processing Backfill
-
-Start the indexer after reset. It will:
-
-- sync raw snapshots,
-- process append-only core create/spend windows,
-- maintain 100-block process windows by default,
-- stop on invariant failure.
-
-Monitor progress:
-
-```bash
-bun run health:indexer
-```
-
-Or from the app host:
-
-```bash
-cd /opt/onlydoge
-docker compose --env-file .env -f docker-compose.managed.yml logs -f onlydoge-indexer
-```
-
-## Current-State Materialization
-
-When core processing reaches the target height, materialize current state.
-
-Dry-run:
-
-```bash
-bun run materialize:clickhouse-core -- --networkId 1 --asOfBlockHeight <height>
-```
-
-Execute from a clean start:
-
-```bash
-bun run materialize:clickhouse-core -- --networkId 1 --asOfBlockHeight <height> --reset --execute
-```
-
-Resume from checkpoint:
-
-```bash
-bun run materialize:clickhouse-core -- --networkId 1 --asOfBlockHeight <height> --execute
-```
-
-Bound a run to a few ranges:
-
-```bash
-bun run materialize:clickhouse-core -- --networkId 1 --asOfBlockHeight <height> --execute --rangeLimit 8
-```
-
-The script checkpoints progress in metadata and can resume safely at the same `asOfBlockHeight`.
-
-## History Preparation
-
-Core-backed history requires a ClickHouse skipping index on `core_utxo_creates_v1.address`.
-
-Dry-run:
-
-```bash
-bun run scripts/prepare-clickhouse-core-history.ts -- --networkId 1
-```
-
-Add/materialize the index:
-
-```bash
-bun run scripts/prepare-clickhouse-core-history.ts -- --networkId 1 --execute --materialize-index
-```
-
-Wait for materialization and mark history ready:
-
-```bash
-bun run scripts/prepare-clickhouse-core-history.ts -- --networkId 1 --execute --wait --mark-ready
-```
-
-After this, `dogecoin_history_ready_n1` should be `true`, and `indexer_fact_tail_n1` should align with the core process tail.
-
-## Validation
-
-Required validation:
-
-- `lastError = null`
-- `stage = online`
-- `dogecoin_current_state_ready_n1 = true`
-- `dogecoin_history_ready_n1 = true`
-- `syncTail` aligned with the node tip after online raw sync catches up
-- `processTail` aligned with the node tip after online processing catches up
-- `finalizedTail` behind `processTail` by `indexer_reprocess_depth_n1`
-- balance sum equals spendable current UTXO sum
-- sampled transaction search/detail works
-- sampled address summary/history/UTXO reads work
-
-Raw block sync and processing can run at the Dogecoin node's confirmed chain tip. The configured reprocess depth is the recent canonicality window; mempool transactions are unconfirmed transactions and do not explain block-processing freshness.
-
-Example in-container stats check:
-
-```bash
-docker compose --env-file .env -f docker-compose.managed.yml exec -T onlydoge-api \
-  bun -e 'const { loadSettings, RelationalMetadataStore } = await import("@onlydoge/platform"); const m=await RelationalMetadataStore.connect(loadSettings({mode:"indexer"}).database); const s=await m.getCoreIndexerState(1); const keys=["indexer_fact_tail_n1","dogecoin_current_state_ready_n1","dogecoin_history_ready_n1","block_height_n1"]; const out={state:s}; for (const k of keys) out[k]=await m.getJsonValue(k); console.log(JSON.stringify(out,null,2));'
+bun run backfill:analytics-transactions
 ```

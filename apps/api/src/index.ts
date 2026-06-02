@@ -10,10 +10,7 @@ import {
   enforceApiTokenAuth,
 } from '@onlydoge/access-control';
 import { buildAnalyticsQueryHttp } from '@onlydoge/analytics-query';
-import { buildEntityLabelingHttp } from '@onlydoge/entity-labeling';
 import { buildExplorerQueryHttp } from '@onlydoge/explorer-query';
-import { buildInvestigationQueryHttp } from '@onlydoge/investigation-query';
-import { buildNetworkCatalogHttp } from '@onlydoge/network-catalog';
 import type { Runtime } from '@onlydoge/platform';
 import {
   InfrastructureError,
@@ -29,8 +26,8 @@ const auditOutcomeByStatusCode: Partial<Record<number, CreateAuditEventInput['ou
   429: 'rate_limited',
 };
 
-const ownerScopedAuditResourceTypes = new Set(['entity', 'address_label', 'tag']);
-const idRouteCollections = new Set(['keys', 'networks', 'tokens', 'entities', 'addresses', 'tags']);
+const ownerScopedAuditResourceTypes = new Set<string>();
+const idRouteCollections = new Set(['keys']);
 const auditOperationByMethod: Record<string, string> = {
   DELETE: 'delete',
   PATCH: 'update',
@@ -86,11 +83,30 @@ export function buildApiApp(runtime: Runtime) {
         resolveOptionalAuthenticatedApiKey,
       ),
     )
-    .use(buildNetworkCatalogHttp(runtime.networkCatalog, resolveAuthenticatedApiKey))
-    .use(buildEntityLabelingHttp(runtime.entityLabeling, resolveAuthenticatedApiKey))
+    .get(
+      '/v1/heartbeat/',
+      () =>
+        new Response(null, {
+          status: 204,
+          headers: {
+            'cache-control': 'no-store',
+          },
+        }),
+      {
+        detail: {
+          tags: ['Health'],
+          summary: 'Heartbeat',
+          description: 'Public lightweight health check for API uptime probes.',
+          responses: {
+            204: {
+              description: 'API is reachable.',
+            },
+          },
+        },
+      },
+    )
     .use(buildAnalyticsQueryHttp(runtime.analyticsQuery, resolveAuthenticatedApiKey))
     .use(buildExplorerQueryHttp(runtime.explorerQuery, resolveAuthenticatedApiKey))
-    .use(buildInvestigationQueryHttp(runtime.investigationQuery, resolveAuthenticatedApiKey))
     .use(
       openapi({
         path: '/openapi',
@@ -104,7 +120,7 @@ export function buildApiApp(runtime: Runtime) {
             title: 'OnlyDoge API',
             version: '0.1.0',
             description:
-              'Dogecoin-first investigation and explorer API. Use `/v1/keys` to bootstrap an API token, then send it in the `x-api-token` header for protected `/v1` routes.',
+              'Dogecoin explorer and analytics API. Use `/v1/keys` to bootstrap an API token, then send it in the `x-api-token` header for protected `/v1` routes.',
           },
           servers: [
             {
@@ -118,14 +134,6 @@ export function buildApiApp(runtime: Runtime) {
               description: 'Bootstrap, inspect, deactivate, and delete API keys.',
             },
             {
-              name: 'Network Catalog',
-              description: 'Configure indexed Dogecoin networks and token currency metadata.',
-            },
-            {
-              name: 'Entity Labeling',
-              description: 'Maintain entities, labels, tagged addresses, and risk tags.',
-            },
-            {
               name: 'Explorer',
               description:
                 'Read indexed Dogecoin blocks, transactions, addresses, UTXOs, and search results.',
@@ -134,10 +142,6 @@ export function buildApiApp(runtime: Runtime) {
               name: 'Analytics',
               description:
                 'Run guarded AI-generated ClickHouse SQL against curated Dogecoin analytics facts.',
-            },
-            {
-              name: 'Investigation',
-              description: 'Run address/entity lookups and inspect indexer health signals.',
             },
             {
               name: 'Health',
@@ -288,8 +292,7 @@ type ErrorContext = {
   };
 };
 
-async function handleUp(runtime: Runtime): Promise<Response> {
-  await runtime.investigationQuery.heartbeat();
+async function handleUp(_runtime: Runtime): Promise<Response> {
   return new Response('ok', {
     headers: {
       'cache-control': 'no-store',
@@ -652,17 +655,9 @@ function specialAuditResourceKey(collection: string | undefined): string {
 const auditResourceTypes: Record<string, string> = {
   keys: 'api_key',
   audit: 'audit_event',
-  networks: 'network',
-  tokens: 'token',
-  entities: 'entity',
-  addresses: 'address_label',
-  tags: 'tag',
 };
 
-const specialAuditResourceTypes: Record<string, string> = {
-  info: 'investigation',
-  stats: 'stats',
-};
+const specialAuditResourceTypes: Record<string, string> = {};
 
 function auditResourceId(id: string | undefined): { id?: string } {
   if (!id) {
@@ -1083,12 +1078,7 @@ const cachePolicyRules: Array<{
     },
   },
   {
-    matches: (path) =>
-      hasAnyPrefix(path, [
-        '/v1/explorer/blocks',
-        '/v1/explorer/transactions',
-        '/v1/explorer/networks',
-      ]),
+    matches: (path) => hasAnyPrefix(path, ['/v1/explorer/blocks', '/v1/explorer/transactions']),
     policy: {
       cacheControl: 'private, max-age=30, stale-while-revalidate=120',
       vary: 'x-api-token',
@@ -1104,31 +1094,6 @@ const cachePolicyRules: Array<{
     matches: (path) => path === '/v1/keys' || path.startsWith('/v1/keys/'),
     policy: {
       cacheControl: 'no-store',
-      vary: 'x-api-token',
-    },
-  },
-  {
-    matches: (path) => path.startsWith('/v1/stats'),
-    policy: privateFastPolicy,
-  },
-  {
-    matches: (path) => path.startsWith('/v1/info'),
-    policy: {
-      cacheControl: 'private, max-age=15, stale-while-revalidate=30',
-      vary: 'x-api-token',
-    },
-  },
-  {
-    matches: (path) =>
-      hasAnyPrefix(path, [
-        '/v1/networks',
-        '/v1/tokens',
-        '/v1/entities',
-        '/v1/addresses',
-        '/v1/tags',
-      ]),
-    policy: {
-      cacheControl: 'private, max-age=30, stale-while-revalidate=60',
       vary: 'x-api-token',
     },
   },

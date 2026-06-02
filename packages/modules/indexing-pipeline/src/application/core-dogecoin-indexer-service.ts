@@ -1,12 +1,10 @@
 import { randomUUID } from 'node:crypto';
 
-import type { PrimaryId } from '@onlydoge/shared-kernel';
-
 import type {
   BlockchainRpcPort,
   CoordinatorConfigPort,
   CoreDogecoinStateStorePort,
-  IndexedNetworkPort,
+  DogecoinConfigPort,
   RawBlockStoragePort,
 } from '../contracts/ports';
 import { fromDecimalUnits } from '../domain/amounts';
@@ -53,17 +51,14 @@ export interface CoreDogecoinIndexerServiceOptions {
   exitProcess?: (code: number) => never;
 }
 
-interface CoreDogecoinNetwork {
+interface DogecoinRuntimeConfig {
   architecture: 'dogecoin';
   blockTime: number;
   id: string;
-  networkId: PrimaryId;
   rpcEndpoint: string;
   rps: number;
   zmqBlockEndpoint?: string | null;
 }
-
-type IndexedNetwork = Awaited<ReturnType<IndexedNetworkPort['listActiveNetworks']>>[number];
 
 const workerIdleMs = 250;
 const leaseTimeoutMs = 15_000;
@@ -79,7 +74,6 @@ interface ProgressObservation {
 interface CoreBlockAttempt {
   activeStep: CoreBlockStep;
   height: number;
-  networkId: PrimaryId;
   startedAtMs: number;
 }
 
@@ -137,13 +131,12 @@ class CoreBlockTimeoutError extends Error {
 
 export class CoreDogecoinIndexerService {
   private readonly instanceId = randomUUID();
-  private readonly activeBlockAttempts = new Map<PrimaryId, CoreBlockAttempt>();
-  private latestLog: string | null = null;
-  private readonly progressObservations = new Map<PrimaryId, ProgressObservation>();
+  private activeBlockAttempt: CoreBlockAttempt | null = null;
+  private progressObservation: ProgressObservation | null = null;
 
   public constructor(
     private readonly configs: CoordinatorConfigPort,
-    private readonly networks: IndexedNetworkPort,
+    private readonly dogecoin: DogecoinConfigPort,
     private readonly rawBlocks: RawBlockStoragePort,
     private readonly rpc: BlockchainRpcPort,
     private readonly stateStore: CoreDogecoinStateStorePort,
@@ -164,7 +157,7 @@ export class CoreDogecoinIndexerService {
       return false;
     }
 
-    return this.runActiveDogecoinNetworks();
+    return this.runDogecoin();
   }
 
   private async runStartLoopIteration(): Promise<void> {
@@ -188,10 +181,10 @@ export class CoreDogecoinIndexerService {
       return 1_000;
     }
 
-    return this.networkWorkIdleMs();
+    return this.dogecoinWorkIdleMs();
   }
 
-  private async networkWorkIdleMs(): Promise<number | null> {
+  private async dogecoinWorkIdleMs(): Promise<number | null> {
     if (await this.runOnce()) {
       return null;
     }
@@ -199,70 +192,52 @@ export class CoreDogecoinIndexerService {
     return workerIdleMs;
   }
 
-  private async runActiveDogecoinNetworks(): Promise<boolean> {
-    const dogecoinNetworks = await this.listDogecoinNetworks();
-    if (dogecoinNetworks.length === 0) {
-      this.logOnce('[onlydoge] core indexer idle reason=no-dogecoin-networks');
-      return false;
-    }
-
-    return this.runDogecoinNetworkBatch(dogecoinNetworks);
+  private async runDogecoin(): Promise<boolean> {
+    const dogecoin = await this.dogecoin.getDogecoinConfig();
+    return this.runDogecoinConfig(dogecoin);
   }
 
-  private async runDogecoinNetworkBatch(dogecoinNetworks: CoreDogecoinNetwork[]): Promise<boolean> {
-    let didWork = false;
-    for (const network of dogecoinNetworks) {
-      didWork = didAnyNetworkWork(didWork, await this.runNetwork(network));
-    }
-    return didWork;
-  }
+  private async runDogecoinConfig(dogecoin: DogecoinRuntimeConfig): Promise<boolean> {
+    const latest = await this.rpc.getBlockHeight(dogecoin);
+    await this.configs.setJsonValue(configKeyBlockHeight(), latest);
 
-  private async listDogecoinNetworks(): Promise<CoreDogecoinNetwork[]> {
-    return (await this.networks.listActiveNetworks()).filter(isDogecoinNetwork);
-  }
-
-  private async runNetwork(network: CoreDogecoinNetwork): Promise<boolean> {
-    const latest = await this.rpc.getBlockHeight(network);
-    await this.configs.setJsonValue(configKeyBlockHeight(network.networkId), latest);
-
-    const state = await this.ensureState(network, latest);
-    await this.publishProgress(network.networkId, latest, state);
-    await this.assertProgressWatchdog(network, latest, state);
+    const state = await this.ensureState(dogecoin, latest);
+    await this.publishProgress(latest, state);
+    await this.assertProgressWatchdog(dogecoin, latest, state);
 
     try {
-      return await this.runNetworkStage(network, latest, state);
+      return await this.runDogecoinStage(dogecoin, latest, state);
     } catch (error) {
-      await this.stateStore.setCoreIndexerError(network.networkId, formatError(error));
+      await this.stateStore.setCoreIndexerError(formatError(error));
       throw error;
     }
   }
 
-  private runNetworkStage(
-    network: CoreDogecoinNetwork,
+  private runDogecoinStage(
+    dogecoin: DogecoinRuntimeConfig,
     latest: number,
     state: CoreIndexerState,
   ): Promise<boolean> {
     const stageRunners: Record<CoreIndexerState['stage'], () => Promise<boolean>> = {
-      sync_backfill: () => this.syncBackfill(network, latest, state),
-      process_backfill: () => this.processBackfill(network, latest, state),
-      online: () => this.online(network, latest, state),
+      sync_backfill: () => this.syncBackfill(dogecoin, latest, state),
+      process_backfill: () => this.processBackfill(dogecoin, latest, state),
+      online: () => this.online(dogecoin, latest, state),
     };
     return stageRunners[state.stage]();
   }
 
   private async ensureState(
-    network: CoreDogecoinNetwork,
+    dogecoin: DogecoinRuntimeConfig,
     latest: number,
   ): Promise<CoreIndexerState> {
-    const current = await this.stateStore.getCoreIndexerState(network.networkId);
+    const current = await this.stateStore.getCoreIndexerState();
     if (current) {
       return current;
     }
 
-    const storedSyncTail = await this.storedSyncTail(network.networkId);
+    const storedSyncTail = await this.storedSyncTail();
     const syncTail = Math.min(storedSyncTail, latest);
     const state = await this.stateStore.upsertCoreIndexerState({
-      networkId: network.networkId,
       stage: 'sync_backfill',
       syncTail,
       processTail: -1,
@@ -270,85 +245,82 @@ export class CoreDogecoinIndexerService {
       lastError: null,
     });
     console.info(
-      `[onlydoge] core indexer initialized network=${network.id} stage=sync_backfill sync_tail=${syncTail} process_tail=-1`,
+      `[onlydoge] core indexer initialized chain=${dogecoin.id} stage=sync_backfill sync_tail=${syncTail} process_tail=-1`,
     );
     return state;
   }
 
-  private async storedSyncTail(networkId: PrimaryId): Promise<number> {
-    const value = await this.configs.getJsonValue<number>(configKeyIndexerSyncTail(networkId));
+  private async storedSyncTail(): Promise<number> {
+    const value = await this.configs.getJsonValue<number>(configKeyIndexerSyncTail());
     return value ?? -1;
   }
 
   private async syncBackfill(
-    network: CoreDogecoinNetwork,
+    dogecoin: DogecoinRuntimeConfig,
     latest: number,
     state: CoreIndexerState,
   ): Promise<boolean> {
     if (shouldPromoteToProcessBackfill(state, latest, this.settings.coreSyncCompleteDistance)) {
       await this.stateStore.upsertCoreIndexerState({
-        networkId: network.networkId,
         stage: 'process_backfill',
         onlineTip: latest,
       });
-      await this.configs.setJsonValue(configKeyIndexerStage(network.networkId), 'process_backfill');
+      await this.configs.setJsonValue(configKeyIndexerStage(), 'process_backfill');
       console.info(
-        `[onlydoge] core stage changed network=${network.id} stage=process_backfill sync_tail=${state.syncTail} latest=${latest}`,
+        `[onlydoge] core stage changed chain=${dogecoin.id} stage=process_backfill sync_tail=${state.syncTail} latest=${latest}`,
       );
       return true;
     }
 
     const end = Math.min(latest, state.syncTail + this.settings.syncWindow);
-    return this.syncRawBlockWindow(network, latest, state, end, 'sync_backfill');
+    return this.syncRawBlockWindow(dogecoin, latest, state, end, 'sync_backfill');
   }
 
   private async syncRawBlockWindow(
-    network: CoreDogecoinNetwork,
+    dogecoin: DogecoinRuntimeConfig,
     latest: number,
     state: CoreIndexerState,
     end: number,
     stage: CoreIndexerState['stage'],
   ): Promise<boolean> {
     const heights = range(state.syncTail + 1, end);
-    return this.syncRawBlockHeights(network, latest, state, heights, end, stage);
+    return this.syncRawBlockHeights(dogecoin, latest, state, heights, end, stage);
   }
 
   private async syncRawBlockHeights(
-    network: CoreDogecoinNetwork,
+    dogecoin: DogecoinRuntimeConfig,
     latest: number,
     state: CoreIndexerState,
     heights: number[],
     syncTail: number,
     stage: CoreIndexerState['stage'],
   ): Promise<boolean> {
-    await this.storeRawBlockHeights(network, heights);
+    await this.storeRawBlockHeights(dogecoin, heights);
 
     const nextState = await this.stateStore.upsertCoreIndexerState({
-      networkId: network.networkId,
       stage,
       syncTail,
       onlineTip: latest,
       lastError: null,
     });
-    await this.publishProgress(network.networkId, latest, nextState);
+    await this.publishProgress(latest, nextState);
     console.info(
-      `[onlydoge] core synced network=${network.id} blocks=${heights.at(0) ?? state.syncTail + 1}-${heights.at(-1) ?? syncTail} latest=${latest}`,
+      `[onlydoge] core synced chain=${dogecoin.id} blocks=${heights.at(0) ?? state.syncTail + 1}-${heights.at(-1) ?? syncTail} latest=${latest}`,
     );
     return true;
   }
 
   private async storeRawBlockHeights(
-    network: CoreDogecoinNetwork,
+    dogecoin: DogecoinRuntimeConfig,
     heights: number[],
   ): Promise<void> {
     await mapWithConcurrency(heights, this.settings.syncConcurrency, async (height) => {
-      const snapshot = await this.rpc.getBlockSnapshot(network, height);
-      await this.rawBlocks.putPart(network.networkId, height, rawBlockPart, snapshot, {
+      const snapshot = await this.rpc.getBlockSnapshot(dogecoin, height);
+      await this.rawBlocks.putPart(height, rawBlockPart, snapshot, {
         timeoutMs: this.settings.coreRawStorageTimeoutMs,
       });
       const block = parseDogecoinBlockSnapshot(snapshot);
       await this.stateStore.upsertCoreBlock({
-        networkId: network.networkId,
         blockHeight: block.height,
         blockHash: block.hash,
         previousBlockHash: block.previousHash,
@@ -362,58 +334,62 @@ export class CoreDogecoinIndexerService {
   }
 
   private async processBackfill(
-    network: CoreDogecoinNetwork,
+    dogecoin: DogecoinRuntimeConfig,
     latest: number,
     state: CoreIndexerState,
   ): Promise<boolean> {
     const currentStateReady =
-      (await this.configs.getJsonValue<boolean>(
-        configKeyDogecoinCurrentStateReady(network.networkId),
-      )) === true;
+      (await this.configs.getJsonValue<boolean>(configKeyDogecoinCurrentStateReady())) === true;
 
     if (state.processTail >= state.syncTail) {
-      return this.transitionCompletedBackfill(network, latest, state, currentStateReady);
+      return this.transitionCompletedBackfill(dogecoin, latest, state, currentStateReady);
     }
 
-    return this.processBackfillWindow(network, latest, state, currentStateReady);
+    return this.processBackfillWindow(dogecoin, latest, state, currentStateReady);
   }
 
   private async transitionCompletedBackfill(
-    network: CoreDogecoinNetwork,
+    dogecoin: DogecoinRuntimeConfig,
     latest: number,
     state: CoreIndexerState,
     currentStateReady: boolean,
   ): Promise<boolean> {
     if (state.processTail >= latest - this.settings.coreOnlineTipDistance) {
-      await this.promoteBackfillToOnline(network, latest, state, currentStateReady);
+      await this.promoteBackfillToOnline(dogecoin, latest, state, currentStateReady);
       return true;
     }
 
-    await this.returnBackfillToSync(network, latest, state);
+    await this.returnBackfillToSync(dogecoin, latest, state);
     return true;
   }
 
   private async promoteBackfillToOnline(
-    network: CoreDogecoinNetwork,
+    dogecoin: DogecoinRuntimeConfig,
     latest: number,
     state: CoreIndexerState,
     currentStateReady: boolean,
   ): Promise<void> {
-    await this.materializeCurrentStateIfNeeded(network, state, currentStateReady);
+    await this.materializeCurrentStateIfNeeded(state, currentStateReady);
     await this.stateStore.upsertCoreIndexerState({
-      networkId: network.networkId,
       stage: 'online',
       onlineTip: latest,
       lastError: null,
     });
-    await this.configs.setJsonValue(configKeyIndexerStage(network.networkId), 'online');
+    await Promise.all([
+      this.configs.setJsonValue(configKeyIndexerStage(), 'online'),
+      this.configs.setJsonValue(configKeyDogecoinHistoryReady(), true),
+      this.configs.setJsonValue(configKeyIndexerFactTail(), state.processTail),
+      this.configs.setJsonValue(
+        configKeyIndexerFactProgress(),
+        toProgress(state.processTail, latest),
+      ),
+    ]);
     console.info(
-      `[onlydoge] core stage changed network=${network.id} stage=online process_tail=${state.processTail} latest=${latest}`,
+      `[onlydoge] core stage changed chain=${dogecoin.id} stage=online process_tail=${state.processTail} latest=${latest}`,
     );
   }
 
   private async materializeCurrentStateIfNeeded(
-    network: CoreDogecoinNetwork,
     state: CoreIndexerState,
     currentStateReady: boolean,
   ): Promise<void> {
@@ -421,33 +397,28 @@ export class CoreDogecoinIndexerService {
       return;
     }
 
-    await this.stateStore.materializeCoreDogecoinCurrentState(
-      network.networkId,
-      state.processTail,
-      {
-        statementTimeoutMs: this.settings.coreDbStatementTimeoutMs,
-      },
-    );
+    await this.stateStore.materializeCoreDogecoinCurrentState(state.processTail, {
+      statementTimeoutMs: this.settings.coreDbStatementTimeoutMs,
+    });
   }
 
   private async returnBackfillToSync(
-    network: CoreDogecoinNetwork,
+    dogecoin: DogecoinRuntimeConfig,
     latest: number,
     state: CoreIndexerState,
   ): Promise<void> {
     await this.stateStore.upsertCoreIndexerState({
-      networkId: network.networkId,
       stage: 'sync_backfill',
       onlineTip: latest,
     });
-    await this.configs.setJsonValue(configKeyIndexerStage(network.networkId), 'sync_backfill');
+    await this.configs.setJsonValue(configKeyIndexerStage(), 'sync_backfill');
     console.info(
-      `[onlydoge] core stage changed network=${network.id} stage=sync_backfill reason=tip-advanced process_tail=${state.processTail} latest=${latest}`,
+      `[onlydoge] core stage changed chain=${dogecoin.id} stage=sync_backfill reason=tip-advanced process_tail=${state.processTail} latest=${latest}`,
     );
   }
 
   private async processBackfillWindow(
-    network: CoreDogecoinNetwork,
+    dogecoin: DogecoinRuntimeConfig,
     latest: number,
     state: CoreIndexerState,
     currentStateReady: boolean,
@@ -455,52 +426,51 @@ export class CoreDogecoinIndexerService {
   ): Promise<boolean> {
     const end = Math.min(state.syncTail, state.processTail + this.settings.coreProcessWindow);
     const heights = range(state.processTail + 1, end);
-    const metrics = await this.processWindow(network, latest, heights, currentStateReady);
-    await this.publishWindowProgress(network, latest, metrics, stage);
+    const metrics = await this.processWindow(dogecoin, latest, heights, currentStateReady);
+    await this.publishWindowProgress(dogecoin, latest, metrics, stage);
 
     console.info(
-      `[onlydoge] core processed network=${network.id} blocks=${metrics.start}-${metrics.end} sync_tail=${state.syncTail} latest=${latest}`,
+      `[onlydoge] core processed chain=${dogecoin.id} blocks=${metrics.start}-${metrics.end} sync_tail=${state.syncTail} latest=${latest}`,
     );
     return true;
   }
 
   private async processWindow(
-    network: CoreDogecoinNetwork,
+    dogecoin: DogecoinRuntimeConfig,
     _latest: number,
     heights: number[],
     updateCurrentState: boolean,
   ): Promise<CoreWindowMetrics> {
     const bounds = requireCoreProcessWindowBounds(heights);
-    const attempt = this.createCoreBlockAttempt(network, bounds.lastHeight);
-    this.activeBlockAttempts.set(network.networkId, attempt);
+    const attempt = this.createCoreBlockAttempt(bounds.lastHeight);
+    this.activeBlockAttempt = attempt;
 
     try {
       return await this.processWindowWithAttempt(
-        network,
+        dogecoin,
         heights,
         bounds,
         updateCurrentState,
         attempt,
       );
     } catch (error) {
-      await this.exitForCoreBlockTimeout(error, network, attempt.height);
+      await this.exitForCoreBlockTimeout(error, dogecoin, attempt.height);
       throw error;
     } finally {
-      this.clearActiveBlockAttempt(network.networkId, attempt);
+      this.clearActiveBlockAttempt(attempt);
     }
   }
 
-  private createCoreBlockAttempt(network: CoreDogecoinNetwork, height: number): CoreBlockAttempt {
+  private createCoreBlockAttempt(height: number): CoreBlockAttempt {
     return {
       activeStep: 'load_raw',
       height,
-      networkId: network.networkId,
       startedAtMs: Date.now(),
     };
   }
 
   private async processWindowWithAttempt(
-    network: CoreDogecoinNetwork,
+    dogecoin: DogecoinRuntimeConfig,
     heights: number[],
     bounds: CoreProcessWindowBounds,
     updateCurrentState: boolean,
@@ -508,12 +478,11 @@ export class CoreDogecoinIndexerService {
   ): Promise<CoreWindowMetrics> {
     const totalStartedAt = Date.now();
     const { result: snapshots, elapsedMs: loadRawMs } = await this.loadRawSnapshots(
-      network,
+      dogecoin,
       heights,
       attempt,
     );
     const { result: applications, elapsedMs: buildMs } = await this.buildWindowApplications(
-      network.networkId,
       snapshots,
       attempt,
     );
@@ -535,42 +504,36 @@ export class CoreDogecoinIndexerService {
   }
 
   private loadRawSnapshots(
-    network: CoreDogecoinNetwork,
+    dogecoin: DogecoinRuntimeConfig,
     heights: number[],
     attempt: CoreBlockAttempt,
   ): Promise<{ elapsedMs: number; result: Record<string, unknown>[] }> {
     return this.runCoreBlockStep(attempt, 'load_raw', () =>
       mapWithConcurrency(heights, this.settings.coreProcessLoadConcurrency, (height) =>
-        this.loadRawSnapshot(network, height),
+        this.loadRawSnapshot(dogecoin, height),
       ),
     );
   }
 
   private async loadRawSnapshot(
-    network: CoreDogecoinNetwork,
+    dogecoin: DogecoinRuntimeConfig,
     height: number,
   ): Promise<Record<string, unknown>> {
-    const snapshot = await this.rawBlocks.getPart<Record<string, unknown>>(
-      network.networkId,
-      height,
-      rawBlockPart,
-      {
-        timeoutMs: this.settings.coreRawStorageTimeoutMs,
-      },
-    );
+    const snapshot = await this.rawBlocks.getPart<Record<string, unknown>>(height, rawBlockPart, {
+      timeoutMs: this.settings.coreRawStorageTimeoutMs,
+    });
     if (!snapshot) {
-      throw new Error(`missing raw dogecoin block snapshot network=${network.id} height=${height}`);
+      throw new Error(`missing raw dogecoin block snapshot chain=${dogecoin.id} height=${height}`);
     }
     return snapshot;
   }
 
   private buildWindowApplications(
-    networkId: PrimaryId,
     snapshots: Record<string, unknown>[],
     attempt: CoreBlockAttempt,
   ): Promise<{ elapsedMs: number; result: CoreDogecoinBlockApplication[] }> {
     return this.runCoreBlockStep(attempt, 'build_application', () =>
-      Promise.resolve(this.buildFastBlockApplications(networkId, snapshots)),
+      Promise.resolve(this.buildFastBlockApplications(snapshots)),
     );
   }
 
@@ -589,21 +552,20 @@ export class CoreDogecoinIndexerService {
     );
   }
 
-  private clearActiveBlockAttempt(networkId: PrimaryId, attempt: CoreBlockAttempt): void {
-    if (this.activeBlockAttempts.get(networkId) === attempt) {
-      this.activeBlockAttempts.delete(networkId);
+  private clearActiveBlockAttempt(attempt: CoreBlockAttempt): void {
+    if (this.activeBlockAttempt === attempt) {
+      this.activeBlockAttempt = null;
     }
   }
 
   private buildFastBlockApplications(
-    networkId: PrimaryId,
     snapshots: Record<string, unknown>[],
   ): CoreDogecoinBlockApplication[] {
-    return buildFastCoreDogecoinBlockApplications(networkId, snapshots);
+    return buildFastCoreDogecoinBlockApplications(snapshots);
   }
 
   private async publishWindowProgress(
-    network: CoreDogecoinNetwork,
+    dogecoin: DogecoinRuntimeConfig,
     latest: number,
     metrics: CoreWindowMetrics,
     stage: CoreIndexerState['stage'] = 'process_backfill',
@@ -615,62 +577,60 @@ export class CoreDogecoinIndexerService {
         {
           activeStep: 'publish_progress',
           height: metrics.end,
-          networkId: network.networkId,
           startedAtMs: Date.now(),
         },
         'publish_progress',
         async () => {
           const state = await this.stateStore.upsertCoreIndexerState({
-            networkId: network.networkId,
             stage,
             processTail: metrics.end,
             onlineTip: latest,
             lastError: null,
           });
-          await this.publishProgress(network.networkId, latest, state);
+          await this.publishProgress(latest, state);
           return state;
         },
       );
       nextState = published.result;
       publishMs = published.elapsedMs;
     } catch (error) {
-      await this.exitForCoreBlockTimeout(error, network, metrics.end);
+      await this.exitForCoreBlockTimeout(error, dogecoin, metrics.end);
       throw error;
     }
 
     console.info(
-      `[onlydoge] phase=core-process-window network=${network.id} blocks=${metrics.start}-${metrics.end} applied=${metrics.applied} load_raw_ms=${metrics.loadRawMs} build_ms=${metrics.buildMs} apply_ms=${metrics.applyMs} publish_progress_ms=${publishMs} total_ms=${metrics.totalMs + publishMs} creates=${metrics.creates} spends=${metrics.spends} process_tail=${nextState.processTail}`,
+      `[onlydoge] phase=core-process-window chain=${dogecoin.id} blocks=${metrics.start}-${metrics.end} applied=${metrics.applied} load_raw_ms=${metrics.loadRawMs} build_ms=${metrics.buildMs} apply_ms=${metrics.applyMs} publish_progress_ms=${publishMs} total_ms=${metrics.totalMs + publishMs} creates=${metrics.creates} spends=${metrics.spends} process_tail=${nextState.processTail}`,
     );
   }
 
   private async exitForCoreBlockTimeout(
     error: unknown,
-    network: CoreDogecoinNetwork,
+    dogecoin: DogecoinRuntimeConfig,
     height: number,
   ): Promise<void> {
     if (!(error instanceof CoreBlockTimeoutError)) {
       return;
     }
 
-    const message = `core block timed out network=${network.id} height=${height} active_step=${error.step} timeout_ms=${error.timeoutMs}`;
-    await this.stateStore.setCoreIndexerError(network.networkId, message);
+    const message = `core block timed out chain=${dogecoin.id} height=${height} active_step=${error.step} timeout_ms=${error.timeoutMs}`;
+    await this.stateStore.setCoreIndexerError(message);
     console.error(
-      `[onlydoge] phase=core-process error=timeout network=${network.id} height=${height} active_step=${error.step} timeout_ms=${error.timeoutMs}`,
+      `[onlydoge] phase=core-process error=timeout chain=${dogecoin.id} height=${height} active_step=${error.step} timeout_ms=${error.timeoutMs}`,
     );
     this.exitProcess(1);
   }
 
   private async online(
-    network: CoreDogecoinNetwork,
+    dogecoin: DogecoinRuntimeConfig,
     latest: number,
     state: CoreIndexerState,
   ): Promise<boolean> {
-    const didWork = await this.advanceOnlineBacklog(network, latest, state);
+    const didWork = await this.advanceOnlineBacklog(dogecoin, latest, state);
     if (didWork) {
       return true;
     }
 
-    if (await this.publishOnlineNoWorkIfPossible(network, latest, state)) {
+    if (await this.publishOnlineNoWorkIfPossible(dogecoin, latest, state)) {
       return false;
     }
 
@@ -678,44 +638,43 @@ export class CoreDogecoinIndexerService {
   }
 
   private async publishOnlineNoWorkIfPossible(
-    network: CoreDogecoinNetwork,
+    dogecoin: DogecoinRuntimeConfig,
     latest: number,
     state: CoreIndexerState,
   ): Promise<boolean> {
-    if (await this.publishReadyOnlineStateIfCurrent(network, latest, state)) {
+    if (await this.publishReadyOnlineStateIfCurrent(dogecoin, latest, state)) {
       return true;
     }
 
-    return this.publishProgressIfAtLatest(network, latest, state);
+    return this.publishProgressIfAtLatest(latest, state);
   }
 
   private async isCurrentOnlineStateReady(
-    network: CoreDogecoinNetwork,
     latest: number,
     state: CoreIndexerState,
   ): Promise<boolean> {
     return (
       state.syncTail >= latest &&
-      (await this.isDogecoinCurrentStateReady(network.networkId)) &&
+      (await this.isDogecoinCurrentStateReady()) &&
       state.processTail >= latest
     );
   }
 
   private async publishReadyOnlineStateIfCurrent(
-    network: CoreDogecoinNetwork,
+    dogecoin: DogecoinRuntimeConfig,
     latest: number,
     state: CoreIndexerState,
   ): Promise<boolean> {
-    if (!(await this.isCurrentOnlineStateReady(network, latest, state))) {
+    void dogecoin;
+    if (!(await this.isCurrentOnlineStateReady(latest, state))) {
       return false;
     }
 
-    await this.publishReadyOnlineState(network.networkId, latest, state);
+    await this.publishReadyOnlineState(latest, state);
     return true;
   }
 
   private async publishProgressIfAtLatest(
-    network: CoreDogecoinNetwork,
     latest: number,
     state: CoreIndexerState,
   ): Promise<boolean> {
@@ -723,21 +682,16 @@ export class CoreDogecoinIndexerService {
       return false;
     }
 
-    await this.publishProgress(network.networkId, latest, state);
+    await this.publishProgress(latest, state);
     return true;
   }
 
-  private async publishReadyOnlineState(
-    networkId: PrimaryId,
-    latest: number,
-    state: CoreIndexerState,
-  ): Promise<void> {
-    const nextState = await this.ensureReadyOnlineState(networkId, latest, state);
-    await this.publishProgress(networkId, latest, nextState);
+  private async publishReadyOnlineState(latest: number, state: CoreIndexerState): Promise<void> {
+    const nextState = await this.ensureReadyOnlineState(latest, state);
+    await this.publishProgress(latest, nextState);
   }
 
   private async ensureReadyOnlineState(
-    networkId: PrimaryId,
     latest: number,
     state: CoreIndexerState,
   ): Promise<CoreIndexerState> {
@@ -746,7 +700,6 @@ export class CoreDogecoinIndexerService {
     }
 
     return this.stateStore.upsertCoreIndexerState({
-      networkId,
       stage: 'online',
       onlineTip: latest,
       lastError: null,
@@ -754,20 +707,25 @@ export class CoreDogecoinIndexerService {
   }
 
   private async advanceOnlineBacklog(
-    network: CoreDogecoinNetwork,
+    dogecoin: DogecoinRuntimeConfig,
     latest: number,
     state: CoreIndexerState,
   ): Promise<boolean> {
     const syncEnd = Math.min(latest, state.syncTail + this.settings.syncWindow);
-    const didSync = await this.syncOnlineBacklogIfNeeded(network, latest, state, syncEnd);
+    const didSync = await this.syncOnlineBacklogIfNeeded(dogecoin, latest, state, syncEnd);
 
-    const refreshed = await this.refreshedOnlineBacklogState(network, state, syncEnd);
-    const didProcess = await this.processOnlineBacklogIfNeeded(network, latest, refreshed, didSync);
+    const refreshed = await this.refreshedOnlineBacklogState(state, syncEnd);
+    const didProcess = await this.processOnlineBacklogIfNeeded(
+      dogecoin,
+      latest,
+      refreshed,
+      didSync,
+    );
     return [didSync, didProcess].includes(true);
   }
 
   private async syncOnlineBacklogIfNeeded(
-    network: CoreDogecoinNetwork,
+    dogecoin: DogecoinRuntimeConfig,
     latest: number,
     state: CoreIndexerState,
     syncEnd: number,
@@ -779,16 +737,15 @@ export class CoreDogecoinIndexerService {
 
     const start = onlineRawRefreshStart(state, syncEnd, this.settings.coreReprocessDepth);
     const heights = range(start, syncEnd);
-    await this.syncRawBlockHeights(network, latest, state, heights, syncEnd, 'online');
+    await this.syncRawBlockHeights(dogecoin, latest, state, heights, syncEnd, 'online');
     return true;
   }
 
   private async refreshedOnlineBacklogState(
-    network: CoreDogecoinNetwork,
     state: CoreIndexerState,
     syncEnd: number,
   ): Promise<CoreIndexerState> {
-    const refreshed = await this.stateStore.getCoreIndexerState(network.networkId);
+    const refreshed = await this.stateStore.getCoreIndexerState();
     if (refreshed) {
       return refreshed;
     }
@@ -797,7 +754,7 @@ export class CoreDogecoinIndexerService {
   }
 
   private async processOnlineBacklogIfNeeded(
-    network: CoreDogecoinNetwork,
+    dogecoin: DogecoinRuntimeConfig,
     latest: number,
     state: CoreIndexerState,
     forceTailReprocess: boolean,
@@ -808,17 +765,17 @@ export class CoreDogecoinIndexerService {
     }
 
     const didProcess = await this.processOnlineWindow(
-      network,
+      dogecoin,
       latest,
       state,
       processTarget,
-      await this.isDogecoinCurrentStateReady(network.networkId),
+      await this.isDogecoinCurrentStateReady(),
     );
     return didProcess;
   }
 
   private async processOnlineWindow(
-    network: CoreDogecoinNetwork,
+    dogecoin: DogecoinRuntimeConfig,
     latest: number,
     state: CoreIndexerState,
     processTarget: number,
@@ -830,72 +787,60 @@ export class CoreDogecoinIndexerService {
       this.settings.coreReprocessDepth,
       this.settings.coreProcessWindow,
     );
-    await this.storeRawBlockHeights(network, heights);
-    const metrics = await this.processWindow(network, latest, heights, currentStateReady);
-    await this.publishWindowProgress(network, latest, metrics, 'online');
+    await this.storeRawBlockHeights(dogecoin, heights);
+    const metrics = await this.processWindow(dogecoin, latest, heights, currentStateReady);
+    await this.publishWindowProgress(dogecoin, latest, metrics, 'online');
 
     console.info(
-      `[onlydoge] core processed network=${network.id} blocks=${metrics.start}-${metrics.end} sync_tail=${state.syncTail} latest=${latest}`,
+      `[onlydoge] core processed chain=${dogecoin.id} blocks=${metrics.start}-${metrics.end} sync_tail=${state.syncTail} latest=${latest}`,
     );
     return metrics.applied || state.processTail < metrics.end;
   }
 
-  private async publishProgress(
-    networkId: PrimaryId,
-    latest: number,
-    state: CoreIndexerState,
-  ): Promise<void> {
+  private async publishProgress(latest: number, state: CoreIndexerState): Promise<void> {
     const historyReady =
-      (await this.configs.getJsonValue<boolean>(configKeyDogecoinHistoryReady(networkId))) === true;
+      (await this.configs.getJsonValue<boolean>(configKeyDogecoinHistoryReady())) === true;
     const writes = [
       this.configs.setJsonValue(configKeyPrimary(), createLease(this.instanceId)),
-      this.configs.setJsonValue(configKeyIndexerStage(networkId), state.stage),
-      this.configs.setJsonValue(configKeyIndexerSyncTail(networkId), state.syncTail),
-      this.configs.setJsonValue(configKeyIndexerProcessTail(networkId), state.processTail),
+      this.configs.setJsonValue(configKeyIndexerStage(), state.stage),
+      this.configs.setJsonValue(configKeyIndexerSyncTail(), state.syncTail),
+      this.configs.setJsonValue(configKeyIndexerProcessTail(), state.processTail),
       this.configs.setJsonValue(
-        configKeyIndexerFinalizedTail(networkId),
+        configKeyIndexerFinalizedTail(),
         finalizedTail(state.processTail, this.settings.coreReprocessDepth),
       ),
+      this.configs.setJsonValue(configKeyIndexerReprocessDepth(), this.settings.coreReprocessDepth),
+      this.configs.setJsonValue(configKeyIndexerSyncProgress(), toProgress(state.syncTail, latest)),
       this.configs.setJsonValue(
-        configKeyIndexerReprocessDepth(networkId),
-        this.settings.coreReprocessDepth,
-      ),
-      this.configs.setJsonValue(
-        configKeyIndexerSyncProgress(networkId),
-        toProgress(state.syncTail, latest),
-      ),
-      this.configs.setJsonValue(
-        configKeyIndexerProcessProgress(networkId),
+        configKeyIndexerProcessProgress(),
         toProgress(state.processTail, latest),
       ),
     ];
     if (historyReady) {
       writes.push(
-        this.configs.setJsonValue(configKeyIndexerFactTail(networkId), state.processTail),
+        this.configs.setJsonValue(configKeyIndexerFactTail(), state.processTail),
         this.configs.setJsonValue(
-          configKeyIndexerFactProgress(networkId),
+          configKeyIndexerFactProgress(),
           toProgress(state.processTail, latest),
         ),
       );
     }
-    if (await this.isDogecoinAnalyticsFactsReady(networkId)) {
+    if (await this.isDogecoinAnalyticsFactsReady()) {
       writes.push(
         this.configs.setJsonValue(
-          configKeyDogecoinAnalyticsFactsTail(networkId),
+          configKeyDogecoinAnalyticsFactsTail(),
           finalizedTail(state.processTail, this.settings.coreReprocessDepth),
         ),
       );
     }
 
     await Promise.all(writes);
-    this.observeProgress(networkId, state);
+    this.observeProgress(state);
   }
 
-  private async isDogecoinAnalyticsFactsReady(networkId: PrimaryId): Promise<boolean> {
+  private async isDogecoinAnalyticsFactsReady(): Promise<boolean> {
     return (
-      (await this.configs.getJsonValue<boolean>(
-        configKeyDogecoinAnalyticsFactsReady(networkId),
-      )) === true
+      (await this.configs.getJsonValue<boolean>(configKeyDogecoinAnalyticsFactsReady())) === true
     );
   }
 
@@ -923,46 +868,42 @@ export class CoreDogecoinIndexerService {
   }
 
   private async assertProgressWatchdog(
-    network: CoreDogecoinNetwork,
+    dogecoin: DogecoinRuntimeConfig,
     latest: number,
     state: CoreIndexerState,
   ): Promise<void> {
-    if (await this.shouldSkipProgressWatchdog(network.networkId, state)) {
+    if (await this.shouldSkipProgressWatchdog(state)) {
       return;
     }
 
-    await this.assertObservedProgressWatchdog(network, latest, state);
+    await this.assertObservedProgressWatchdog(dogecoin, latest, state);
   }
 
   private async assertObservedProgressWatchdog(
-    network: CoreDogecoinNetwork,
+    dogecoin: DogecoinRuntimeConfig,
     latest: number,
     state: CoreIndexerState,
   ): Promise<void> {
-    const observation = this.observeProgress(network.networkId, state);
+    const observation = this.observeProgress(state);
     const ageMs = this.coreProgressBacklogAgeMs(state, latest, observation);
     if (isFreshProgressAge(ageMs, this.settings.coreProgressWatchdogMs)) {
       return;
     }
 
-    await this.exitForExpiredProgressWatchdog(network, state, requireProgressAge(ageMs));
+    await this.exitForExpiredProgressWatchdog(dogecoin, state, requireProgressAge(ageMs));
   }
 
-  private async shouldSkipProgressWatchdog(
-    networkId: PrimaryId,
-    state: CoreIndexerState,
-  ): Promise<boolean> {
+  private async shouldSkipProgressWatchdog(state: CoreIndexerState): Promise<boolean> {
     if (state.stage !== 'online') {
       return false;
     }
 
-    return this.isDogecoinCurrentStateReady(networkId);
+    return this.isDogecoinCurrentStateReady();
   }
 
-  private async isDogecoinCurrentStateReady(networkId: PrimaryId): Promise<boolean> {
+  private async isDogecoinCurrentStateReady(): Promise<boolean> {
     return (
-      (await this.configs.getJsonValue<boolean>(configKeyDogecoinCurrentStateReady(networkId))) ===
-      true
+      (await this.configs.getJsonValue<boolean>(configKeyDogecoinCurrentStateReady())) === true
     );
   }
 
@@ -979,39 +920,36 @@ export class CoreDogecoinIndexerService {
   }
 
   private async exitForExpiredProgressWatchdog(
-    network: CoreDogecoinNetwork,
+    dogecoin: DogecoinRuntimeConfig,
     state: CoreIndexerState,
     ageMs: number,
   ): Promise<void> {
-    const activeAttempt = activeAttemptLog(this.activeBlockAttempts.get(network.networkId));
-    const message = `core progress watchdog expired network=${network.id} stage=${state.stage} sync_tail=${state.syncTail} process_tail=${state.processTail} age_ms=${ageMs}`;
-    await this.stateStore.setCoreIndexerError(network.networkId, message);
+    const activeAttempt = activeAttemptLog(this.activeBlockAttempt ?? undefined);
+    const message = `core progress watchdog expired chain=${dogecoin.id} stage=${state.stage} sync_tail=${state.syncTail} process_tail=${state.processTail} age_ms=${ageMs}`;
+    await this.stateStore.setCoreIndexerError(message);
     console.error(
-      `[onlydoge] phase=core-watchdog error=no-progress network=${network.id} stage=${state.stage} sync_tail=${state.syncTail} process_tail=${state.processTail} age_ms=${ageMs} active_height=${activeAttempt.height} active_step=${activeAttempt.step}`,
+      `[onlydoge] phase=core-watchdog error=no-progress chain=${dogecoin.id} stage=${state.stage} sync_tail=${state.syncTail} process_tail=${state.processTail} age_ms=${ageMs} active_height=${activeAttempt.height} active_step=${activeAttempt.step}`,
     );
     this.exitProcess(1);
   }
 
-  private observeProgress(networkId: PrimaryId, state: CoreIndexerState): ProgressObservation {
-    const previous = this.progressObservations.get(networkId);
+  private observeProgress(state: CoreIndexerState): ProgressObservation {
+    const previous = this.progressObservation ?? undefined;
     if (isSameProgressObservation(previous, state)) {
       return previous;
     }
 
-    return this.recordProgressObservation(networkId, state);
+    return this.recordProgressObservation(state);
   }
 
-  private recordProgressObservation(
-    networkId: PrimaryId,
-    state: CoreIndexerState,
-  ): ProgressObservation {
+  private recordProgressObservation(state: CoreIndexerState): ProgressObservation {
     const next = {
       observedAtMs: Date.now(),
       processTail: state.processTail,
       stage: state.stage,
       syncTail: state.syncTail,
     };
-    this.progressObservations.set(networkId, next);
+    this.progressObservation = next;
     return next;
   }
 
@@ -1074,27 +1012,10 @@ export class CoreDogecoinIndexerService {
     }
     return claimed;
   }
-
-  private logOnce(message: string): void {
-    if (this.latestLog === message) {
-      return;
-    }
-
-    this.latestLog = message;
-    console.info(message);
-  }
-}
-
-function isDogecoinNetwork(network: IndexedNetwork): network is CoreDogecoinNetwork {
-  return network.architecture === 'dogecoin';
 }
 
 function shouldContinueStartLoop(signal: AbortSignal | undefined): boolean {
   return signal?.aborted !== true;
-}
-
-function didAnyNetworkWork(previous: boolean, next: boolean): boolean {
-  return [previous, next].includes(true);
 }
 
 function shouldPromoteToProcessBackfill(
@@ -1343,11 +1264,10 @@ async function withTimeout<T>(
 }
 
 export function buildFastCoreDogecoinBlockApplications(
-  networkId: PrimaryId,
   snapshots: Record<string, unknown>[],
 ): CoreDogecoinBlockApplication[] {
   const tracker = createCoreWindowKeyTracker();
-  return snapshots.map((snapshot) => buildCoreBlockApplication(networkId, snapshot, tracker));
+  return snapshots.map((snapshot) => buildCoreBlockApplication(snapshot, tracker));
 }
 
 function parseDogecoinBlockSnapshot(snapshot: Record<string, unknown>): ParsedDogecoinBlock & {
@@ -1372,15 +1292,13 @@ function createCoreWindowKeyTracker(): CoreWindowKeyTracker {
 }
 
 function buildCoreBlockApplication(
-  networkId: PrimaryId,
   snapshot: Record<string, unknown>,
   tracker: CoreWindowKeyTracker,
 ): CoreDogecoinBlockApplication {
   const block = parseDogecoinBlockSnapshot(snapshot);
-  const effects = collectCoreBlockEffects(networkId, block, tracker);
+  const effects = collectCoreBlockEffects(block, tracker);
 
   return {
-    networkId,
     blockHeight: block.height,
     blockHash: block.hash,
     previousBlockHash: block.previousHash,
@@ -1393,20 +1311,18 @@ function buildCoreBlockApplication(
 }
 
 function collectCoreBlockEffects(
-  networkId: PrimaryId,
   block: ParsedDogecoinBlock,
   tracker: CoreWindowKeyTracker,
 ): CoreTransactionEffects {
   const effects: CoreTransactionEffects = { utxoCreates: [], utxoSpends: [] };
   for (const [txIndex, tx] of block.tx.entries()) {
-    appendTransactionEffects(effects, networkId, block, tx, txIndex, tracker);
+    appendTransactionEffects(effects, block, tx, txIndex, tracker);
   }
   return effects;
 }
 
 function appendTransactionEffects(
   effects: CoreTransactionEffects,
-  networkId: PrimaryId,
   block: ParsedDogecoinBlock,
   tx: DogecoinTransaction,
   txIndex: number,
@@ -1416,7 +1332,7 @@ function appendTransactionEffects(
   const isCoinbase = hasCoinbaseInput(tx);
   effects.utxoSpends.push(...buildTransactionSpends(txid, block.height, tx, tracker));
   effects.utxoCreates.push(
-    ...buildTransactionOutputs(networkId, block, tx, txid, txIndex, isCoinbase, tracker),
+    ...buildTransactionOutputs(block, tx, txid, txIndex, isCoinbase, tracker),
   );
 }
 
@@ -1469,7 +1385,6 @@ function buildTransactionSpend(
 }
 
 function buildTransactionOutputs(
-  networkId: PrimaryId,
   block: ParsedDogecoinBlock,
   tx: DogecoinTransaction,
   txid: string,
@@ -1480,23 +1395,13 @@ function buildTransactionOutputs(
   const outputs: ProjectionUtxoOutput[] = [];
   for (const [outputIndex, output] of dogecoinOutputs(tx).entries()) {
     outputs.push(
-      buildTransactionOutput(
-        networkId,
-        block,
-        txid,
-        txIndex,
-        output,
-        outputIndex,
-        isCoinbase,
-        tracker,
-      ),
+      buildTransactionOutput(block, txid, txIndex, output, outputIndex, isCoinbase, tracker),
     );
   }
   return outputs;
 }
 
 function buildTransactionOutput(
-  networkId: PrimaryId,
   block: ParsedDogecoinBlock,
   txid: string,
   txIndex: number,
@@ -1509,7 +1414,6 @@ function buildTransactionOutput(
   assertUniqueCoreOutput(outputKey, tracker);
   const address = extractDogecoinOutputAddress(output);
   return {
-    networkId,
     blockHeight: block.height,
     blockHash: block.hash,
     blockTime: block.time,

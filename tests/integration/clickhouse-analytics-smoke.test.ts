@@ -10,13 +10,7 @@ import { createRuntime } from '@onlydoge/platform';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 
 import { dogecoinFixture } from '../fixtures/dogecoin';
-import {
-  createDogecoinTestNetwork,
-  installRpcMock,
-  request,
-  requireString,
-  runIndexerUntilProcessed,
-} from '../helpers';
+import { installRpcMock, request, requireString, runIndexerUntilProcessed } from '../helpers';
 
 const runSmoke = process.env.ONLYDOGE_RUN_CLICKHOUSE_SMOKE === '1';
 const describeSmoke = runSmoke ? describe : describe.skip;
@@ -66,18 +60,10 @@ describeSmoke('clickhouse analytics smoke', () => {
           throw new Error('expected authenticated API key');
         }
 
-        const network = await createDogecoinTestNetwork(ctx.runtime, actor);
-        const internalNetwork = await ctx.runtime.metadata.getNetworkByName('Dogecoin Mainnet');
-        if (!internalNetwork) {
-          throw new Error('expected Dogecoin test network');
-        }
+        void actor;
+        await runIndexerUntilProcessed(ctx, 2);
 
-        await runIndexerUntilProcessed(ctx, internalNetwork.networkId, 2);
-
-        await expect(
-          ctx.runtime.analyticsQuery.backfill({ network: network.id }),
-        ).resolves.toMatchObject({
-          network: network.id,
+        await expect(ctx.runtime.analyticsQuery.backfill()).resolves.toMatchObject({
           throughBlockHeight: 1,
         });
 
@@ -93,7 +79,6 @@ describeSmoke('clickhouse analytics smoke', () => {
           method: 'POST',
           headers: { 'x-api-token': apiToken },
           body: {
-            network: network.id,
             from: String(dogecoinFixture.blocksByHeight[0].time),
             to: String(dogecoinFixture.blocksByHeight[2].time + 60),
             limit: 5,
@@ -104,7 +89,6 @@ describeSmoke('clickhouse analytics smoke', () => {
 
         expect(response.status).toBe(200);
         expect(payload.query).toMatchObject({
-          network: network.id,
           finalizedBlockHeight: 1,
         });
         expect(payload.rows).toEqual([
@@ -275,8 +259,7 @@ function highestFeeSql(): string {
   return `
     SELECT txid, fee_base_i256 AS fee_base
     FROM analytics_transactions_v1
-    WHERE network_id = {networkId:UInt64}
-      AND block_time >= {fromTime:UInt64}
+    WHERE block_time >= {fromTime:UInt64}
       AND block_time < {toTime:UInt64}
       AND block_height <= {maxFinalizedHeight:UInt64}
       AND is_coinbase = 0

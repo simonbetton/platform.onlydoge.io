@@ -1,13 +1,7 @@
 import { URL } from 'node:url';
 
 import type { CoreDogecoinIndexerSettings } from '@onlydoge/indexing-pipeline';
-import {
-  type ChainFamily,
-  expandHomePath,
-  type Mode,
-  type PrimaryId,
-  parseMode,
-} from '@onlydoge/shared-kernel';
+import { expandHomePath, type Mode, parseMode } from '@onlydoge/shared-kernel';
 
 export interface DatabaseSettings {
   driver: 'sqlite' | 'postgres' | 'mysql';
@@ -38,8 +32,19 @@ export interface WarehouseSettings {
 
 export interface IndexerSettings extends CoreDogecoinIndexerSettings {}
 
+export interface DogecoinSettings {
+  blockTime: number;
+  chainId: number;
+  mempoolRetentionSeconds: number;
+  mempoolSampleIntervalMs: number;
+  rpcEndpoint: string;
+  rps: number;
+  zmqBlockEndpoint?: string | null;
+}
+
 export interface AppSettings {
   auditRetentionDays: number;
+  dogecoin: DogecoinSettings;
   mode: Mode;
   isIndexer: boolean;
   isHttp: boolean;
@@ -65,6 +70,7 @@ export function loadSettings(input?: {
   return {
     mode,
     auditRetentionDays: parsePositiveInteger(env.ONLYDOGE_AUDIT_RETENTION_DAYS, 365),
+    dogecoin: parseDogecoinSettings(env),
     isIndexer: isIndexerMode(mode),
     isHttp: isHttpMode(mode),
     ip: resolveSettingsValue(inputIp(input), env.ONLYDOGE_IP, '127.0.0.1'),
@@ -73,6 +79,22 @@ export function loadSettings(input?: {
     indexer: parseIndexerSettings(env),
     storage: parseStorageSettings(locations.storage, env),
     warehouse: parseWarehouseSettings(locations.warehouse, env),
+  };
+}
+
+function parseDogecoinSettings(env: NodeJS.ProcessEnv): DogecoinSettings {
+  return {
+    blockTime: parsePositiveInteger(env.ONLYDOGE_DOGECOIN_BLOCK_TIME, 60),
+    chainId: parseNonNegativeInteger(env.ONLYDOGE_DOGECOIN_CHAIN_ID, 0),
+    mempoolRetentionSeconds: parsePositiveInteger(env.ONLYDOGE_MEMPOOL_RETENTION_SECONDS, 60 * 60),
+    mempoolSampleIntervalMs: parsePositiveInteger(env.ONLYDOGE_MEMPOOL_SAMPLE_INTERVAL_MS, 15_000),
+    rpcEndpoint: resolveSettingsValue(
+      env.ONLYDOGE_DOGECOIN_RPC_ENDPOINT,
+      env.ONLYDOGE_RPC_ENDPOINT,
+      'http://127.0.0.1:22555',
+    ),
+    rps: parsePositiveInteger(env.ONLYDOGE_DOGECOIN_RPC_RPS, 25),
+    zmqBlockEndpoint: env.ONLYDOGE_DOGECOIN_ZMQ_BLOCK_ENDPOINT ?? null,
   };
 }
 
@@ -461,6 +483,19 @@ function parsePositiveInteger(value: string | undefined, fallback: number): numb
   return requirePositiveInteger(parsed, value);
 }
 
+function parseNonNegativeInteger(value: string | undefined, fallback: number): number {
+  if (!value) {
+    return fallback;
+  }
+
+  const parsed = Number.parseInt(value, 10);
+  if (!Number.isInteger(parsed) || parsed < 0) {
+    throw new Error(`Invalid non-negative integer: ${value}`);
+  }
+
+  return parsed;
+}
+
 function requirePositiveInteger(parsed: number, raw: string): number {
   if (!isPositiveInteger(parsed)) {
     throw new Error(`Invalid positive integer: ${raw}`);
@@ -471,14 +506,4 @@ function requirePositiveInteger(parsed: number, raw: string): number {
 
 function isPositiveInteger(value: number): boolean {
   return [Number.isInteger(value), value > 0].every(Boolean);
-}
-
-export interface RpcBackedNetwork {
-  architecture: ChainFamily;
-  blockTime: number;
-  id: string;
-  networkId: PrimaryId;
-  rpcEndpoint: string;
-  rps: number;
-  zmqBlockEndpoint?: string | null;
 }

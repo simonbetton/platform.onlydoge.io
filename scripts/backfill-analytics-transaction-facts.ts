@@ -1,7 +1,6 @@
 import { createRuntime } from '@onlydoge/platform';
 
 interface Options {
-  network?: string;
   throughBlockHeight?: number;
 }
 
@@ -15,11 +14,6 @@ function parseOptions(args: string[]): Options {
   const options: Options = {};
   for (let index = 0; index < args.length; index += 1) {
     const arg = args[index];
-    if (arg === '--network') {
-      options.network = requireOptionValue(args, index, arg);
-      index += 1;
-      continue;
-    }
     if (arg === '--throughBlockHeight') {
       options.throughBlockHeight = parsePositiveInteger(requireOptionValue(args, index, arg), arg);
       index += 1;

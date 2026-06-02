@@ -1,101 +1,87 @@
-import type { PrimaryId } from '@onlydoge/shared-kernel';
-
 export function configKeyPrimary(): string {
   return 'primary';
 }
 
-export function configKeyBlockHeight(networkId: PrimaryId): string {
-  return `block_height_n${networkId}`;
+export function configKeyBlockHeight(): string {
+  return 'block_height';
 }
 
-export function configKeyNetworksUpdated(): string {
-  return 'networks_updated';
+export function configKeyIndexerSyncTail(): string {
+  return 'indexer_sync_tail';
 }
 
-export function configKeyNewlyAddedAddress(networkId: PrimaryId, addressId: PrimaryId): string {
-  return `newly_added_address_n${networkId}_a${addressId}`;
+export function configKeyIndexerSyncProgress(): string {
+  return 'indexer_sync_progress';
 }
 
-export function configKeyIndexerSyncTail(networkId: PrimaryId): string {
-  return `indexer_sync_tail_n${networkId}`;
+export function configKeyIndexerStage(): string {
+  return 'indexer_stage';
 }
 
-export function configKeyIndexerSyncProgress(networkId: PrimaryId): string {
-  return `indexer_sync_progress_n${networkId}`;
+export function configKeyIndexerProcessTail(): string {
+  return 'indexer_process_tail';
 }
 
-export function configKeyIndexerStage(networkId: PrimaryId): string {
-  return `indexer_stage_n${networkId}`;
+export function configKeyIndexerFinalizedTail(): string {
+  return 'indexer_finalized_tail';
 }
 
-export function configKeyIndexerProcessTail(networkId: PrimaryId): string {
-  return `indexer_process_tail_n${networkId}`;
+export function configKeyIndexerReprocessDepth(): string {
+  return 'indexer_reprocess_depth';
 }
 
-export function configKeyIndexerFinalizedTail(networkId: PrimaryId): string {
-  return `indexer_finalized_tail_n${networkId}`;
+export function configKeyIndexerProcessProgress(): string {
+  return 'indexer_process_progress';
 }
 
-export function configKeyIndexerReprocessDepth(networkId: PrimaryId): string {
-  return `indexer_reprocess_depth_n${networkId}`;
+export function configKeyIndexerFactTail(): string {
+  return 'indexer_fact_tail';
 }
 
-export function configKeyIndexerProcessProgress(networkId: PrimaryId): string {
-  return `indexer_process_progress_n${networkId}`;
+export function configKeyIndexerFactProgress(): string {
+  return 'indexer_fact_progress';
 }
 
-export function configKeyIndexerFactTail(networkId: PrimaryId): string {
-  return `indexer_fact_tail_n${networkId}`;
+export function configKeyDogecoinCurrentStateReady(): string {
+  return 'dogecoin_current_state_ready';
 }
 
-export function configKeyIndexerFactProgress(networkId: PrimaryId): string {
-  return `indexer_fact_progress_n${networkId}`;
+export function configKeyDogecoinHistoryReady(): string {
+  return 'dogecoin_history_ready';
 }
 
-export function configKeyDogecoinCurrentStateReady(networkId: PrimaryId): string {
-  return `dogecoin_current_state_ready_n${networkId}`;
+export function configKeyDogecoinAnalyticsFactsReady(): string {
+  return 'dogecoin_analytics_facts_ready';
 }
 
-export function configKeyDogecoinHistoryReady(networkId: PrimaryId): string {
-  return `dogecoin_history_ready_n${networkId}`;
+export function configKeyDogecoinAnalyticsFactsTail(): string {
+  return 'dogecoin_analytics_facts_tail';
 }
 
-export function configKeyDogecoinAnalyticsFactsReady(networkId: PrimaryId): string {
-  return `dogecoin_analytics_facts_ready_n${networkId}`;
+export function configKeyDogecoinCurrentStateMaterialization(): string {
+  return 'dogecoin_current_state_materialization';
 }
 
-export function configKeyDogecoinAnalyticsFactsTail(networkId: PrimaryId): string {
-  return `dogecoin_analytics_facts_tail_n${networkId}`;
+export function configKeyProjectionBootstrapTail(): string {
+  return 'projection_bootstrap_tail';
 }
 
-export function configKeyDogecoinCurrentStateMaterialization(networkId: PrimaryId): string {
-  return `dogecoin_current_state_materialization_n${networkId}`;
+export function configKeyProjectionBootstrapTargetTail(): string {
+  return 'projection_bootstrap_target_tail';
 }
 
-export function configKeyProjectionBootstrapTail(networkId: PrimaryId): string {
-  return `projection_bootstrap_tail_n${networkId}`;
+export function configKeyProjectionBootstrapPhase(): string {
+  return 'projection_bootstrap_phase';
 }
 
-export function configKeyProjectionBootstrapTargetTail(networkId: PrimaryId): string {
-  return `projection_bootstrap_target_tail_n${networkId}`;
+export function configKeyProjectionBootstrapCursorUtxo(): string {
+  return 'projection_bootstrap_cursor_utxo';
 }
 
-export function configKeyProjectionBootstrapPhase(networkId: PrimaryId): string {
-  return `projection_bootstrap_phase_n${networkId}`;
+export function configKeyProjectionBootstrapCursorBalance(): string {
+  return 'projection_bootstrap_cursor_balance';
 }
 
-export function configKeyProjectionBootstrapCursorUtxo(networkId: PrimaryId): string {
-  return `projection_bootstrap_cursor_utxo_n${networkId}`;
-}
-
-export function configKeyProjectionBootstrapCursorBalance(networkId: PrimaryId): string {
-  return `projection_bootstrap_cursor_balance_n${networkId}`;
-}
-
-export function configKeyProjectionBootstrapStartedAt(networkId: PrimaryId): string {
-  return `projection_bootstrap_started_at_n${networkId}`;
-}
-
-export function configKeyIndexerLink(networkId: PrimaryId, addressId: PrimaryId): string {
-  return `indexer_link_n${networkId}_a${addressId}`;
+export function configKeyProjectionBootstrapStartedAt(): string {
+  return 'projection_bootstrap_started_at';
 }

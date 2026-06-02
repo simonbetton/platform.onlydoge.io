@@ -11,11 +11,8 @@ COPY packages/platform/package.json packages/platform/package.json
 COPY packages/shared-kernel/package.json packages/shared-kernel/package.json
 COPY packages/modules/access-control/package.json packages/modules/access-control/package.json
 COPY packages/modules/analytics-query/package.json packages/modules/analytics-query/package.json
-COPY packages/modules/entity-labeling/package.json packages/modules/entity-labeling/package.json
 COPY packages/modules/explorer-query/package.json packages/modules/explorer-query/package.json
 COPY packages/modules/indexing-pipeline/package.json packages/modules/indexing-pipeline/package.json
-COPY packages/modules/investigation-query/package.json packages/modules/investigation-query/package.json
-COPY packages/modules/network-catalog/package.json packages/modules/network-catalog/package.json
 RUN bun install --frozen-lockfile
 RUN find node_modules -name bun.lock -delete
 
@@ -32,7 +29,7 @@ FROM base AS production
 ENV NODE_ENV=production
 LABEL org.opencontainers.image.source="https://github.com/simonbetton/onlydoge-indexer"
 LABEL org.opencontainers.image.title="OnlyDoge"
-LABEL org.opencontainers.image.description="Dogecoin-first blockchain investigation backend and indexer"
+LABEL org.opencontainers.image.description="Dogecoin explorer backend and indexer"
 COPY --from=prod-deps /app/node_modules /app/node_modules
 COPY . .
 EXPOSE 80
