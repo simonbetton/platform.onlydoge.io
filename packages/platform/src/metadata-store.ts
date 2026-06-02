@@ -63,6 +63,8 @@ const legacyMetadataTables = [
   'tags',
   'entities',
   'networks',
+  'core_block_undo',
+  'core_processed_blocks',
 ] as const;
 
 export class RelationalMetadataStore
@@ -446,11 +448,58 @@ export class RelationalMetadataStore
   }
 
   private async migrate(): Promise<void> {
-    await this.migrateApiKeys();
-    for (const statement of activeMetadataStatements(this.client.kind)) {
-      await this.execute(statement);
+    await this.withMigrationLock(async () => {
+      await this.migrateApiKeys();
+      await this.dropLegacyCoreTables();
+      for (const statement of activeMetadataStatements(this.client.kind)) {
+        await this.execute(statement);
+      }
+      await this.dropLegacyMetadataTables();
+    });
+  }
+
+  private async withMigrationLock(work: () => Promise<void>): Promise<void> {
+    if (this.client.kind === 'sqlite') {
+      await work();
+      return;
     }
-    await this.dropLegacyMetadataTables();
+
+    await this.acquireMigrationLock();
+    try {
+      await work();
+    } finally {
+      await this.releaseMigrationLock();
+    }
+  }
+
+  private async acquireMigrationLock(): Promise<void> {
+    if (this.client.kind === 'postgres') {
+      await this.execute('SELECT pg_advisory_lock(762319045)');
+      return;
+    }
+
+    await this.execute("SELECT GET_LOCK('onlydoge_metadata_migrate', 60)");
+  }
+
+  private async releaseMigrationLock(): Promise<void> {
+    if (this.client.kind === 'postgres') {
+      await this.execute('SELECT pg_advisory_unlock(762319045)');
+      return;
+    }
+
+    await this.execute("SELECT RELEASE_LOCK('onlydoge_metadata_migrate')");
+  }
+
+  private async dropLegacyCoreTables(): Promise<void> {
+    await this.dropTableIfLegacyNetworkScoped('core_indexer_state');
+    await this.dropTableIfLegacyNetworkScoped('core_blocks');
+  }
+
+  private async dropTableIfLegacyNetworkScoped(table: string): Promise<void> {
+    const columns = await this.tableColumns(table);
+    if (columns.has('network_id')) {
+      await this.execute(`DROP TABLE IF EXISTS ${table}`);
+    }
   }
 
   private async migrateApiKeys(): Promise<void> {
@@ -539,6 +588,33 @@ export class RelationalMetadataStore
   private async sqliteTableColumns(table: string): Promise<Set<string>> {
     const rows = await this.queryRows<DatabaseRow>(`PRAGMA table_info(${table})`);
     return new Set(rows.map((row) => String(row.name)));
+  }
+
+  private async tableColumns(table: string): Promise<Set<string>> {
+    if (this.client.kind === 'sqlite') {
+      return this.sqliteTableColumns(table);
+    }
+    if (this.client.kind === 'postgres') {
+      const rows = await this.queryRows<DatabaseRow>(
+        `
+          SELECT column_name
+          FROM information_schema.columns
+          WHERE table_schema = current_schema() AND table_name = ?
+        `,
+        [table],
+      );
+      return new Set(rows.map((row) => String(row.column_name)));
+    }
+
+    const rows = await this.queryRows<DatabaseRow>(
+      `
+        SELECT COLUMN_NAME AS column_name
+        FROM information_schema.columns
+        WHERE table_schema = DATABASE() AND table_name = ?
+      `,
+      [table],
+    );
+    return new Set(rows.map((row) => String(row.column_name)));
   }
 
   private async one<T extends DatabaseRow>(sql: string, args: SqlValue[] = []): Promise<T | null> {
