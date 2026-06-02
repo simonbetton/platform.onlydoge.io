@@ -313,7 +313,7 @@ export class RelationalMetadataStore
       syncTail: input.syncTail ?? current?.syncTail ?? -1,
       processTail: input.processTail ?? current?.processTail ?? -1,
       onlineTip: input.onlineTip ?? current?.onlineTip ?? -1,
-      lastError: input.lastError ?? current?.lastError ?? null,
+      lastError: 'lastError' in input ? (input.lastError ?? null) : (current?.lastError ?? null),
       updatedAt: now,
     };
 

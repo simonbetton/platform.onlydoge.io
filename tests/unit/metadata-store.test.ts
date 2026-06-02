@@ -113,6 +113,16 @@ describe('relational metadata store', () => {
         processTail: 7,
       });
 
+      await expect(
+        ctx.runtime.metadata.upsertCoreIndexerState({
+          lastError: null,
+          syncTail: 10,
+        }),
+      ).resolves.toMatchObject({
+        lastError: null,
+        syncTail: 10,
+      });
+
       await ctx.runtime.metadata.upsertCoreBlock({
         blockHeight: 1,
         blockHash: 'block-1',
