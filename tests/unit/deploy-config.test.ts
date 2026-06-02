@@ -143,6 +143,7 @@ function canonicalEnv(): Record<string, string> {
   return {
     ONLYDOGE_CORE_BLOCK_TIMEOUT_MS: '120000',
     ONLYDOGE_DATABASE: 'postgres://onlydoge:secret@db/onlydoge',
+    ONLYDOGE_DOGECOIN_RPC_ENDPOINT: 'http://rpc-user:rpc-password@dogecoin-rpc:22555/',
     ONLYDOGE_IMAGE: 'ghcr.io/simonbetton/onlydoge-indexer:latest',
     ONLYDOGE_PUBLIC_HOST: 'platform.onlydoge.io',
     ONLYDOGE_REMOTE_DIR: '/opt/onlydoge',

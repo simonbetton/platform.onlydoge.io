@@ -109,6 +109,7 @@ Configure these `production` environment secrets:
 - `PROD_SSH_TARGET`: app host SSH target
 - `PROD_SSH_JUMP`: optional bastion SSH target
 - `PROD_ADMIN_API_TOKEN`: existing production admin API token for E2E key creation and teardown verification
+- `ONLYDOGE_DOGECOIN_RPC_ENDPOINT`: Dogecoin Core JSON-RPC endpoint reachable from the API/indexer containers
 
 The workflow runs quality checks, builds and pushes a fresh multi-arch production image for the selected commit, deploys the resulting immutable digest, and passes that digest to `bun run e2e:production` as `EXPECTED_IMAGE_DIGEST`.
 
@@ -121,6 +122,7 @@ Required environment:
 - `PROD_BASE_URL`: public API base URL, for example `https://api.example.com`
 - `PROD_ADMIN_API_TOKEN`: existing production admin API token
 - `EXPECTED_IMAGE_DIGEST`: immutable image digest expected to be running
+- `ONLYDOGE_DOGECOIN_RPC_ENDPOINT`: Dogecoin Core JSON-RPC endpoint configured in the deployed runtime env
 
 Optional environment:
 
