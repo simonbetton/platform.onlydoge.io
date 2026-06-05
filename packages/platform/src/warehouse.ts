@@ -1856,6 +1856,15 @@ export class ClickHouseWarehouseAdapter
   }
 
   public async getTransactionRef(txid: string) {
+    const coreRef = await this.getCoreTransactionRef(txid);
+    if (coreRef) {
+      return coreRef;
+    }
+
+    return this.getCurrentTransactionRef(txid);
+  }
+
+  private async getCurrentTransactionRef(txid: string) {
     const rows = await this.queryRows<{
       blockHash: string;
       blockHeight: number;
@@ -1877,7 +1886,7 @@ export class ClickHouseWarehouseAdapter
       format: 'JSONEachRow',
     });
 
-    return rows[0] ?? (await this.getCoreTransactionRef(txid));
+    return rows[0] ?? null;
   }
 
   private async getCoreTransactionRef(txid: string) {

@@ -460,16 +460,12 @@ describe('clickhouse warehouse adapter', () => {
     ).toBe(true);
   });
 
-  it('falls back to core Dogecoin outputs for transaction refs', async () => {
+  it('uses core Dogecoin output-key index first for transaction refs', async () => {
     const adapter = new ClickHouseWarehouseAdapter({
       driver: 'clickhouse',
       location: 'http://clickhouse:8123',
     });
     const query = vi.fn(async ({ query: statement }: { query: string }) => {
-      if (statement.includes('FROM utxo_outputs_v2')) {
-        return { json: async () => [] };
-      }
-
       if (statement.includes('FROM dogecoin_core_utxo_creates_v1')) {
         return {
           json: async () => [
@@ -481,6 +477,10 @@ describe('clickhouse warehouse adapter', () => {
             },
           ],
         };
+      }
+
+      if (statement.includes('FROM dogecoin_utxo_outputs_current_v1')) {
+        throw new Error('current-state txid scan should not run before the core output-key lookup');
       }
 
       return { json: async () => [] };
@@ -497,6 +497,7 @@ describe('clickhouse warehouse adapter', () => {
       blockTime: 456,
       txIndex: 7,
     });
+    expect(statements[0]).toContain('FROM dogecoin_core_utxo_creates_v1');
     expect(
       statements.some(
         (statement) =>
@@ -505,6 +506,47 @@ describe('clickhouse warehouse adapter', () => {
           statement.includes('output_key < {prefixEnd:String}'),
       ),
     ).toBe(true);
+  });
+
+  it('falls back to current UTXO state for transaction refs missing from core outputs', async () => {
+    const adapter = new ClickHouseWarehouseAdapter({
+      driver: 'clickhouse',
+      location: 'http://clickhouse:8123',
+    });
+    const query = vi.fn(async ({ query: statement }: { query: string }) => {
+      if (statement.includes('FROM dogecoin_core_utxo_creates_v1')) {
+        return { json: async () => [] };
+      }
+
+      if (statement.includes('FROM dogecoin_utxo_outputs_current_v1')) {
+        return {
+          json: async () => [
+            {
+              blockHeight: 321,
+              blockHash: 'current-block-hash',
+              blockTime: 654,
+              txIndex: 9,
+            },
+          ],
+        };
+      }
+
+      return { json: async () => [] };
+    });
+
+    (adapter as unknown as { client: { query: typeof query } }).client = { query };
+
+    const ref = await adapter.getTransactionRef('doge-txid');
+    const statements = query.mock.calls.map(([parameters]) => parameters.query);
+
+    expect(ref).toEqual({
+      blockHeight: 321,
+      blockHash: 'current-block-hash',
+      blockTime: 654,
+      txIndex: 9,
+    });
+    expect(statements[0]).toContain('FROM dogecoin_core_utxo_creates_v1');
+    expect(statements[1]).toContain('FROM dogecoin_utxo_outputs_current_v1');
   });
 
   it('boots clickhouse with address-oriented read models and backfills them once', async () => {
