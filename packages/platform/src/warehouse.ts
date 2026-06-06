@@ -184,6 +184,10 @@ type AddressMovementSummaryRow = {
   sentBase: string;
   txCount: number;
 };
+type AddressSpendableSummaryRow = {
+  balance: string;
+  utxoCount: number;
+};
 type CoreBenchmarkTables = {
   appliedBlocks: string;
   balances: string;
@@ -937,18 +941,6 @@ function isMovementBalanceSnapshot(candidate: BalanceRow, movement: AddressMovem
     candidate.address === movement.address,
     candidate.assetAddress === movement.assetAddress,
   ].every(Boolean);
-}
-
-function spendableOutputByKey(
-  outputsByKey: Map<string, ProjectionUtxoOutput>,
-  outputKey: string,
-): ProjectionUtxoOutput[] {
-  const output = outputsByKey.get(outputKey);
-  if (!isUnspentSpendableOutput(output)) {
-    return [];
-  }
-
-  return [output];
 }
 
 function isUnspentSpendableOutput(
@@ -1922,6 +1914,18 @@ export class ClickHouseWarehouseAdapter
   }
 
   public async getAddressSummary(address: string) {
+    const [coreMovement, coreSpendable] = await Promise.all([
+      this.queryCoreAddressMovementSummary(address),
+      this.queryCoreSpendableAddressSummary(address),
+    ]);
+    if (hasAddressMovementSummary(coreMovement)) {
+      return buildClickHouseAddressSummary(
+        coreMovement,
+        coreSpendable.balance,
+        coreSpendable.utxoCount,
+      );
+    }
+
     const [movementFromTable, balance, utxoCount] = await Promise.all([
       this.queryAddressMovementSummary(address),
       this.queryNativeBalance(address),
@@ -1951,6 +1955,45 @@ export class ClickHouseWarehouseAdapter
     });
 
     return rows[0];
+  }
+
+  private async queryCoreSpendableAddressSummary(
+    address: string,
+  ): Promise<AddressSpendableSummaryRow> {
+    const rows = await this.queryRows<AddressSpendableSummaryRow>({
+      query: `
+          WITH
+          address_outputs AS (
+            SELECT
+              output_key,
+              value_base
+            FROM ${coreUtxoCreatesTable}
+            WHERE
+              address = {address:String}
+              AND is_spendable = 1
+            ORDER BY output_key ASC, version DESC
+            LIMIT 1 BY output_key
+          ),
+          address_spends AS (
+            SELECT
+              spent_output_key
+            FROM ${coreUtxoSpendsTable}
+            WHERE
+              spent_output_key IN (SELECT output_key FROM address_outputs)
+            ORDER BY spent_output_key ASC, version DESC
+            LIMIT 1 BY spent_output_key
+          )
+          SELECT
+            CAST(sum(toInt256(value_base)) AS String) AS balance,
+            count() AS "utxoCount"
+          FROM address_outputs
+          WHERE output_key NOT IN (SELECT spent_output_key FROM address_spends)
+        `,
+      query_params: { address },
+      format: 'JSONEachRow',
+    });
+
+    return rows[0] ?? { balance: '0', utxoCount: 0 };
   }
 
   private async queryCoreAddressMovementSummary(
@@ -2048,6 +2091,11 @@ export class ClickHouseWarehouseAdapter
   }
 
   public async listAddressTransactions(address: string, offset = 0, limit?: number) {
+    const coreRows = await this.listCoreAddressTransactions(address, offset, limit);
+    if (coreRows.length > 0) {
+      return coreRows;
+    }
+
     const pagination = clickHousePagination(offset, limit);
     const rows = await this.queryRows<{
       blockHash: string;
@@ -2081,7 +2129,7 @@ export class ClickHouseWarehouseAdapter
       format: 'JSONEachRow',
     });
 
-    return rows.length > 0 ? rows : await this.listCoreAddressTransactions(address, offset, limit);
+    return rows;
   }
 
   private async listCoreAddressTransactions(address: string, offset = 0, limit?: number) {
@@ -2182,35 +2230,66 @@ export class ClickHouseWarehouseAdapter
   }
 
   public async listAddressUtxos(address: string, offset = 0, limit?: number) {
+    return this.listCoreAddressUtxos(address, offset, limit);
+  }
+
+  private async listCoreAddressUtxos(
+    address: string,
+    offset = 0,
+    limit?: number,
+  ): Promise<ProjectionUtxoOutput[]> {
     const pagination = clickHousePagination(offset, limit);
-    const pageRows = await this.queryRows<{
-      blockHeight: number;
-      outputKey: string;
-      txIndex: number;
-      vout: number;
-    }>({
+    return await this.queryRows<ProjectionUtxoOutput>({
       query: `
-          SELECT
-            output_key AS "outputKey",
-            block_height AS "blockHeight",
-            tx_index AS "txIndex",
-            vout,
-            is_spendable,
-            spent_by_txid
-          FROM (
+          WITH
+          address_outputs AS (
             SELECT
-              output_key,
               block_height,
+              block_hash,
+              block_time,
+              txid,
               tx_index,
               vout,
-              is_spendable,
-              spent_by_txid
-            FROM ${utxoCurrentStateByAddressTable}
-            WHERE address = {address:String}
+              output_key,
+              address,
+              script_type,
+              value_base,
+              is_coinbase,
+              is_spendable
+            FROM ${coreUtxoCreatesTable}
+            WHERE
+              address = {address:String}
+              AND is_spendable = 1
             ORDER BY output_key ASC, version DESC
             LIMIT 1 BY output_key
+          ),
+          address_spends AS (
+            SELECT
+              spent_output_key
+            FROM ${coreUtxoSpendsTable}
+            WHERE
+              spent_output_key IN (SELECT output_key FROM address_outputs)
+            ORDER BY spent_output_key ASC, version DESC
+            LIMIT 1 BY spent_output_key
           )
-          WHERE is_spendable = 1 AND spent_by_txid IS NULL
+          SELECT
+            block_height AS "blockHeight",
+            block_hash AS "blockHash",
+            block_time AS "blockTime",
+            txid,
+            tx_index AS "txIndex",
+            vout,
+            output_key AS "outputKey",
+            address,
+            script_type AS "scriptType",
+            value_base AS "valueBase",
+            is_coinbase = 1 AS "isCoinbase",
+            is_spendable = 1 AS "isSpendable",
+            CAST(NULL, 'Nullable(String)') AS "spentByTxid",
+            CAST(NULL, 'Nullable(UInt64)') AS "spentInBlock",
+            CAST(NULL, 'Nullable(UInt64)') AS "spentInputIndex"
+          FROM address_outputs
+          WHERE output_key NOT IN (SELECT spent_output_key FROM address_spends)
           ORDER BY block_height DESC, tx_index DESC, vout ASC
           ${pagination.limitClause}
           ${pagination.offsetClause}
@@ -2221,14 +2300,6 @@ export class ClickHouseWarehouseAdapter
       },
       format: 'JSONEachRow',
     });
-
-    if (pageRows.length === 0) {
-      return [];
-    }
-
-    const outputsByKey = await this.getUtxoOutputs(pageRows.map((row) => row.outputKey));
-
-    return pageRows.flatMap((row) => spendableOutputByKey(outputsByKey, row.outputKey));
   }
 
   public async getUtxoOutput(outputKey: string): Promise<ProjectionUtxoOutput | null> {
@@ -2379,6 +2450,7 @@ export class ClickHouseWarehouseAdapter
                 LIMIT 1 BY spent_output_key
               ) AS s
               ON c.output_key = s.spent_output_key
+              SETTINGS join_use_nulls = 1
             `,
           query_params: { outputKeys: chunk },
           format: 'JSONEachRow',

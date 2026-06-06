@@ -280,22 +280,9 @@ describe('clickhouse warehouse adapter', () => {
       location: 'http://clickhouse:8123',
     });
     const query = vi.fn(async ({ query: statement }: { query: string }) => {
-      if (statement.includes('FROM dogecoin_utxo_outputs_current_by_address_v1')) {
-        return {
-          json: async () => [
-            {
-              outputKey: 'prev-txid:1',
-              blockHeight: 123,
-              txIndex: 4,
-              vout: 1,
-            },
-          ],
-        };
-      }
-
       if (
-        statement.includes('FROM dogecoin_utxo_outputs_current_v1') &&
-        statement.includes('output_key IN')
+        statement.includes('FROM dogecoin_core_utxo_creates_v1') &&
+        statement.includes('WHERE output_key NOT IN')
       ) {
         return {
           json: async () => [
@@ -336,9 +323,9 @@ describe('clickhouse warehouse adapter', () => {
     expect(
       statements.some(
         (statement) =>
-          statement.includes('LIMIT 1 BY output_key') &&
-          statement.includes('FROM dogecoin_utxo_outputs_current_by_address_v1') &&
-          !statement.includes('FINAL'),
+          statement.includes('FROM dogecoin_core_utxo_creates_v1') &&
+          statement.includes('FROM dogecoin_core_utxo_spends_v1') &&
+          statement.includes('WHERE output_key NOT IN'),
       ),
     ).toBe(true);
   });
@@ -635,10 +622,11 @@ describe('clickhouse warehouse adapter', () => {
     ).toBe(true);
   });
 
-  it('falls back to core Dogecoin history when address movement tables are empty', async () => {
+  it('prefers core Dogecoin history over legacy address movement tables', async () => {
     const { adapter, query } = addressSummaryAdapter({
-      addressMovementRows: [addressSummaryMovementRow('0', '0', 0)],
+      addressMovementRows: [addressSummaryMovementRow('999', '500', 1)],
       coreMovementRows: [addressSummaryMovementRow('11', '7', 2)],
+      coreSpendableRows: [{ balance: '4', utxoCount: 1 }],
     });
 
     const { statements, summary } = await readTestAddressSummary(adapter, query);
@@ -1131,6 +1119,7 @@ function coreApplication(input: {
 function addressSummaryAdapter(input: {
   addressMovementRows: Array<{ receivedBase: string; sentBase: string; txCount: number }>;
   coreMovementRows?: Array<{ receivedBase: string; sentBase: string; txCount: number }>;
+  coreSpendableRows?: Array<{ balance: string; utxoCount: number }>;
 }) {
   const adapter = new ClickHouseWarehouseAdapter({
     driver: 'clickhouse',
@@ -1141,7 +1130,11 @@ function addressSummaryAdapter(input: {
       return jsonRows(input.addressMovementRows);
     }
 
-    if (statement.includes('WITH address_outputs')) {
+    if (statement.includes('address_outputs AS') && !statement.includes('UNION ALL')) {
+      return jsonRows(input.coreSpendableRows ?? [{ balance: '0', utxoCount: 0 }]);
+    }
+
+    if (statement.includes('address_outputs AS')) {
       return jsonRows(input.coreMovementRows ?? []);
     }
 
