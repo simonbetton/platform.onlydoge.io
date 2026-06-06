@@ -1,4 +1,5 @@
 import {
+  configKeyIndexerProcessTail,
   configKeyIndexerSyncTail,
   type DogecoinTransaction,
   type DogecoinVin,
@@ -58,6 +59,7 @@ type MempoolCacheEntry = {
 
 const defaultMempoolLimit = 100;
 const maxMempoolLimit = 500;
+const rawTransactionRefLookupLimit = 1_000;
 const mempoolCacheTtlMs = 1_000;
 
 export class ExplorerQueryService {
@@ -266,7 +268,7 @@ export class ExplorerQueryService {
   }
 
   private async searchTransaction(q: string): Promise<ExplorerSearchResult | null> {
-    const txRef = await this.warehouse.getTransactionRef(q);
+    const txRef = await this.getTransactionRef(q);
     if (!txRef) {
       return null;
     }
@@ -383,12 +385,50 @@ export class ExplorerQueryService {
   }
 
   private async requireTransactionRef(txid: string) {
-    const txRef = await this.warehouse.getTransactionRef(txid);
+    const txRef = await this.getTransactionRef(txid);
     if (!txRef) {
       throw new NotFoundError('transaction not found');
     }
 
     return txRef;
+  }
+
+  private async getTransactionRef(txid: string) {
+    return (await this.warehouse.getTransactionRef(txid)) ?? this.findRawTransactionRef(txid);
+  }
+
+  private async findRawTransactionRef(txid: string) {
+    const syncTail = await this.configNumberOrDefault(configKeyIndexerSyncTail(), -1);
+    if (syncTail < 0) {
+      return null;
+    }
+
+    const processTail = await this.configNumberOrDefault(configKeyIndexerProcessTail(), -1);
+    const earliestHeight = Math.max(
+      0,
+      processTail + 1,
+      syncTail - rawTransactionRefLookupLimit + 1,
+    );
+
+    for (let blockHeight = syncTail; blockHeight >= earliestHeight; blockHeight -= 1) {
+      const snapshot = await this.rawBlocks.getPart<Record<string, unknown>>(blockHeight, 'block');
+      if (!snapshot) {
+        continue;
+      }
+
+      const block = this.parseBlock(snapshot);
+      const txIndex = block.tx.findIndex((candidate) => this.readString(candidate.txid) === txid);
+      if (txIndex >= 0) {
+        return {
+          blockHash: block.hash,
+          blockHeight: block.height,
+          blockTime: block.time,
+          txIndex,
+        };
+      }
+    }
+
+    return null;
   }
 
   private requireTransaction(block: ParsedDogecoinBlock, txid: string): DogecoinTransaction {
