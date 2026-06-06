@@ -52,6 +52,7 @@ export async function createRuntime(input?: {
     explorerWarehouse,
     rawBlockStorage,
     metadata,
+    metadata,
     rpc,
   );
   const coreIndexer = new CoreDogecoinIndexerService(

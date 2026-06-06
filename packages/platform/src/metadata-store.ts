@@ -407,6 +407,33 @@ export class RelationalMetadataStore
     );
   }
 
+  public async getCoreBlockByHash(blockHash: string): Promise<{
+    blockHash: string;
+    blockHeight: number;
+  } | null> {
+    const row = await this.one<{
+      block_hash: string;
+      block_height: number | string;
+    }>(
+      `
+        SELECT block_height, block_hash
+        FROM core_blocks
+        WHERE block_hash = ?
+        LIMIT 1
+      `,
+      [blockHash],
+    );
+
+    if (!row) {
+      return null;
+    }
+
+    return {
+      blockHash: String(row.block_hash),
+      blockHeight: Number(row.block_height),
+    };
+  }
+
   public async applyProjectionWindow(_batches: BlockProjectionBatch[]): Promise<void> {}
   public async clearProjectionBootstrapState(): Promise<void> {}
   public async finalizeProjectionBootstrap(_processTail: number): Promise<void> {}
@@ -762,6 +789,7 @@ function activeMetadataStatements(kind: SupportedClient['kind']): string[] {
     `,
     'CREATE UNIQUE INDEX IF NOT EXISTS uq_api_keys_secret_key_hash ON api_keys (secret_key_hash)',
     'CREATE INDEX IF NOT EXISTS idx_audit_events_created_at ON audit_events (created_at)',
+    'CREATE INDEX IF NOT EXISTS idx_core_blocks_block_hash ON core_blocks (block_hash)',
   ];
 }
 

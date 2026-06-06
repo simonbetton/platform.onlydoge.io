@@ -18,6 +18,13 @@ export interface ExplorerConfigPort {
   getJsonValue<T>(key: string): Promise<T | null>;
 }
 
+export interface ExplorerCoreBlockPort {
+  getCoreBlockByHash(blockHash: string): Promise<{
+    blockHash: string;
+    blockHeight: number;
+  } | null>;
+}
+
 export interface ExplorerRawBlockPort {
   getPart<T extends Record<string, unknown>>(blockHeight: number, part: string): Promise<T | null>;
 }

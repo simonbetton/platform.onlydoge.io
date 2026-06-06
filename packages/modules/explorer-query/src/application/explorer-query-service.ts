@@ -15,6 +15,7 @@ import { NotFoundError, TooEarlyError, ValidationError } from '@onlydoge/shared-
 
 import type {
   ExplorerConfigPort,
+  ExplorerCoreBlockPort,
   ExplorerDogecoinConfigPort,
   ExplorerMempoolRpcPort,
   ExplorerRawBlockPort,
@@ -67,6 +68,7 @@ export class ExplorerQueryService {
     private readonly warehouse: ExplorerWarehousePort,
     private readonly rawBlocks: ExplorerRawBlockPort,
     private readonly configs: ExplorerConfigPort,
+    private readonly coreBlocks: ExplorerCoreBlockPort,
     private readonly mempoolRpc: ExplorerMempoolRpcPort,
   ) {}
 
@@ -508,7 +510,9 @@ export class ExplorerQueryService {
       return this.loadBlockSnapshot(Number(normalized));
     }
 
-    const blockRef = await this.warehouse.getAppliedBlockByHash(normalized);
+    const blockRef =
+      (await this.warehouse.getAppliedBlockByHash(normalized)) ??
+      (await this.coreBlocks.getCoreBlockByHash(normalized));
     if (!blockRef) {
       throw new NotFoundError('block not found');
     }

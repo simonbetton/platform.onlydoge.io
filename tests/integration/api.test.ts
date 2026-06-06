@@ -607,12 +607,19 @@ async function expectExplorerBlocks({ ctx, headers }: ExplorerScenario): Promise
   const blocks = await request(ctx.app, '/v1/explorer/blocks', { headers });
   const [latestBlock] = readObjectArrayField(await readJsonObject(blocks), 'blocks');
   expect(requireNumberField(latestBlock ?? {}, 'height')).toBe(2);
+  const latestBlockHash = requireStringField(latestBlock ?? {}, 'hash');
 
   const blockDetail = await request(ctx.app, '/v1/explorer/blocks/2', { headers });
   const blockDetailBody = await readJsonObject(blockDetail);
   expect(requireNumberField(readObjectField(blockDetailBody, 'block'), 'height')).toBe(2);
   const [blockTx] = readObjectArrayField(blockDetailBody, 'transactions');
   expect(requireStringField(blockTx ?? {}, 'txid')).toBe('doge-tx-2');
+
+  const blockDetailByHash = await request(ctx.app, `/v1/explorer/blocks/${latestBlockHash}`, {
+    headers,
+  });
+  const blockDetailByHashBody = await readJsonObject(blockDetailByHash);
+  expect(requireNumberField(readObjectField(blockDetailByHashBody, 'block'), 'height')).toBe(2);
 }
 
 async function expectExplorerMempool(
