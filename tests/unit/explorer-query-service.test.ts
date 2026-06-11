@@ -17,6 +17,8 @@ import { describe, expect, it } from 'vitest';
 describe('ExplorerQueryService', () => {
   it('resolves transaction details from raw synced blocks when derived refs lag', async () => {
     const rawTxid = 'raw-synced-tx';
+    const createdLookups: string[][] = [];
+    const fullLookups: string[][] = [];
     const previousOutput = projectionOutput({
       address: 'DPreviousOutput111111111111111111111',
       outputKey: 'previous-tx:0',
@@ -67,6 +69,8 @@ describe('ExplorerQueryService', () => {
         ],
       ]),
       utxoOutputs: new Map([[previousOutput.outputKey, previousOutput]]),
+      createdLookups,
+      fullLookups,
     });
 
     await expect(service.search(rawTxid)).resolves.toMatchObject({
@@ -107,10 +111,14 @@ describe('ExplorerQueryService', () => {
         valueBase: '4900000000',
       }),
     ]);
+    expect(createdLookups).toContainEqual(['previous-tx:0']);
+    expect(fullLookups).toContainEqual([`${rawTxid}:0`]);
   });
 });
 
 function createService(input: {
+  createdLookups?: string[][];
+  fullLookups?: string[][];
   rawBlocks: Map<number, Record<string, unknown>>;
   utxoOutputs: Map<string, ProjectionUtxoOutput>;
 }): ExplorerQueryService {
@@ -136,7 +144,17 @@ function createService(input: {
     async getTransactionRef() {
       return null;
     },
+    async getCreatedUtxoOutputs(outputKeys) {
+      input.createdLookups?.push(outputKeys);
+      return new Map(
+        outputKeys
+          .map((outputKey) => input.utxoOutputs.get(outputKey))
+          .filter((output): output is ProjectionUtxoOutput => Boolean(output))
+          .map((output) => [output.outputKey, output]),
+      );
+    },
     async getUtxoOutputs(outputKeys) {
+      input.fullLookups?.push(outputKeys);
       return new Map(
         outputKeys
           .map((outputKey) => input.utxoOutputs.get(outputKey))

@@ -41,7 +41,14 @@ export interface ExplorerMempoolRpcPort {
   }>;
 }
 
+export interface ExplorerCreatedUtxoOutput {
+  address: string;
+  outputKey: string;
+  valueBase: string;
+}
+
 export interface ExplorerWarehousePort {
+  getCreatedUtxoOutputs(outputKeys: string[]): Promise<Map<string, ExplorerCreatedUtxoOutput>>;
   getUtxoOutputs(outputKeys: string[]): Promise<Map<string, ProjectionUtxoOutput>>;
   getAddressSummary(address: string): Promise<{
     balance: string;

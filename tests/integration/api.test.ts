@@ -391,6 +391,135 @@ describe('api integration', () => {
     }
   });
 
+  it('migrates legacy audit event resource ids', async () => {
+    const tempRoot = await mkdtemp(join(tmpdir(), 'onlydoge-legacy-audit-events-'));
+    const databasePath = join(tempRoot, 'onlydoge.sqlite.db');
+    const databaseUrl = `sqlite://${databasePath}`;
+    const previousEnv = new Map<string, string | undefined>();
+    const envKeys = [
+      'ONLYDOGE_DATABASE',
+      'ONLYDOGE_STORAGE',
+      'ONLYDOGE_WAREHOUSE',
+      'ONLYDOGE_MODE',
+    ] as const;
+    for (const key of envKeys) {
+      previousEnv.set(key, process.env[key]);
+    }
+    const client = createLibsqlClient({ url: `file:${databasePath}` });
+
+    try {
+      await client.execute(`
+        CREATE TABLE audit_events (
+          audit_event_id INTEGER PRIMARY KEY AUTOINCREMENT,
+          id TEXT NOT NULL UNIQUE,
+          actor_api_key_id BIGINT NOT NULL,
+          actor_api_key TEXT NOT NULL,
+          actor_role TEXT NOT NULL,
+          owner_api_key_id BIGINT NULL,
+          owner_api_key TEXT NULL,
+          method TEXT NOT NULL,
+          path TEXT NOT NULL,
+          route TEXT NOT NULL,
+          operation TEXT NOT NULL,
+          resource_type TEXT NOT NULL,
+          resource_ids TEXT NOT NULL,
+          status_code INTEGER NOT NULL,
+          outcome TEXT NOT NULL,
+          error TEXT NULL,
+          request_id TEXT NOT NULL,
+          ip TEXT NULL,
+          user_agent TEXT NULL,
+          created_at TEXT NOT NULL
+        )
+      `);
+      await client.execute({
+        sql: `
+          INSERT INTO audit_events (
+            id, actor_api_key_id, actor_api_key, actor_role, owner_api_key_id, owner_api_key,
+            method, path, route, operation, resource_type, resource_ids, status_code, outcome,
+            error, request_id, ip, user_agent, created_at
+          )
+          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        `,
+        args: [
+          'evt_legacy',
+          1,
+          'key_legacy',
+          'admin',
+          null,
+          null,
+          'GET',
+          '/v1/keys/key_legacy',
+          'GET /v1/keys/:id',
+          'read',
+          'api_key',
+          '["key_legacy"]',
+          200,
+          'success',
+          null,
+          'req_legacy',
+          '127.0.0.1',
+          'test',
+          '2026-01-01T00:00:00.000Z',
+        ],
+      });
+
+      process.env.ONLYDOGE_DATABASE = databaseUrl;
+      process.env.ONLYDOGE_STORAGE = `file://${tempRoot}/storage`;
+      process.env.ONLYDOGE_WAREHOUSE = `${tempRoot}/warehouse.json`;
+      process.env.ONLYDOGE_MODE = 'both';
+
+      const runtime = await createRuntime({ mode: 'both', ip: '127.0.0.1', port: 2277 });
+      const columns = await client.execute('PRAGMA table_info(audit_events)');
+      const columnNames = columns.rows.map((row) => String(row.name));
+      expect(columnNames).toContain('resource_ids_json');
+
+      await expect(runtime.metadata.listAuditEvents({})).resolves.toEqual([
+        expect.objectContaining({
+          id: 'evt_legacy',
+          resourceIds: ['key_legacy'],
+        }),
+      ]);
+
+      await runtime.metadata.createAuditEvent({
+        actorApiKeyId: 1,
+        actorApiKey: 'key_legacy',
+        actorRole: 'admin',
+        ownerApiKeyId: null,
+        ownerApiKey: null,
+        method: 'POST',
+        path: '/v1/keys/',
+        route: 'POST /v1/keys/',
+        operation: 'create',
+        resourceType: 'api_key',
+        resourceIds: ['key_created'],
+        statusCode: 201,
+        outcome: 'success',
+        error: null,
+        requestId: 'req_new',
+        ip: '127.0.0.1',
+        userAgent: 'test',
+        createdAt: '2026-01-01T00:01:00.000Z',
+      });
+      await expect(
+        runtime.metadata.listAuditEvents({ resourceId: 'key_created' }),
+      ).resolves.toEqual([
+        expect.objectContaining({
+          resourceIds: ['key_created'],
+        }),
+      ]);
+    } finally {
+      for (const [key, value] of previousEnv.entries()) {
+        if (value === undefined) {
+          delete process.env[key];
+        } else {
+          process.env[key] = value;
+        }
+      }
+      await rm(tempRoot, { recursive: true, force: true });
+    }
+  });
+
   it('rate limits protected requests independently per authenticated API key', async () => {
     const ctx = await createTestApp();
     const accessControl = new AccessControlService(

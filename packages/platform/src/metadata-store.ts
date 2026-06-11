@@ -70,6 +70,8 @@ const legacyMetadataTables = [
 export class RelationalMetadataStore
   implements ApiKeyRepository, AuditEventRepository, CoordinatorConfigPort, ProjectionStateStorePort
 {
+  private auditEventsHasLegacyResourceIds = false;
+
   private constructor(private readonly client: SupportedClient) {}
 
   public static async connect(settings: DatabaseSettings): Promise<RelationalMetadataStore> {
@@ -195,6 +197,43 @@ export class RelationalMetadataStore
 
   public async createAuditEvent(input: CreateAuditEventInput): Promise<void> {
     const id = input.id ?? `evt_${randomUUID().replaceAll('-', '')}`;
+    const resourceIdsJson = JSON.stringify(input.resourceIds);
+    if (this.auditEventsHasLegacyResourceIds) {
+      await this.execute(
+        `
+          INSERT INTO audit_events (
+            id, actor_api_key_id, actor_api_key, actor_role, owner_api_key_id, owner_api_key,
+            method, path, route, operation, resource_type, resource_ids, resource_ids_json,
+            status_code, outcome, error, request_id, ip, user_agent, created_at
+          )
+          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        `,
+        [
+          id,
+          input.actorApiKeyId,
+          input.actorApiKey,
+          input.actorRole,
+          input.ownerApiKeyId,
+          input.ownerApiKey,
+          input.method,
+          input.path,
+          input.route,
+          input.operation,
+          input.resourceType,
+          resourceIdsJson,
+          resourceIdsJson,
+          input.statusCode,
+          input.outcome,
+          input.error,
+          input.requestId,
+          input.ip,
+          input.userAgent,
+          input.createdAt,
+        ],
+      );
+      return;
+    }
+
     await this.execute(
       `
         INSERT INTO audit_events (
@@ -216,7 +255,7 @@ export class RelationalMetadataStore
         input.route,
         input.operation,
         input.resourceType,
-        JSON.stringify(input.resourceIds),
+        resourceIdsJson,
         input.statusCode,
         input.outcome,
         input.error,
@@ -481,6 +520,7 @@ export class RelationalMetadataStore
       for (const statement of activeMetadataStatements(this.client.kind)) {
         await this.execute(statement);
       }
+      await this.migrateAuditEvents();
       await this.dropLegacyMetadataTables();
     });
   }
@@ -596,6 +636,53 @@ export class RelationalMetadataStore
     await this.execute(
       'CREATE UNIQUE INDEX IF NOT EXISTS uq_api_keys_secret_key_hash ON api_keys (secret_key_hash)',
     );
+  }
+
+  private async migrateAuditEvents(): Promise<void> {
+    const columns = await this.tableColumns('audit_events');
+    if (!columns.has('resource_ids_json')) {
+      await this.addAuditEventResourceIdsJsonColumn();
+    }
+
+    const nextColumns = await this.tableColumns('audit_events');
+    this.auditEventsHasLegacyResourceIds = nextColumns.has('resource_ids');
+    if (nextColumns.has('resource_ids')) {
+      await this.execute(
+        `
+          UPDATE audit_events
+          SET resource_ids_json = resource_ids
+          WHERE resource_ids_json = '[]' AND resource_ids IS NOT NULL
+        `,
+      );
+    }
+
+    await this.enforceAuditEventResourceIdsJsonNotNull();
+  }
+
+  private async addAuditEventResourceIdsJsonColumn(): Promise<void> {
+    if (this.client.kind === 'sqlite') {
+      await this.execute(
+        "ALTER TABLE audit_events ADD COLUMN resource_ids_json TEXT NOT NULL DEFAULT '[]'",
+      );
+      return;
+    }
+
+    await this.execute('ALTER TABLE audit_events ADD COLUMN resource_ids_json TEXT NULL');
+  }
+
+  private async enforceAuditEventResourceIdsJsonNotNull(): Promise<void> {
+    await this.execute(
+      "UPDATE audit_events SET resource_ids_json = '[]' WHERE resource_ids_json IS NULL",
+    );
+    if (this.client.kind === 'sqlite') {
+      return;
+    }
+    if (this.client.kind === 'postgres') {
+      await this.execute('ALTER TABLE audit_events ALTER COLUMN resource_ids_json SET NOT NULL');
+      return;
+    }
+
+    await this.execute('ALTER TABLE audit_events MODIFY resource_ids_json TEXT NOT NULL');
   }
 
   private async dropLegacyMetadataTables(): Promise<void> {

@@ -17,6 +17,7 @@ import { NotFoundError, TooEarlyError, ValidationError } from '@onlydoge/shared-
 import type {
   ExplorerConfigPort,
   ExplorerCoreBlockPort,
+  ExplorerCreatedUtxoOutput,
   ExplorerDogecoinConfigPort,
   ExplorerMempoolRpcPort,
   ExplorerRawBlockPort,
@@ -442,7 +443,7 @@ export class ExplorerQueryService {
 
   private serializeTransactionInputs(
     transaction: DogecoinTransaction,
-    inputMap: Map<string, ProjectionUtxoOutput>,
+    inputMap: Map<string, ExplorerCreatedUtxoOutput>,
     addresses: Set<string>,
   ): ExplorerTransactionInput[] {
     return this.readInputs(transaction.vin).flatMap((input) =>
@@ -452,7 +453,7 @@ export class ExplorerQueryService {
 
   private serializeTransactionInput(
     input: DogecoinVin,
-    inputMap: Map<string, ProjectionUtxoOutput>,
+    inputMap: Map<string, ExplorerCreatedUtxoOutput>,
     addresses: Set<string>,
   ): ExplorerTransactionInput[] {
     if (input.coinbase) {
@@ -606,7 +607,7 @@ export class ExplorerQueryService {
 
   private async loadResolvedInputs(
     transactions: DogecoinTransaction[],
-  ): Promise<Map<string, ProjectionUtxoOutput>> {
+  ): Promise<Map<string, ExplorerCreatedUtxoOutput>> {
     const outputKeys = [
       ...new Set(
         transactions.flatMap((transaction) =>
@@ -620,14 +621,14 @@ export class ExplorerQueryService {
       ),
     ];
 
-    return this.warehouse.getUtxoOutputs(outputKeys);
+    return this.warehouse.getCreatedUtxoOutputs(outputKeys);
   }
 
   private serializeTransactionSummary(
     block: ParsedDogecoinBlock,
     transaction: DogecoinTransaction,
     txIndex: number,
-    resolvedInputs?: Map<string, ProjectionUtxoOutput>,
+    resolvedInputs?: Map<string, ExplorerCreatedUtxoOutput>,
   ): ExplorerTransactionSummary {
     const txid = this.requireString(transaction.txid, 'tx.txid');
     const inputs = this.readInputs(transaction.vin);
@@ -653,7 +654,7 @@ export class ExplorerQueryService {
 
   private totalResolvedInputBase(
     inputs: DogecoinVin[],
-    resolvedInputs?: Map<string, ProjectionUtxoOutput>,
+    resolvedInputs?: Map<string, ExplorerCreatedUtxoOutput>,
   ): bigint {
     let totalInput = 0n;
     for (const input of inputs) {
@@ -665,7 +666,7 @@ export class ExplorerQueryService {
 
   private resolvedInputValue(
     input: DogecoinVin,
-    resolvedInputs?: Map<string, ProjectionUtxoOutput>,
+    resolvedInputs?: Map<string, ExplorerCreatedUtxoOutput>,
   ): bigint {
     if (input.coinbase) {
       return 0n;
@@ -821,12 +822,12 @@ function isCurrentMempoolPromise(
 }
 
 function hasResolvedAddress(
-  resolved: ProjectionUtxoOutput | undefined,
-): resolved is ProjectionUtxoOutput & { address: string } {
+  resolved: ExplorerCreatedUtxoOutput | undefined,
+): resolved is ExplorerCreatedUtxoOutput & { address: string } {
   return resolved !== undefined && resolved.address !== '';
 }
 
-function resolvedInputAmount(resolved: ProjectionUtxoOutput | undefined): bigint {
+function resolvedInputAmount(resolved: ExplorerCreatedUtxoOutput | undefined): bigint {
   return resolved ? parseAmountBase(resolved.valueBase) : 0n;
 }
 

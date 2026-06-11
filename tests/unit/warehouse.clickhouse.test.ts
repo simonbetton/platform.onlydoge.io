@@ -274,16 +274,13 @@ describe('clickhouse warehouse adapter', () => {
     expect(insertedTables).toContain('dogecoin_utxo_outputs_current_v1');
   });
 
-  it('lists address UTXOs from a deduplicated key page before loading full rows', async () => {
+  it('lists address UTXOs from the address-ordered current state table', async () => {
     const adapter = new ClickHouseWarehouseAdapter({
       driver: 'clickhouse',
       location: 'http://clickhouse:8123',
     });
     const query = vi.fn(async ({ query: statement }: { query: string }) => {
-      if (
-        statement.includes('FROM dogecoin_core_utxo_creates_v1') &&
-        statement.includes('WHERE output_key NOT IN')
-      ) {
+      if (statement.includes('FROM dogecoin_utxo_outputs_current_by_address_v1')) {
         return {
           json: async () => [
             clickHouseUtxoRow({
@@ -323,11 +320,12 @@ describe('clickhouse warehouse adapter', () => {
     expect(
       statements.some(
         (statement) =>
-          statement.includes('FROM dogecoin_core_utxo_creates_v1') &&
-          statement.includes('FROM dogecoin_core_utxo_spends_v1') &&
-          statement.includes('WHERE output_key NOT IN'),
+          statement.includes('FROM dogecoin_utxo_outputs_current_by_address_v1') &&
+          statement.includes('WHERE address = {address:String}') &&
+          statement.includes('LIMIT 1 BY output_key'),
       ),
     ).toBe(true);
+    expect(statements.some((statement) => statement.includes('address_outputs AS'))).toBe(false);
   });
 
   it('does not query the legacy versioned UTXO table when current-state rows are missing', async () => {
@@ -445,6 +443,54 @@ describe('clickhouse warehouse adapter', () => {
           statement.includes('LIMIT 1 BY spent_output_key'),
       ),
     ).toBe(true);
+  });
+
+  it('resolves created UTXO outputs from core creates without spend joins', async () => {
+    const adapter = new ClickHouseWarehouseAdapter({
+      driver: 'clickhouse',
+      location: 'http://clickhouse:8123',
+    });
+    const query = vi.fn(async ({ query: statement }: { query: string }) => {
+      if (statement.includes('FROM dogecoin_core_utxo_creates_v1')) {
+        return {
+          json: async () => [
+            clickHouseUtxoRow({
+              blockHeight: 123,
+              blockHash: 'prev-hash',
+              blockTime: 456,
+              txid: 'prev-txid',
+              txIndex: 0,
+              vout: 1,
+              outputKey: 'prev-txid:1',
+              address: 'DInputAddress',
+              valueBase: '10',
+              spentByTxid: null,
+              spentInBlock: null,
+              spentInputIndex: null,
+            }),
+          ],
+        };
+      }
+
+      return { json: async () => [] };
+    });
+
+    (adapter as unknown as { client: { query: typeof query } }).client = { query };
+
+    const rows = await adapter.getCreatedUtxoOutputs(['prev-txid:1']);
+    const statements = query.mock.calls.map(([parameters]) => parameters.query);
+
+    expect(rows.get('prev-txid:1')).toMatchObject({
+      outputKey: 'prev-txid:1',
+      address: 'DInputAddress',
+      valueBase: '10',
+    });
+    expect(statements).toHaveLength(1);
+    expect(statements[0]).toContain('FROM dogecoin_core_utxo_creates_v1');
+    expect(statements[0]).toContain('LIMIT 1 BY output_key');
+    expect(statements[0]).not.toContain('FROM dogecoin_core_utxo_spends_v1');
+    expect(statements[0]).not.toContain('FROM dogecoin_utxo_outputs_current_v1');
+    expect(statements[0]).not.toContain('spent_by_txid');
   });
 
   it('uses core Dogecoin output-key index first for transaction refs', async () => {
@@ -622,7 +668,7 @@ describe('clickhouse warehouse adapter', () => {
     ).toBe(true);
   });
 
-  it('prefers core Dogecoin history over legacy address movement tables', async () => {
+  it('prefers address movement read models over core Dogecoin address scans', async () => {
     const { adapter, query } = addressSummaryAdapter({
       addressMovementRows: [addressSummaryMovementRow('999', '500', 1)],
       coreMovementRows: [addressSummaryMovementRow('11', '7', 2)],
@@ -631,28 +677,23 @@ describe('clickhouse warehouse adapter', () => {
 
     const { statements, summary } = await readTestAddressSummary(adapter, query);
 
-    expectStandardAddressSummary(summary);
-    expect(
-      statements.some(
-        (statement) =>
-          statement.includes('WITH address_outputs') &&
-          statement.includes('FROM dogecoin_core_utxo_creates_v1') &&
-          statement.includes('FROM dogecoin_core_utxo_spends_v1'),
-      ),
-    ).toBe(true);
+    expect(summary).toMatchObject({
+      balance: '4',
+      receivedBase: '999',
+      sentBase: '500',
+      txCount: 1,
+      utxoCount: 1,
+    });
+    expect(statements.some((statement) => statement.includes('WITH address_outputs'))).toBe(false);
   });
 
-  it('uses aggregate ordering for core-backed address transaction history', async () => {
+  it('uses address movement read models for address transaction history', async () => {
     const adapter = new ClickHouseWarehouseAdapter({
       driver: 'clickhouse',
       location: 'http://clickhouse:8123',
     });
     const query = vi.fn(async ({ query: statement }: { query: string }) => {
       if (statement.includes('FROM dogecoin_address_movements_by_address_v1')) {
-        return { json: async () => [] };
-      }
-
-      if (statement.includes('address_outputs AS')) {
         return {
           json: async () => [
             {
@@ -683,16 +724,10 @@ describe('clickhouse warehouse adapter', () => {
     });
     expect(
       statements.some((statement) =>
-        statement.includes('ORDER BY block_height DESC, max(tx_index) DESC, txid DESC'),
+        statement.includes('ORDER BY block_height DESC, tx_index DESC, txid DESC'),
       ),
     ).toBe(true);
-    expect(
-      statements.some(
-        (statement) =>
-          statement.includes('address_spends AS') &&
-          statement.includes('block_height IN (SELECT spent_in_block FROM address_spends)'),
-      ),
-    ).toBe(true);
+    expect(statements.some((statement) => statement.includes('address_outputs AS'))).toBe(false);
   });
 
   it('appends core Dogecoin create, spend, and processed-block rows by window', async () => {
@@ -1138,7 +1173,10 @@ function addressSummaryAdapter(input: {
       return jsonRows(input.coreMovementRows ?? []);
     }
 
-    if (statement.includes('FROM dogecoin_balances_current_v1')) {
+    if (
+      statement.includes('FROM dogecoin_utxo_outputs_current_by_address_v1') &&
+      statement.includes('sum(toInt256(value_base))')
+    ) {
       return jsonRows([{ balance: '4' }]);
     }
 

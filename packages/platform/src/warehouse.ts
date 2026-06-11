@@ -15,7 +15,7 @@ import {
   analyticsTransactionsTable,
   mempoolSamplesTable,
 } from '@onlydoge/analytics-query';
-import type { ExplorerWarehousePort } from '@onlydoge/explorer-query';
+import type { ExplorerCreatedUtxoOutput, ExplorerWarehousePort } from '@onlydoge/explorer-query';
 import {
   type AddressMovement,
   type BlockProjectionBatch,
@@ -183,10 +183,6 @@ type AddressMovementSummaryRow = {
   receivedBase: string;
   sentBase: string;
   txCount: number;
-};
-type AddressSpendableSummaryRow = {
-  balance: string;
-  utxoCount: number;
 };
 type CoreBenchmarkTables = {
   appliedBlocks: string;
@@ -490,6 +486,12 @@ export class InMemoryWarehouseAdapter
     );
 
     return new Map(outputs.map((output) => [output.outputKey, output]));
+  }
+
+  public async getCreatedUtxoOutputs(
+    outputKeys: string[],
+  ): Promise<Map<string, ExplorerCreatedUtxoOutput>> {
+    return this.getUtxoOutputs(outputKeys);
   }
 
   public async hasAppliedBlock(blockHeight: number, blockHash: string): Promise<boolean> {
@@ -1857,6 +1859,7 @@ export class ClickHouseWarehouseAdapter
   }
 
   private async getCurrentTransactionRef(txid: string) {
+    const prefix = `${txid}:`;
     const rows = await this.queryRows<{
       blockHash: string;
       blockHeight: number;
@@ -1870,11 +1873,17 @@ export class ClickHouseWarehouseAdapter
             block_time AS "blockTime",
             tx_index AS "txIndex"
           FROM ${utxoCurrentStateTable}
-          WHERE txid = {txid:String}
-          ORDER BY version DESC
+          WHERE
+            output_key >= {prefix:String}
+            AND output_key < {prefixEnd:String}
+          ORDER BY output_key ASC, version DESC
+          LIMIT 1 BY output_key
           LIMIT 1
         `,
-      query_params: { txid },
+      query_params: {
+        prefix,
+        prefixEnd: `${txid};`,
+      },
       format: 'JSONEachRow',
     });
 
@@ -1914,28 +1923,12 @@ export class ClickHouseWarehouseAdapter
   }
 
   public async getAddressSummary(address: string) {
-    const [coreMovement, coreSpendable] = await Promise.all([
-      this.queryCoreAddressMovementSummary(address),
-      this.queryCoreSpendableAddressSummary(address),
-    ]);
-    if (hasAddressMovementSummary(coreMovement)) {
-      return buildClickHouseAddressSummary(
-        coreMovement,
-        coreSpendable.balance,
-        coreSpendable.utxoCount,
-      );
-    }
-
     const [movementFromTable, balance, utxoCount] = await Promise.all([
       this.queryAddressMovementSummary(address),
       this.queryNativeBalance(address),
       this.querySpendableUtxoCount(address),
     ]);
-    const movement = hasAddressMovementSummary(movementFromTable)
-      ? movementFromTable
-      : await this.queryCoreAddressMovementSummary(address);
-
-    return buildClickHouseAddressSummary(movement, balance, utxoCount);
+    return buildClickHouseAddressSummary(movementFromTable, balance, utxoCount);
   }
 
   private async queryAddressMovementSummary(
@@ -1957,106 +1950,22 @@ export class ClickHouseWarehouseAdapter
     return rows[0];
   }
 
-  private async queryCoreSpendableAddressSummary(
-    address: string,
-  ): Promise<AddressSpendableSummaryRow> {
-    const rows = await this.queryRows<AddressSpendableSummaryRow>({
-      query: `
-          WITH
-          address_outputs AS (
-            SELECT
-              output_key,
-              value_base
-            FROM ${coreUtxoCreatesTable}
-            WHERE
-              address = {address:String}
-              AND is_spendable = 1
-            ORDER BY output_key ASC, version DESC
-            LIMIT 1 BY output_key
-          ),
-          address_spends AS (
-            SELECT
-              spent_output_key
-            FROM ${coreUtxoSpendsTable}
-            WHERE
-              spent_output_key IN (SELECT output_key FROM address_outputs)
-            ORDER BY spent_output_key ASC, version DESC
-            LIMIT 1 BY spent_output_key
-          )
-          SELECT
-            CAST(sum(toInt256(value_base)) AS String) AS balance,
-            count() AS "utxoCount"
-          FROM address_outputs
-          WHERE output_key NOT IN (SELECT spent_output_key FROM address_spends)
-        `,
-      query_params: { address },
-      format: 'JSONEachRow',
-    });
-
-    return rows[0] ?? { balance: '0', utxoCount: 0 };
-  }
-
-  private async queryCoreAddressMovementSummary(
-    address: string,
-  ): Promise<AddressMovementSummaryRow | undefined> {
-    const rows = await this.queryRows<AddressMovementSummaryRow>({
-      query: `
-          WITH address_outputs AS (
-            SELECT
-              output_key,
-              txid,
-              value_base
-            FROM ${coreUtxoCreatesTable}
-            WHERE
-              address = {address:String}
-              AND is_spendable = 1
-            ORDER BY output_key ASC, version DESC
-            LIMIT 1 BY output_key
-          )
-          SELECT
-            CAST(sumIf(amount_base_i256, direction = 'credit') AS String) AS "receivedBase",
-            CAST(sumIf(amount_base_i256, direction = 'debit') AS String) AS "sentBase",
-            uniqExact(txid) AS "txCount"
-          FROM (
-            SELECT
-              txid,
-              toInt256(value_base) AS amount_base_i256,
-              'credit' AS direction
-            FROM address_outputs
-            UNION ALL
-            SELECT
-              s.spent_by_txid AS txid,
-              toInt256(c.value_base) AS amount_base_i256,
-              'debit' AS direction
-            FROM address_outputs AS c
-            INNER JOIN (
-              SELECT
-                spent_output_key,
-                spent_by_txid
-              FROM ${coreUtxoSpendsTable}
-              WHERE
-                spent_output_key IN (SELECT output_key FROM address_outputs)
-              ORDER BY spent_output_key ASC, version DESC
-              LIMIT 1 BY spent_output_key
-            ) AS s
-            ON c.output_key = s.spent_output_key
-          )
-        `,
-      query_params: { address },
-      format: 'JSONEachRow',
-    });
-
-    return rows[0];
-  }
-
   private async queryNativeBalance(address: string): Promise<string> {
     const rows = await this.queryRows<{ balance: string }>({
       query: `
-          SELECT balance
-          FROM ${balancesTable}
-          WHERE address = {address:String} AND asset_address = ''
-          ORDER BY version DESC
-          LIMIT 1
+          SELECT CAST(sum(toInt256(value_base)) AS String) AS balance
+          FROM (
+            SELECT
+              output_key,
+              value_base,
+              is_spendable,
+              spent_by_txid
+            FROM ${utxoCurrentStateByAddressTable}
+            WHERE address = {address:String}
+            ORDER BY output_key ASC, version DESC
+            LIMIT 1 BY output_key
+          )
+          WHERE is_spendable = 1 AND spent_by_txid IS NULL
         `,
       query_params: { address },
       format: 'JSONEachRow',
@@ -2091,11 +2000,6 @@ export class ClickHouseWarehouseAdapter
   }
 
   public async listAddressTransactions(address: string, offset = 0, limit?: number) {
-    const coreRows = await this.listCoreAddressTransactions(address, offset, limit);
-    if (coreRows.length > 0) {
-      return coreRows;
-    }
-
     const pagination = clickHousePagination(offset, limit);
     const rows = await this.queryRows<{
       blockHash: string;
@@ -2132,146 +2036,10 @@ export class ClickHouseWarehouseAdapter
     return rows;
   }
 
-  private async listCoreAddressTransactions(address: string, offset = 0, limit?: number) {
-    const pagination = clickHousePagination(offset, limit);
-    return await this.queryRows<{
-      blockHash: string;
-      blockHeight: number;
-      blockTime: number;
-      receivedBase: string;
-      sentBase: string;
-      txIndex: number;
-      txid: string;
-    }>({
-      query: `
-          WITH
-          address_outputs AS (
-            SELECT
-              block_height,
-              block_hash,
-              block_time,
-              txid,
-              tx_index,
-              output_key,
-              value_base
-            FROM ${coreUtxoCreatesTable}
-            WHERE
-              address = {address:String}
-              AND is_spendable = 1
-            ORDER BY output_key ASC, version DESC
-            LIMIT 1 BY output_key
-          ),
-          address_spends AS (
-            SELECT
-              spent_output_key,
-              spent_by_txid,
-              spent_in_block
-            FROM ${coreUtxoSpendsTable}
-            WHERE
-              spent_output_key IN (SELECT output_key FROM address_outputs)
-            ORDER BY spent_output_key ASC, version DESC
-            LIMIT 1 BY spent_output_key
-          ),
-          spend_blocks AS (
-            SELECT
-              block_height,
-              block_hash,
-              block_time
-            FROM ${coreProcessedBlocksTable}
-            WHERE
-              block_height IN (SELECT spent_in_block FROM address_spends)
-            ORDER BY block_height ASC, version DESC
-            LIMIT 1 BY block_height
-          )
-          SELECT
-            block_height AS "blockHeight",
-            any(block_hash) AS "blockHash",
-            any(block_time) AS "blockTime",
-            txid,
-            max(tx_index) AS "txIndex",
-            CAST(sumIf(amount_base_i256, direction = 'credit') AS String) AS "receivedBase",
-            CAST(sumIf(amount_base_i256, direction = 'debit') AS String) AS "sentBase"
-          FROM (
-            SELECT
-              block_height,
-              block_hash,
-              block_time,
-              txid,
-              tx_index,
-              toInt256(value_base) AS amount_base_i256,
-              'credit' AS direction
-            FROM address_outputs
-            UNION ALL
-            SELECT
-              s.spent_in_block AS block_height,
-              b.block_hash AS block_hash,
-              b.block_time AS block_time,
-              s.spent_by_txid AS txid,
-              0 AS tx_index,
-              toInt256(c.value_base) AS amount_base_i256,
-              'debit' AS direction
-            FROM address_outputs AS c
-            INNER JOIN address_spends AS s
-            ON c.output_key = s.spent_output_key
-            INNER JOIN spend_blocks AS b
-            ON b.block_height = s.spent_in_block
-          )
-          GROUP BY block_height, txid
-          ORDER BY block_height DESC, max(tx_index) DESC, txid DESC
-          ${pagination.limitClause}
-          ${pagination.offsetClause}
-        `,
-      query_params: {
-        address,
-        ...pagination.queryParams,
-      },
-      format: 'JSONEachRow',
-    });
-  }
-
   public async listAddressUtxos(address: string, offset = 0, limit?: number) {
-    return this.listCoreAddressUtxos(address, offset, limit);
-  }
-
-  private async listCoreAddressUtxos(
-    address: string,
-    offset = 0,
-    limit?: number,
-  ): Promise<ProjectionUtxoOutput[]> {
     const pagination = clickHousePagination(offset, limit);
     return await this.queryRows<ProjectionUtxoOutput>({
       query: `
-          WITH
-          address_outputs AS (
-            SELECT
-              block_height,
-              block_hash,
-              block_time,
-              txid,
-              tx_index,
-              vout,
-              output_key,
-              address,
-              script_type,
-              value_base,
-              is_coinbase,
-              is_spendable
-            FROM ${coreUtxoCreatesTable}
-            WHERE
-              address = {address:String}
-              AND is_spendable = 1
-            ORDER BY output_key ASC, version DESC
-            LIMIT 1 BY output_key
-          ),
-          address_spends AS (
-            SELECT
-              spent_output_key
-            FROM ${coreUtxoSpendsTable}
-            WHERE
-              spent_output_key IN (SELECT output_key FROM address_outputs)
-            ORDER BY spent_output_key ASC, version DESC
-            LIMIT 1 BY spent_output_key
-          )
           SELECT
             block_height AS "blockHeight",
             block_hash AS "blockHash",
@@ -2285,11 +2053,33 @@ export class ClickHouseWarehouseAdapter
             value_base AS "valueBase",
             is_coinbase = 1 AS "isCoinbase",
             is_spendable = 1 AS "isSpendable",
-            CAST(NULL, 'Nullable(String)') AS "spentByTxid",
-            CAST(NULL, 'Nullable(UInt64)') AS "spentInBlock",
-            CAST(NULL, 'Nullable(UInt64)') AS "spentInputIndex"
-          FROM address_outputs
-          WHERE output_key NOT IN (SELECT spent_output_key FROM address_spends)
+            spent_by_txid AS "spentByTxid",
+            spent_in_block AS "spentInBlock",
+            spent_input_index AS "spentInputIndex"
+          FROM (
+            SELECT
+              block_height,
+              block_hash,
+              block_time,
+              txid,
+              tx_index,
+              vout,
+              output_key,
+              address,
+              script_type,
+              value_base,
+              is_coinbase,
+              is_spendable,
+              spent_by_txid,
+              spent_in_block,
+              spent_input_index,
+              version
+            FROM ${utxoCurrentStateByAddressTable}
+            WHERE address = {address:String}
+            ORDER BY output_key ASC, version DESC
+            LIMIT 1 BY output_key
+          )
+          WHERE is_spendable = 1 AND spent_by_txid IS NULL
           ORDER BY block_height DESC, tx_index DESC, vout ASC
           ${pagination.limitClause}
           ${pagination.offsetClause}
@@ -2314,6 +2104,12 @@ export class ClickHouseWarehouseAdapter
     const currentOutputs = await this.getCurrentUtxoOutputMap(outputKeys);
     await this.addMissingUtxoOutputs(outputKeys, currentOutputs);
     return currentOutputs;
+  }
+
+  public async getCreatedUtxoOutputs(
+    outputKeys: string[],
+  ): Promise<Map<string, ExplorerCreatedUtxoOutput>> {
+    return this.queryCoreCreatedUtxoOutputs(outputKeys);
   }
 
   private async addMissingUtxoOutputs(
@@ -2460,6 +2256,25 @@ export class ClickHouseWarehouseAdapter
     for (const row of rowChunks.flat()) {
       currentOutputs.set(row.outputKey, row);
     }
+  }
+
+  private async queryCoreCreatedUtxoOutputs(
+    outputKeys: string[],
+  ): Promise<Map<string, ExplorerCreatedUtxoOutput>> {
+    return this.queryCoreOutputKeyRows<ExplorerCreatedUtxoOutput>(outputKeys, (chunk) => ({
+      query: `
+          SELECT
+            output_key AS "outputKey",
+            address,
+            value_base AS "valueBase"
+          FROM ${coreUtxoCreatesTable}
+          WHERE output_key IN ({outputKeys:Array(String)})
+          ORDER BY output_key ASC, version DESC
+          LIMIT 1 BY output_key
+        `,
+      query_params: { outputKeys: chunk },
+      format: 'JSONEachRow',
+    }));
   }
 
   public async hasAppliedBlock(blockHeight: number, blockHash: string): Promise<boolean> {
@@ -3430,6 +3245,10 @@ export class CompositeWarehouseAdapter
     return this.stateStore.getUtxoOutputs(outputKeys);
   }
 
+  public getCreatedUtxoOutputs(outputKeys: string[]) {
+    return this.historyWarehouse.getCreatedUtxoOutputs(outputKeys);
+  }
+
   public async getAddressSummary(address: string) {
     const [current, historical] = await Promise.all([
       this.stateStore.getCurrentAddressSummary(address),
@@ -3562,24 +3381,6 @@ function toMempoolSampleInsertRow(row: MempoolSampleRow): Record<string, unknown
     fee_rate_base_per_kilobyte: row.feeRateBasePerKilobyte,
     raw_json: row.rawJson,
   };
-}
-
-function hasAddressMovementSummary(
-  movement: AddressMovementSummaryRow | undefined,
-): movement is AddressMovementSummaryRow {
-  if (movement === undefined) {
-    return false;
-  }
-
-  return hasAddressMovementValues(movement);
-}
-
-function hasAddressMovementValues(movement: AddressMovementSummaryRow): boolean {
-  return [
-    Number(movement.txCount) > 0,
-    movement.receivedBase !== '0',
-    movement.sentBase !== '0',
-  ].includes(true);
 }
 
 export class MirroredProjectionStateStore implements ProjectionStateStorePort {
