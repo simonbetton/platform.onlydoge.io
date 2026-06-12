@@ -1412,13 +1412,13 @@ export class ClickHouseWarehouseAdapter
         throw error;
       }
 
-      await this.recoverCoreCurrentStateForPendingWindow(pending, context, error);
+      await this.recoverCoreCurrentStateForPendingWindow(pending, context, requestContext, error);
     }
 
     try {
       await this.insertPendingCoreWindow(pending, context, requestContext);
     } catch (retryError) {
-      await this.cleanFailedCoreWindow(pending, context);
+      await this.cleanFailedCoreWindowFacts(pending, context);
       throw retryError;
     }
   }
@@ -1426,17 +1426,19 @@ export class ClickHouseWarehouseAdapter
   private async recoverCoreCurrentStateForPendingWindow(
     pending: CoreDogecoinBlockApplication[],
     context: CoreDogecoinApplyContext | undefined,
+    requestContext: ClickHouseRequestContext,
     error: MissingCoreCurrentPrevoutError,
   ): Promise<void> {
     const windowStart = coreWindowStart(pending);
     const windowEnd = coreWindowEnd(pending);
     console.warn(
-      `[onlydoge] phase=core-current-state-recovery action=rematerialize reason=missing-current-prevout output_key=${error.outputKey} window_start=${windowStart} window_end=${windowEnd}`,
+      `[onlydoge] phase=core-current-state-recovery action=repair-prevouts reason=missing-current-prevout output_key=${error.outputKey} window_start=${windowStart} window_end=${windowEnd}`,
     );
-    await this.cleanFailedCoreWindow(pending, context);
+    await this.cleanFailedCoreWindowFacts(pending, context);
+    await this.repairMissingCoreCurrentPrevouts(pending, requestContext);
   }
 
-  private async cleanFailedCoreWindow(
+  private async cleanFailedCoreWindowFacts(
     pending: CoreDogecoinBlockApplication[],
     context: CoreDogecoinApplyContext | undefined,
   ): Promise<void> {
@@ -1446,7 +1448,33 @@ export class ClickHouseWarehouseAdapter
     }
 
     await this.deleteCoreDogecoinTail(windowStart, context);
-    await this.rematerializeCoreCurrentStateAt(windowStart - 1, context);
+  }
+
+  private async repairMissingCoreCurrentPrevouts(
+    pending: CoreDogecoinBlockApplication[],
+    requestContext: ClickHouseRequestContext,
+  ): Promise<void> {
+    const outputKeys = externalCoreSpendKeys(pending);
+    const currentOutputs = await this.getCurrentUtxoOutputMap(outputKeys, requestContext);
+    const missingOutputKeys = missingUtxoOutputKeys(outputKeys, currentOutputs);
+    if (missingOutputKeys.length === 0) {
+      return;
+    }
+
+    const repairedRows = await this.queryCoreHistoricalUtxoOutputRows(
+      missingOutputKeys,
+      requestContext,
+      coreWindowStart(pending) - 1,
+    );
+    assertCoreCurrentPrevoutRepairs(missingOutputKeys, repairedRows);
+
+    await this.insertRows(
+      utxoCurrentStateTable,
+      repairedRows.map((row) =>
+        toUtxoInsertRow(unspentCoreCurrentRepair(row), coreCurrentCreateVersion(row.blockHeight)),
+      ),
+      requestContext,
+    );
   }
 
   private async insertCoreAddressMovements(
@@ -2245,15 +2273,31 @@ export class ClickHouseWarehouseAdapter
     missingOutputKeys: string[],
     currentOutputs: Map<string, ProjectionUtxoOutput>,
   ): Promise<void> {
+    const rows = await this.queryCoreHistoricalUtxoOutputRows(missingOutputKeys);
+    for (const row of rows) {
+      currentOutputs.set(row.outputKey, row);
+    }
+  }
+
+  private async queryCoreHistoricalUtxoOutputRows(
+    outputKeys: string[],
+    requestContext?: ClickHouseRequestContext,
+    asOfBlockHeight?: number,
+  ): Promise<ProjectionUtxoOutput[]> {
+    if (outputKeys.length === 0 || (asOfBlockHeight !== undefined && asOfBlockHeight < 0)) {
+      return [];
+    }
+
     const rowChunks = await mapWithConcurrency(
-      chunkQueryValues([...new Set(missingOutputKeys)], {
+      chunkQueryValues([...new Set(outputKeys)], {
         maxBytes: maxClickHouseCoreOutputKeyBytesPerChunk,
         maxValues: maxClickHouseCoreOutputKeyValuesPerChunk,
       }),
       maxClickHouseCoreOutputKeyQueryConcurrency,
       (chunk) =>
-        this.queryRows<ProjectionUtxoOutput>({
-          query: `
+        this.queryRows<ProjectionUtxoOutput>(
+          {
+            query: `
               SELECT
                 c.block_height AS "blockHeight",
                 c.block_hash AS "blockHash",
@@ -2287,6 +2331,7 @@ export class ClickHouseWarehouseAdapter
                 FROM ${coreUtxoCreatesTable}
                 WHERE
                   output_key IN ({outputKeys:Array(String)})
+                  ${coreAsOfBlockHeightClause('block_height', asOfBlockHeight)}
                 ORDER BY output_key ASC, version DESC
                 LIMIT 1 BY output_key
               ) AS c
@@ -2299,20 +2344,21 @@ export class ClickHouseWarehouseAdapter
                 FROM ${coreUtxoSpendsTable}
                 WHERE
                   spent_output_key IN ({outputKeys:Array(String)})
+                  ${coreAsOfBlockHeightClause('spent_in_block', asOfBlockHeight)}
                 ORDER BY spent_output_key ASC, version DESC
                 LIMIT 1 BY spent_output_key
               ) AS s
               ON c.output_key = s.spent_output_key
               SETTINGS join_use_nulls = 1
             `,
-          query_params: { outputKeys: chunk },
-          format: 'JSONEachRow',
-        }),
+            query_params: coreHistoricalUtxoOutputParams(chunk, asOfBlockHeight),
+            format: 'JSONEachRow',
+          },
+          requestContext,
+        ),
     );
 
-    for (const row of rowChunks.flat()) {
-      currentOutputs.set(row.outputKey, row);
-    }
+    return rowChunks.flat();
   }
 
   private async queryCoreCreatedUtxoOutputs(
@@ -3663,6 +3709,52 @@ function missingUtxoOutputKeys(
   currentOutputs: Map<string, ProjectionUtxoOutput>,
 ): string[] {
   return outputKeys.filter((outputKey) => !currentOutputs.has(outputKey));
+}
+
+function assertCoreCurrentPrevoutRepairs(
+  missingOutputKeys: string[],
+  repairedRows: ProjectionUtxoOutput[],
+): void {
+  const repairedByKey = new Map(repairedRows.map((row) => [row.outputKey, row]));
+  const missing = missingOutputKeys.find((outputKey) => !repairedByKey.has(outputKey));
+  if (missing) {
+    throw new MissingCoreCurrentPrevoutError(missing);
+  }
+
+  const spent = repairedRows.find((row) => row.spentInBlock !== null);
+  if (spent) {
+    throw new Error(
+      `core dogecoin prevout already spent before current repair: ${spent.outputKey}`,
+    );
+  }
+}
+
+function unspentCoreCurrentRepair(row: ProjectionUtxoOutput): ProjectionUtxoOutput {
+  return {
+    ...row,
+    spentByTxid: null,
+    spentInBlock: null,
+    spentInputIndex: null,
+  };
+}
+
+function coreAsOfBlockHeightClause(column: string, asOfBlockHeight: number | undefined): string {
+  if (asOfBlockHeight === undefined) {
+    return '';
+  }
+
+  return `AND ${column} <= {asOfBlockHeight:UInt64}`;
+}
+
+function coreHistoricalUtxoOutputParams(
+  outputKeys: string[],
+  asOfBlockHeight: number | undefined,
+): Record<string, number | string[]> {
+  if (asOfBlockHeight === undefined) {
+    return { outputKeys };
+  }
+
+  return { outputKeys, asOfBlockHeight };
 }
 
 function fallbackUtxoVersion(row: ProjectionUtxoOutput): number {

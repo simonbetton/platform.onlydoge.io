@@ -941,6 +941,25 @@ describe('clickhouse warehouse adapter', () => {
               : [],
         };
       }
+      if (
+        statement.includes('FROM dogecoin_core_utxo_creates_v1') &&
+        statement.includes('LEFT JOIN') &&
+        statement.includes('block_height <= {asOfBlockHeight:UInt64}')
+      ) {
+        return {
+          json: async () => [
+            clickHouseUtxoRow({
+              blockHeight: 1,
+              blockHash: 'block-1',
+              blockTime: 1,
+              outputKey: 'prev-tx:0',
+              txid: 'prev-tx',
+              address: 'DPrevAddress',
+              valueBase: '100000000',
+            }),
+          ],
+        };
+      }
       if (statement.includes('FROM dogecoin_balances_current_v1')) {
         return {
           json: async () => [
@@ -957,8 +976,15 @@ describe('clickhouse warehouse adapter', () => {
       return { json: async () => [] };
     });
     const { command, insert } = installClickHouseClient(adapter, query);
-    command.mockImplementation(async (parameters: ClickHouseCommandCall) => {
-      if (parameters.query.includes('INSERT INTO dogecoin_utxo_outputs_current_v1')) {
+    insert.mockImplementation(async (parameters: { table: string; values: unknown[] }) => {
+      if (
+        parameters.table === 'dogecoin_utxo_outputs_current_v1' &&
+        parameters.values.some(
+          (value) =>
+            (value as { output_key?: string; spent_by_txid?: string | null }).output_key ===
+              'prev-tx:0' && (value as { spent_by_txid?: string | null }).spent_by_txid === null,
+        )
+      ) {
         recoveredCurrentState = true;
       }
     });
@@ -987,10 +1013,21 @@ describe('clickhouse warehouse adapter', () => {
         query_params: { fromBlockHeight: 2 },
       }),
     );
-    expect(command).toHaveBeenCalledWith(
+    expect(command).not.toHaveBeenCalledWith(
       expect.objectContaining({
         query: expect.stringContaining('INSERT INTO dogecoin_utxo_outputs_current_v1'),
-        query_params: expect.objectContaining({ asOfBlockHeight: 1 }),
+      }),
+    );
+    expect(insert).toHaveBeenCalledWith(
+      expect.objectContaining({
+        table: 'dogecoin_utxo_outputs_current_v1',
+        values: [
+          expect.objectContaining({
+            output_key: 'prev-tx:0',
+            spent_by_txid: null,
+            version: 2,
+          }),
+        ],
       }),
     );
     expect(insert).toHaveBeenCalledWith(
@@ -1347,7 +1384,7 @@ function installClickHouseClient(
   adapter: ClickHouseWarehouseAdapter,
   query: (parameters: { query: string }) => Promise<unknown>,
 ) {
-  const insert = vi.fn(async () => undefined);
+  const insert = vi.fn(async (_parameters: { table: string; values: unknown[] }) => undefined);
   const command = vi.fn(async (_parameters: ClickHouseCommandCall) => undefined);
   (
     adapter as unknown as {
