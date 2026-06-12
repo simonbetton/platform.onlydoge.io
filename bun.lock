@@ -14,6 +14,7 @@
         "drizzle-orm": "0.45.2",
         "elysia": "1.4.28",
         "mysql2": "3.22.5",
+        "node-sql-parser": "5.4.0",
         "pg": "8.21.0",
         "pino": "10.3.1",
       },
