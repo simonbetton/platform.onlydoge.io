@@ -149,6 +149,13 @@ interface CoreWindowShapeState {
   spent: Set<string>;
 }
 
+class MissingCoreCurrentPrevoutError extends Error {
+  public constructor(public readonly outputKey: string) {
+    super(`missing current dogecoin prevout: ${outputKey}`);
+    this.name = 'MissingCoreCurrentPrevoutError';
+  }
+}
+
 const maxClickHouseHotOutputKeyValuesPerChunk = 128;
 const maxClickHouseHotOutputKeyBytesPerChunk = 6_000;
 const maxClickHouseCoreOutputKeyValuesPerChunk = 512;
@@ -1231,7 +1238,7 @@ export class ClickHouseWarehouseAdapter
     }
 
     await this.validatePendingCoreWindow(pending, context, requestContext);
-    await this.insertPendingCoreWindow(pending, context, requestContext);
+    await this.insertPendingCoreWindowWithRecovery(pending, context, requestContext);
     return appliedCoreWindowResult(input, pending);
   }
 
@@ -1390,6 +1397,56 @@ export class ClickHouseWarehouseAdapter
       pending.map(toCoreProcessedBlockInsertRow),
       requestContext,
     );
+  }
+
+  private async insertPendingCoreWindowWithRecovery(
+    pending: CoreDogecoinBlockApplication[],
+    context: CoreDogecoinApplyContext | undefined,
+    requestContext: ClickHouseRequestContext,
+  ): Promise<void> {
+    try {
+      await this.insertPendingCoreWindow(pending, context, requestContext);
+      return;
+    } catch (error) {
+      if (!shouldRecoverMissingCoreCurrentPrevout(error, context)) {
+        throw error;
+      }
+
+      await this.recoverCoreCurrentStateForPendingWindow(pending, context, error);
+    }
+
+    try {
+      await this.insertPendingCoreWindow(pending, context, requestContext);
+    } catch (retryError) {
+      await this.cleanFailedCoreWindow(pending, context);
+      throw retryError;
+    }
+  }
+
+  private async recoverCoreCurrentStateForPendingWindow(
+    pending: CoreDogecoinBlockApplication[],
+    context: CoreDogecoinApplyContext | undefined,
+    error: MissingCoreCurrentPrevoutError,
+  ): Promise<void> {
+    const windowStart = coreWindowStart(pending);
+    const windowEnd = coreWindowEnd(pending);
+    console.warn(
+      `[onlydoge] phase=core-current-state-recovery action=rematerialize reason=missing-current-prevout output_key=${error.outputKey} window_start=${windowStart} window_end=${windowEnd}`,
+    );
+    await this.cleanFailedCoreWindow(pending, context);
+  }
+
+  private async cleanFailedCoreWindow(
+    pending: CoreDogecoinBlockApplication[],
+    context: CoreDogecoinApplyContext | undefined,
+  ): Promise<void> {
+    const windowStart = coreWindowStart(pending);
+    if (windowStart < 0) {
+      return;
+    }
+
+    await this.deleteCoreDogecoinTail(windowStart, context);
+    await this.rematerializeCoreCurrentStateAt(windowStart - 1, context);
   }
 
   private async insertCoreAddressMovements(
@@ -3574,6 +3631,13 @@ function shouldUpdateCoreCurrentState(context: CoreDogecoinApplyContext | undefi
   return context.updateCurrentState === true;
 }
 
+function shouldRecoverMissingCoreCurrentPrevout(
+  error: unknown,
+  context: CoreDogecoinApplyContext | undefined,
+): error is MissingCoreCurrentPrevoutError {
+  return shouldUpdateCoreCurrentState(context) && error instanceof MissingCoreCurrentPrevoutError;
+}
+
 function coreBenchmarkRows(input: CoreDogecoinBlockApplication[]): {
   createRows: ProjectionUtxoOutput[];
   spendRows: CoreDogecoinBlockApplication['utxoSpends'];
@@ -3833,6 +3897,15 @@ function coreWindowEnd(pending: CoreDogecoinBlockApplication[]): number {
   }
 
   return last.blockHeight;
+}
+
+function coreWindowStart(pending: CoreDogecoinBlockApplication[]): number {
+  const first = pending.at(0);
+  if (!first) {
+    return -1;
+  }
+
+  return first.blockHeight;
 }
 
 function coreWindowSpendKeys(pending: CoreDogecoinBlockApplication[]): string[] {
@@ -4145,7 +4218,7 @@ function requireCurrentCoreOutput(
 ): ProjectionUtxoOutput {
   const current = currentOutputs.get(outputKey);
   if (!current) {
-    throw new Error(`missing current dogecoin prevout: ${outputKey}`);
+    throw new MissingCoreCurrentPrevoutError(outputKey);
   }
 
   return current;

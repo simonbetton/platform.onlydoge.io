@@ -916,6 +916,103 @@ describe('clickhouse warehouse adapter', () => {
     );
   });
 
+  it('recovers current Dogecoin state from core facts when a pending prevout is missing', async () => {
+    const adapter = new ClickHouseWarehouseAdapter({
+      driver: 'clickhouse',
+      location: 'http://clickhouse:8123',
+    });
+    let recoveredCurrentState = false;
+    const query = vi.fn(async ({ query: statement }: { query: string }) => {
+      if (statement.includes('FROM dogecoin_core_processed_blocks_v1')) {
+        return { json: async () => [] };
+      }
+      if (statement.includes('FROM dogecoin_utxo_outputs_current_v1')) {
+        return {
+          json: async () =>
+            recoveredCurrentState
+              ? [
+                  clickHouseUtxoRow({
+                    outputKey: 'prev-tx:0',
+                    txid: 'prev-tx',
+                    address: 'DPrevAddress',
+                    valueBase: '100000000',
+                  }),
+                ]
+              : [],
+        };
+      }
+      if (statement.includes('FROM dogecoin_balances_current_v1')) {
+        return {
+          json: async () => [
+            {
+              address: 'DPrevAddress',
+              assetAddress: '',
+              balance: '100000000',
+              asOfBlockHeight: 1,
+              version: 1,
+            },
+          ],
+        };
+      }
+      return { json: async () => [] };
+    });
+    const { command, insert } = installClickHouseClient(adapter, query);
+    command.mockImplementation(async (parameters: ClickHouseCommandCall) => {
+      if (parameters.query.includes('INSERT INTO dogecoin_utxo_outputs_current_v1')) {
+        recoveredCurrentState = true;
+      }
+    });
+
+    await expect(
+      adapter.applyCoreDogecoinWindow(
+        [
+          coreApplication({
+            blockHeight: 2,
+            blockHash: 'block-2',
+            spends: ['prev-tx:0'],
+            creates: ['new-tx:0'],
+          }),
+        ],
+        { updateCurrentState: true, validatePrevouts: false, statementTimeoutMs: 30000 },
+      ),
+    ).resolves.toEqual({
+      applied: true,
+      processTail: 2,
+    });
+
+    expect(command).toHaveBeenCalledWith(
+      expect.objectContaining({
+        query:
+          'ALTER TABLE dogecoin_core_utxo_creates_v1 DELETE WHERE block_height >= {fromBlockHeight:UInt64}',
+        query_params: { fromBlockHeight: 2 },
+      }),
+    );
+    expect(command).toHaveBeenCalledWith(
+      expect.objectContaining({
+        query: expect.stringContaining('INSERT INTO dogecoin_utxo_outputs_current_v1'),
+        query_params: expect.objectContaining({ asOfBlockHeight: 1 }),
+      }),
+    );
+    expect(insert).toHaveBeenCalledWith(
+      expect.objectContaining({
+        table: 'dogecoin_address_movements_v1',
+        values: expect.arrayContaining([
+          expect.objectContaining({
+            movement_id: 'core-debit:prev-tx:0:tx-2:0',
+            address: 'DPrevAddress',
+            direction: 'debit',
+          }),
+        ]),
+      }),
+    );
+    expect(insert).toHaveBeenCalledWith(
+      expect.objectContaining({
+        table: 'dogecoin_core_processed_blocks_v1',
+        values: [expect.objectContaining({ block_hash: 'block-2', block_height: 2 })],
+      }),
+    );
+  });
+
   it('rejects missing external prevouts in core Dogecoin windows', async () => {
     const { adapter } = installEmptyClickHouseClient();
 
