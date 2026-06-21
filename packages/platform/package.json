@@ -4,9 +4,9 @@
   "type": "module",
   "exports": "./src/index.ts",
   "dependencies": {
-    "@aws-sdk/client-s3": "3.1063.0",
-    "@clickhouse/client": "1.20.0",
-    "@libsql/client": "^0.17.3",
+    "@aws-sdk/client-s3": "3.1073.0",
+    "@clickhouse/client": "1.21.0",
+    "@libsql/client": "^0.17.4",
     "@onlydoge/access-control": "workspace:*",
     "@onlydoge/analytics-query": "workspace:*",
     "@onlydoge/explorer-query": "workspace:*",
@@ -14,7 +14,7 @@
     "@onlydoge/shared-kernel": "workspace:*",
     "drizzle-orm": "0.45.2",
     "mysql2": "^3.22.5",
-    "pg": "^8.21.0",
+    "pg": "^8.22.0",
     "pino": "10.3.1"
   }
 }
