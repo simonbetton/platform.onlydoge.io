@@ -74,15 +74,66 @@ services:
       - ./docker/clickhouse/users.d/onlydoge-memory.xml:/etc/clickhouse-server/users.d/onlydoge-memory.xml:ro
       - ./docker/clickhouse/users.d/onlydoge-analytics.xml:/etc/clickhouse-server/users.d/onlydoge-analytics.xml:ro
 
+  dogecoin:
+    image: dogeorg/dogecoin-node:ubuntu
+    platform: linux/amd64
+    restart: unless-stopped
+    environment:
+      uacomment: ${DOGECOIN_UACOMMENT:-OnlyDoge}
+      rpcuser: ${DOGECOIN_RPC_USER:-gigawallet}
+      rpcpassword: ${DOGECOIN_RPC_PASSWORD:-gigawallet}
+      rpcport: ${DOGECOIN_RPC_PORT:-22555}
+      rpcallowip: 0.0.0.0/0
+    command:
+      - /bin/sh
+      - -c
+      - |
+        exec dogecoind \
+          -uacomment="$$uacomment" \
+          -disablewallet=$$disablewallet \
+          -datadir=$$datadir \
+          -server=1 \
+          -listen=1 \
+          -txindex=1 \
+          -rpcuser="$$rpcuser" \
+          -rpcpassword="$$rpcpassword" \
+          -rpcport=$$rpcport \
+          -rpcbind=0.0.0.0 \
+          -rpcallowip=0.0.0.0/0 \
+          -zmqpubrawblock=$$zmqpubrawblock \
+          -zmqpubhashblock=$$zmqpubhashblock \
+          -zmqpubhashtx=$$zmqpubhashtx \
+          -zmqpubrawtx=$$zmqpubrawtx \
+          -zmqpubhashtxhwm=$$zmqpubhashtxhwm
+    ports:
+      - '${DOGECOIN_RPC_PORT:-22555}:22555'
+      - '${DOGECOIN_P2P_PORT:-22556}:22556'
+      - '${DOGECOIN_ZMQ_PORT:-28332}:28332'
+    volumes:
+      - dogecoin_local:/data
+    healthcheck:
+      test:
+        [
+          'CMD-SHELL',
+          'dogecoin-cli -rpcuser="$$rpcuser" -rpcpassword="$$rpcpassword" getblockchaininfo >/dev/null 2>&1',
+        ]
+      interval: 10s
+      timeout: 5s
+      retries: 30
+      start_period: 20s
+
   onlydoge:
     build:
       context: .
       target: development
+    restart: unless-stopped
     command:
       - /bin/sh
       - -lc
-      - bun install --frozen-lockfile && bun run --watch apps/onlydoge/src/index.ts --mode=both --ip=0.0.0.0 --port=2277
+      - bun install --frozen-lockfile && npm install --omit=dev --prefix scripts/zmq-rawtx-bridge && bun run --watch apps/onlydoge/src/index.ts --mode=both --ip=0.0.0.0 --port=2277
     depends_on:
+      dogecoin:
+        condition: service_healthy
       postgres:
         condition: service_healthy
       minio-create-bucket:
@@ -98,10 +149,10 @@ services:
       ONLYDOGE_INDEXER_DOGECOIN_TRANSFER_MAX_EDGES: ${ONLYDOGE_INDEXER_DOGECOIN_TRANSFER_MAX_EDGES:-1024}
       ONLYDOGE_INDEXER_SYNC_BACKLOG_HIGH_WATERMARK: ${ONLYDOGE_INDEXER_SYNC_BACKLOG_HIGH_WATERMARK:-2048}
       ONLYDOGE_INDEXER_SYNC_BACKLOG_LOW_WATERMARK: ${ONLYDOGE_INDEXER_SYNC_BACKLOG_LOW_WATERMARK:-512}
-      ONLYDOGE_INDEXER_SYNC_WINDOW: ${ONLYDOGE_INDEXER_SYNC_WINDOW:-32}
+      ONLYDOGE_INDEXER_SYNC_WINDOW: ${ONLYDOGE_INDEXER_SYNC_WINDOW:-128}
       ONLYDOGE_INDEXER_SYNC_WINDOW_MIN: ${ONLYDOGE_INDEXER_SYNC_WINDOW_MIN:-32}
       ONLYDOGE_INDEXER_SYNC_WINDOW_MAX: ${ONLYDOGE_INDEXER_SYNC_WINDOW_MAX:-256}
-      ONLYDOGE_INDEXER_SYNC_CONCURRENCY: ${ONLYDOGE_INDEXER_SYNC_CONCURRENCY:-4}
+      ONLYDOGE_INDEXER_SYNC_CONCURRENCY: ${ONLYDOGE_INDEXER_SYNC_CONCURRENCY:-16}
       ONLYDOGE_INDEXER_SYNC_TARGET_MS: ${ONLYDOGE_INDEXER_SYNC_TARGET_MS:-15000}
       ONLYDOGE_INDEXER_SYNC_TIMEOUT_MS: ${ONLYDOGE_INDEXER_SYNC_TIMEOUT_MS:-120000}
       ONLYDOGE_INDEXER_FACT_WINDOW: ${ONLYDOGE_INDEXER_FACT_WINDOW:-64}
@@ -134,6 +185,10 @@ services:
       ONLYDOGE_WAREHOUSE_PASSWORD: ${CLICKHOUSE_PASSWORD:-onlydoge}
       ONLYDOGE_ANALYTICS_WAREHOUSE_USER: ${CLICKHOUSE_ANALYTICS_USER:-onlydoge_analytics}
       ONLYDOGE_ANALYTICS_WAREHOUSE_PASSWORD: ${CLICKHOUSE_ANALYTICS_PASSWORD:-onlydoge_analytics}
+      ONLYDOGE_DOGECOIN_RPC_ENDPOINT: ${ONLYDOGE_DOGECOIN_RPC_ENDPOINT:-http://gigawallet:gigawallet@dogecoin:22555/}
+      ONLYDOGE_DOGECOIN_RPC_RPS: ${ONLYDOGE_DOGECOIN_RPC_RPS:-200}
+      ONLYDOGE_DOGECOIN_ZMQ_BLOCK_ENDPOINT: ${ONLYDOGE_DOGECOIN_ZMQ_BLOCK_ENDPOINT:-tcp://dogecoin:28332}
+      ONLYDOGE_DOGECOIN_ZMQ_TX_ENDPOINT: ${ONLYDOGE_DOGECOIN_ZMQ_TX_ENDPOINT:-tcp://dogecoin:28332}
     healthcheck:
       test:
         [
@@ -152,10 +207,13 @@ services:
       - .:/app
       - bun_node_modules:/app/node_modules
       - bun_install_cache:/root/.bun/install/cache
+      - zmq_bridge_node_modules:/app/scripts/zmq-rawtx-bridge/node_modules
 
 volumes:
   postgres_local:
   minio_local:
   clickhouse_local:
+  dogecoin_local:
   bun_node_modules:
   bun_install_cache:
+  zmq_bridge_node_modules:

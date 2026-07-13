@@ -1,6 +1,8 @@
 FROM oven/bun:1.3.14-alpine AS base
 WORKDIR /app
 RUN apk upgrade --no-cache
+# Node runs the out-of-process ZMQ rawtx bridge; native zeromq crashes Bun in-process.
+RUN apk add --no-cache nodejs npm
 
 FROM base AS deps
 COPY package.json bun.lock tsconfig.base.json biome.json vitest.config.ts drizzle.config.ts ./
@@ -17,7 +19,10 @@ RUN bun install --frozen-lockfile
 RUN find node_modules -name bun.lock -delete
 
 FROM deps AS development
+# Keep native-build tooling: local compose bind-mounts the bridge and npm-installs into a volume at start.
+RUN apk add --no-cache python3 make g++ cmake linux-headers
 COPY . .
+RUN npm install --omit=dev --prefix scripts/zmq-rawtx-bridge
 EXPOSE 2277
 CMD ["bun", "run", "--watch", "apps/onlydoge/src/index.ts", "--mode=both", "--ip=0.0.0.0", "--port=2277"]
 
@@ -32,6 +37,9 @@ LABEL org.opencontainers.image.title="OnlyDoge"
 LABEL org.opencontainers.image.description="Dogecoin explorer backend and indexer"
 COPY --from=prod-deps /app/node_modules /app/node_modules
 COPY . .
+RUN apk add --no-cache --virtual .zmq-build python3 make g++ cmake linux-headers \
+    && npm install --omit=dev --prefix scripts/zmq-rawtx-bridge \
+    && apk del .zmq-build
 EXPOSE 80
 ENTRYPOINT ["bun", "run", "apps/onlydoge/src/index.ts"]
 CMD ["--mode=both", "--ip=0.0.0.0", "--port=80"]

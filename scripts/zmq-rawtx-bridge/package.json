@@ -1,0 +1,8 @@
+{
+  "name": "onlydoge-zmq-rawtx-bridge",
+  "private": true,
+  "type": "module",
+  "dependencies": {
+    "zeromq": "6.5.0"
+  }
+}
