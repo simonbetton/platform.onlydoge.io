@@ -1,46 +1,40 @@
-import { execFile } from 'node:child_process';
-import { randomUUID } from 'node:crypto';
 import { mkdtemp, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
-import { join, resolve } from 'node:path';
-import { promisify } from 'node:util';
+import { join } from 'node:path';
 
 import { buildApiApp } from '@onlydoge/api';
+import { configKeyDogecoinHistoryReady } from '@onlydoge/indexing-pipeline';
 import { createRuntime } from '@onlydoge/platform';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 
+import type { DockerService } from '../adapters/docker-service';
+import { clickHouseQuery, startClickHouse } from '../adapters/services';
 import { dogecoinFixture } from '../fixtures/dogecoin';
 import { installRpcMock, request, requireString, runIndexerUntilProcessed } from '../helpers';
 
 const runSmoke = process.env.ONLYDOGE_RUN_CLICKHOUSE_SMOKE === '1';
 const describeSmoke = runSmoke ? describe : describe.skip;
-const execFileAsync = promisify(execFile);
-const realFetch = globalThis.fetch.bind(globalThis);
-
 const clickHouseImage =
-  process.env.ONLYDOGE_CLICKHOUSE_SMOKE_IMAGE ?? 'clickhouse/clickhouse-server:latest';
+  process.env.ONLYDOGE_CLICKHOUSE_SMOKE_IMAGE ??
+  'clickhouse/clickhouse-server:26.6.1.1193@sha256:1d1f6508eba2dccce2cee9913907c5f7766327debc57a6b1991f2c9e3176c163';
 const clickHouseUser = 'onlydoge';
 const clickHousePassword = 'onlydoge';
 const clickHouseAnalyticsUser = 'onlydoge_analytics';
 const clickHouseAnalyticsPassword = 'onlydoge_analytics';
 const smokeTimeoutMs = 180_000;
 
-let containerName: string | null = null;
+let clickHouse: DockerService | null = null;
 let clickHousePort = 0;
 
 describeSmoke('clickhouse analytics smoke', () => {
   beforeAll(async () => {
-    const container = await startClickHouseContainer();
-    containerName = container.name;
-    clickHousePort = container.port;
-    await waitForClickHouse(clickHousePort);
+    clickHouse = await startClickHouse(clickHouseImage);
+    clickHousePort = clickHouse.hostPort(8123);
   }, smokeTimeoutMs);
 
   afterAll(async () => {
-    if (containerName) {
-      await docker(['rm', '-f', containerName]);
-      containerName = null;
-    }
+    await clickHouse?.stop();
+    clickHouse = null;
   }, 30_000);
 
   it(
@@ -68,10 +62,10 @@ describeSmoke('clickhouse analytics smoke', () => {
         });
 
         const forbiddenMutation = await clickHouseQuery(
-          clickHousePort,
+          requireClickHouse(),
+          'CREATE TABLE onlydoge.analytics_smoke_forbidden (x UInt8) ENGINE = Memory',
           clickHouseAnalyticsUser,
           clickHouseAnalyticsPassword,
-          'CREATE TABLE onlydoge.analytics_smoke_forbidden (x UInt8) ENGINE = Memory',
         );
         expect(forbiddenMutation.ok).toBe(false);
 
@@ -102,6 +96,9 @@ describeSmoke('clickhouse analytics smoke', () => {
             rowsRead: expect.any(Number),
           }),
         );
+
+        await runIndexerUntilHistoryReady(ctx);
+        await expectExplorerReads(ctx.app, apiToken);
       } finally {
         restoreFetch.mockRestore();
         await ctx.cleanup();
@@ -110,107 +107,6 @@ describeSmoke('clickhouse analytics smoke', () => {
     smokeTimeoutMs,
   );
 });
-
-async function startClickHouseContainer(): Promise<{ name: string; port: number }> {
-  const name = `onlydoge-clickhouse-smoke-${randomUUID()}`;
-  const root = process.cwd();
-
-  try {
-    await docker(
-      [
-        'run',
-        '-d',
-        '--rm',
-        '--name',
-        name,
-        '-p',
-        '127.0.0.1::8123',
-        '-e',
-        'CLICKHOUSE_DB=onlydoge',
-        '-e',
-        `CLICKHOUSE_USER=${clickHouseUser}`,
-        '-e',
-        `CLICKHOUSE_PASSWORD=${clickHousePassword}`,
-        '-e',
-        `CLICKHOUSE_ANALYTICS_PASSWORD=${clickHouseAnalyticsPassword}`,
-        '-e',
-        'CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT=1',
-        '-v',
-        `${resolve(root, 'docker/clickhouse/init/001_schema.sql')}:/docker-entrypoint-initdb.d/001_schema.sql:ro`,
-        '-v',
-        `${resolve(root, 'docker/clickhouse/config.d/onlydoge-memory.xml')}:/etc/clickhouse-server/config.d/onlydoge-memory.xml:ro`,
-        '-v',
-        `${resolve(root, 'docker/clickhouse/users.d/onlydoge-memory.xml')}:/etc/clickhouse-server/users.d/onlydoge-memory.xml:ro`,
-        '-v',
-        `${resolve(root, 'docker/clickhouse/users.d/onlydoge-analytics.xml')}:/etc/clickhouse-server/users.d/onlydoge-analytics.xml:ro`,
-        clickHouseImage,
-      ],
-      smokeTimeoutMs,
-    );
-
-    return {
-      name,
-      port: await inspectClickHousePort(name),
-    };
-  } catch (error) {
-    await docker(['rm', '-f', name]).catch(() => undefined);
-    throw error;
-  }
-}
-
-async function inspectClickHousePort(name: string): Promise<number> {
-  const { stdout } = await docker(['port', name, '8123/tcp']);
-  const rawPort = stdout.trim().split(':').at(-1) ?? '';
-  const port = Number(rawPort);
-  if (!Number.isInteger(port) || port <= 0) {
-    throw new Error(`invalid ClickHouse smoke port: ${stdout}`);
-  }
-
-  return port;
-}
-
-async function waitForClickHouse(port: number): Promise<void> {
-  const deadline = Date.now() + 120_000;
-  let lastError = 'ClickHouse did not respond';
-
-  while (Date.now() < deadline) {
-    try {
-      const response = await clickHouseQuery(
-        port,
-        clickHouseUser,
-        clickHousePassword,
-        'EXISTS TABLE onlydoge.analytics_transactions_v1',
-      );
-      const body = await response.text();
-      if (response.ok && body.trim() === '1') {
-        return;
-      }
-      lastError = `status=${response.status} body=${body}`;
-    } catch (error) {
-      lastError = error instanceof Error ? error.message : String(error);
-    }
-
-    await delay(1_000);
-  }
-
-  throw new Error(`ClickHouse smoke container was not ready: ${lastError}`);
-}
-
-async function clickHouseQuery(
-  port: number,
-  user: string,
-  password: string,
-  query: string,
-): Promise<Response> {
-  const url = new URL(`http://127.0.0.1:${port}/`);
-  url.searchParams.set('query', query);
-  return realFetch(url, {
-    headers: {
-      'X-ClickHouse-Key': password,
-      'X-ClickHouse-User': user,
-    },
-  });
-}
 
 async function createClickHouseTestApp(port: number) {
   const tempRoot = await mkdtemp(join(tmpdir(), 'onlydoge-clickhouse-smoke-'));
@@ -255,6 +151,70 @@ async function createClickHouseTestApp(port: number) {
   };
 }
 
+async function runIndexerUntilHistoryReady(
+  ctx: Awaited<ReturnType<typeof createClickHouseTestApp>>,
+): Promise<void> {
+  for (let attempt = 0; attempt < 4; attempt += 1) {
+    await ctx.runtime.indexingPipeline.runOnce();
+    if (
+      (await ctx.runtime.metadata.getJsonValue<boolean>(configKeyDogecoinHistoryReady())) === true
+    ) {
+      return;
+    }
+  }
+  throw new Error('ClickHouse history did not become ready');
+}
+
+async function expectExplorerReads(
+  app: ReturnType<typeof buildApiApp>,
+  apiToken: string,
+): Promise<void> {
+  const headers = { 'x-api-token': apiToken };
+  const blocksResponse = await request(app, '/v1/explorer/blocks?limit=1', { headers });
+  const blocks = await readJsonObject(blocksResponse);
+  expect(blocksResponse.status).toBe(200);
+  expect(blocks.blocks).toEqual([
+    expect.objectContaining({
+      hash: dogecoinFixture.blocksByHeight[2].hash,
+      height: 2,
+    }),
+  ]);
+
+  const blockResponse = await request(app, '/v1/explorer/blocks/2', { headers });
+  expect(blockResponse.status).toBe(200);
+  expect(await readJsonObject(blockResponse)).toMatchObject({
+    block: { height: 2 },
+    transactions: [expect.objectContaining({ txid: 'doge-tx-2' })],
+  });
+
+  const transactionResponse = await request(app, '/v1/explorer/transactions/doge-tx-2', {
+    headers,
+  });
+  expect(transactionResponse.status).toBe(200);
+  expect(await readJsonObject(transactionResponse)).toMatchObject({
+    transaction: { txid: 'doge-tx-2' },
+  });
+
+  const addressResponse = await request(
+    app,
+    `/v1/explorer/addresses/${dogecoinFixture.targetAddress}`,
+    { headers },
+  );
+  expect(addressResponse.status).toBe(200);
+  expect(await readJsonObject(addressResponse)).toMatchObject({
+    address: {
+      balance: '2500000000',
+    },
+  });
+}
+
+function requireClickHouse(): DockerService {
+  if (!clickHouse) {
+    throw new Error('ClickHouse adapter was not initialized');
+  }
+  return clickHouse;
+}
+
 function highestFeeSql(): string {
   return `
     SELECT txid, fee_base_i256 AS fee_base
@@ -284,14 +244,4 @@ async function readJsonObject(response: Response): Promise<Record<string, unknow
   }
 
   return payload as Record<string, unknown>;
-}
-
-async function docker(args: string[], timeout = 30_000) {
-  return execFileAsync('docker', args, {
-    timeout,
-  });
-}
-
-function delay(ms: number): Promise<void> {
-  return new Promise((resolveDelay) => setTimeout(resolveDelay, ms));
 }

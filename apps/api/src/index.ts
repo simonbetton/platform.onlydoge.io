@@ -1,4 +1,3 @@
-import { randomUUID } from 'node:crypto';
 import { openapi } from '@elysiajs/openapi';
 import {
   type AuthenticatedApiKey,
@@ -12,6 +11,7 @@ import {
 import { buildAnalyticsQueryHttp } from '@onlydoge/analytics-query';
 import { buildExplorerQueryHttp } from '@onlydoge/explorer-query';
 import type { Runtime } from '@onlydoge/platform';
+import { createLogger, type OnlyDogeLogger, resolveRequestId } from '@onlydoge/platform';
 import {
   InfrastructureError,
   maskRpcEndpointAuth,
@@ -37,6 +37,7 @@ const auditOperationByMethod: Record<string, string> = {
 
 export function buildApiApp(runtime: Runtime) {
   const requestAuth = new WeakMap<Request, AuthenticatedApiKey>();
+  const requestContexts = new WeakMap<Request, { logger: OnlyDogeLogger; requestId: string }>();
   const auditedRequests = new WeakSet<Request>();
   const resolveAuthenticatedApiKey = (request: Request): AuthenticatedApiKey => {
     const actor = requestAuth.get(request);
@@ -59,15 +60,17 @@ export function buildApiApp(runtime: Runtime) {
     }
 
     auditedRequests.add(request);
-    await recordAuditEvent(runtime, actor, request, statusCode, outcome, error);
+    await recordAuditEvent(runtime, actor, request, statusCode, outcome, error, requestContexts);
   };
 
   return new Elysia()
     .get('/up', () => handleUp(runtime))
-    .onBeforeHandle((context) => handleBeforeHandle(context, runtime, requestAuth, recordAudit))
+    .onBeforeHandle((context) =>
+      handleBeforeHandle(context, runtime, requestAuth, requestContexts, recordAudit),
+    )
     .onAfterHandle((context) => handleAfterHandle(context, recordAudit))
     .onError(async (context) => {
-      const response = handleApiError(context);
+      const response = handleApiError(context, requestContexts);
       await recordAudit(
         context.request,
         responseStatus(response, context.set.status),
@@ -106,7 +109,13 @@ export function buildApiApp(runtime: Runtime) {
       },
     )
     .use(buildAnalyticsQueryHttp(runtime.analyticsQuery, resolveAuthenticatedApiKey))
-    .use(buildExplorerQueryHttp(runtime.explorerQuery, resolveAuthenticatedApiKey))
+    .use(
+      buildExplorerQueryHttp(
+        runtime.explorerQuery,
+        resolveAuthenticatedApiKey,
+        runtime.mempoolWatch,
+      ),
+    )
     .use(
       openapi({
         path: '/openapi',
@@ -212,8 +221,16 @@ async function handleBeforeHandle(
   { request, set }: { request: Request; set: { headers: Record<string, string | number> } },
   runtime: Runtime,
   requestAuth: WeakMap<Request, AuthenticatedApiKey>,
+  requestContexts: WeakMap<Request, { logger: OnlyDogeLogger; requestId: string }>,
   recordAudit: AuditRecorder,
 ): Promise<unknown> {
+  const requestId = resolveRequestId(request.headers.get('x-request-id'));
+  set.headers['x-request-id'] = requestId;
+  requestContexts.set(request, {
+    requestId,
+    logger: createLogger({ service: 'api', component: 'http', requestId }),
+  });
+
   const auth = await enforceApiTokenAuth(
     runtime.accessControl,
     request.method,
@@ -316,13 +333,27 @@ async function handleAfterHandle(
   return applyCachePolicy(requestPath, response, status, policy, set);
 }
 
-function handleApiError(context: ErrorContext): { error: string } {
+function handleApiError(
+  context: ErrorContext,
+  requestContexts: WeakMap<Request, { logger: OnlyDogeLogger; requestId: string }>,
+): { error: string } {
   context.set.headers['cache-control'] = 'no-store';
+  const requestContext = requestContexts.get(context.request);
+  if (requestContext) {
+    context.set.headers['x-request-id'] = requestContext.requestId;
+  }
   const route = errorRoute(context);
-  return knownApiError(context, route) ?? handleUnhandledError(context, route);
+  return (
+    knownApiError(context, route, requestContexts) ??
+    handleUnhandledError(context, route, requestContexts)
+  );
 }
 
-type KnownErrorHandler = (context: ErrorContext, route: string) => { error: string } | null;
+type KnownErrorHandler = (
+  context: ErrorContext,
+  route: string,
+  requestContexts: WeakMap<Request, { logger: OnlyDogeLogger; requestId: string }>,
+) => { error: string } | null;
 
 const knownErrorHandlers: KnownErrorHandler[] = [
   handleInfrastructureError,
@@ -343,29 +374,52 @@ function errorRoute(context: ErrorContext): string {
   return `${context.request.method} ${requestPathname(context.path, context.request)}`;
 }
 
-function knownApiError(context: ErrorContext, route: string): { error: string } | null {
-  return knownErrorHandlers.map((handler) => handler(context, route)).find(isKnownError) ?? null;
+function knownApiError(
+  context: ErrorContext,
+  route: string,
+  requestContexts: WeakMap<Request, { logger: OnlyDogeLogger; requestId: string }>,
+): { error: string } | null {
+  return (
+    knownErrorHandlers
+      .map((handler) => handler(context, route, requestContexts))
+      .find(isKnownError) ?? null
+  );
 }
 
 function isKnownError(result: { error: string } | null): result is { error: string } {
   return result !== null;
 }
 
+function requestLogger(
+  request: Request,
+  requestContexts: WeakMap<Request, { logger: OnlyDogeLogger; requestId: string }>,
+): OnlyDogeLogger {
+  return (
+    requestContexts.get(request)?.logger ??
+    createLogger({ service: 'api', component: 'http', requestId: resolveRequestId(null) })
+  );
+}
+
 function handleInfrastructureError(
-  { code, error, set }: ErrorContext,
+  { code, error, request, set }: ErrorContext,
   route: string,
+  requestContexts: WeakMap<Request, { logger: OnlyDogeLogger; requestId: string }>,
 ): { error: string } | null {
   if (!(error instanceof InfrastructureError)) {
     return null;
   }
 
   const message = maskRpcEndpointAuthInErrorMessage(error.message);
-  console.error('[onlydoge] infrastructure error', {
-    route,
-    code,
-    message,
-    ...errorCauseLog(error.cause),
-  });
+  requestLogger(request, requestContexts).error(
+    {
+      route,
+      code,
+      message,
+      ...errorCauseLog(error.cause),
+      err: error,
+    },
+    'infrastructure error',
+  );
   set.status = error.statusCode;
   return { error: message };
 }
@@ -378,7 +432,11 @@ function errorCauseLog(cause: unknown): { cause?: string } {
   return { cause: describeErrorCause(cause) };
 }
 
-function handleOnlyDogeError({ error, set }: ErrorContext): { error: string } | null {
+function handleOnlyDogeError(
+  { error, set }: ErrorContext,
+  _route: string,
+  _requestContexts: WeakMap<Request, { logger: OnlyDogeLogger; requestId: string }>,
+): { error: string } | null {
   if (!(error instanceof OnlyDogeError)) {
     return null;
   }
@@ -387,7 +445,11 @@ function handleOnlyDogeError({ error, set }: ErrorContext): { error: string } | 
   return { error: error.message };
 }
 
-function handleValidationError({ code, error, set }: ErrorContext): { error: string } | null {
+function handleValidationError(
+  { code, error, set }: ErrorContext,
+  _route: string,
+  _requestContexts: WeakMap<Request, { logger: OnlyDogeLogger; requestId: string }>,
+): { error: string } | null {
   if (code !== 'VALIDATION') {
     return null;
   }
@@ -396,21 +458,26 @@ function handleValidationError({ code, error, set }: ErrorContext): { error: str
   return { error: describeValidationError(error) };
 }
 
-function handleNotFoundError({ code, set }: ErrorContext, route: string): { error: string } | null {
+function handleNotFoundError(
+  { code, request, set }: ErrorContext,
+  route: string,
+  requestContexts: WeakMap<Request, { logger: OnlyDogeLogger; requestId: string }>,
+): { error: string } | null {
   if (code !== 'NOT_FOUND') {
     return null;
   }
 
-  console.error(`[onlydoge] not found route=${route}`);
+  requestLogger(request, requestContexts).warn({ route }, 'not found');
   set.status = 404;
   return { error: 'not found' };
 }
 
 function handleUnhandledError(
-  { code, error, set }: ErrorContext,
+  { code, error, request, set }: ErrorContext,
   route: string,
+  requestContexts: WeakMap<Request, { logger: OnlyDogeLogger; requestId: string }>,
 ): { error: string } {
-  console.error(`[onlydoge] unhandled error route=${route} code=${code}`, error);
+  requestLogger(request, requestContexts).error({ route, code, err: error }, 'unhandled error');
   set.status = 500;
   return { error: 'rekt' };
 }
@@ -437,6 +504,7 @@ function auditEventInput(
   statusCode: number,
   outcome: CreateAuditEventInput['outcome'],
   error: string | null,
+  requestContexts: WeakMap<Request, { logger: OnlyDogeLogger; requestId: string }>,
 ): CreateAuditEventInput {
   const url = new URL(request.url);
   const descriptor = auditDescriptor(request.method, url.pathname, actor);
@@ -455,20 +523,20 @@ function auditEventInput(
     statusCode,
     outcome,
     error,
-    requestId: requestId(request),
+    requestId: requestContextId(request, requestContexts),
     ip: clientIp(request),
     userAgent: request.headers.get('user-agent'),
     createdAt: new Date().toISOString(),
   };
 }
 
-function requestId(request: Request): string {
-  const header = request.headers.get('x-request-id')?.trim();
-  if (header) {
-    return header;
-  }
-
-  return randomUUID();
+function requestContextId(
+  request: Request,
+  requestContexts: WeakMap<Request, { logger: OnlyDogeLogger; requestId: string }>,
+): string {
+  return (
+    requestContexts.get(request)?.requestId ?? resolveRequestId(request.headers.get('x-request-id'))
+  );
 }
 
 async function recordAuditEvent(
@@ -478,13 +546,14 @@ async function recordAuditEvent(
   statusCode: number,
   outcome: CreateAuditEventInput['outcome'],
   error: string | null,
+  requestContexts: WeakMap<Request, { logger: OnlyDogeLogger; requestId: string }>,
 ): Promise<void> {
   try {
     await runtime.metadata.createAuditEvent(
-      auditEventInput(actor, request, statusCode, outcome, error),
+      auditEventInput(actor, request, statusCode, outcome, error, requestContexts),
     );
   } catch (auditError) {
-    console.error('[onlydoge] audit event write failed', auditError);
+    requestLogger(request, requestContexts).error({ err: auditError }, 'audit event write failed');
   }
 }
 

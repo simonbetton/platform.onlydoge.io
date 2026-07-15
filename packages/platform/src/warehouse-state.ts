@@ -23,6 +23,15 @@ export interface WarehouseState {
   addressMovements: AddressMovement[];
   balances: BalanceRow[];
   transactionFacts: AnalyticsTransactionFact[];
+  transactionRefs: Array<{
+    blockHash: string;
+    blockHeight: number;
+    blockTime: number;
+    source: 'raw_sync' | 'core_process';
+    txIndex: number;
+    txid: string;
+    version: number;
+  }>;
   utxoOutputs: ProjectionUtxoOutput[];
 }
 
@@ -65,6 +74,7 @@ export const emptyWarehouseState = (): WarehouseState => ({
   utxoOutputs: [],
   addressMovements: [],
   transactionFacts: [],
+  transactionRefs: [],
   balances: [],
 });
 
@@ -79,6 +89,7 @@ export function mergeWarehouseState(
     utxoOutputs: rowsOrEmpty(source.utxoOutputs),
     addressMovements: rowsOrEmpty(source.addressMovements),
     transactionFacts: rowsOrEmpty(source.transactionFacts),
+    transactionRefs: rowsOrEmpty(source.transactionRefs),
     balances: rowsOrEmpty(source.balances),
   };
 }

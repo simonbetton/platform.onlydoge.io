@@ -1,4 +1,5 @@
 import { fromDecimalUnits } from '@onlydoge/indexing-pipeline';
+import { noopServiceLogger, type ServiceLogger } from '@onlydoge/shared-kernel';
 
 import type { DogecoinSettings } from './settings';
 import type { MempoolSampleRow, MempoolSampleWarehousePort } from './warehouse';
@@ -24,12 +25,17 @@ export interface MempoolRpcPort {
 }
 
 export class DogecoinMempoolSamplerService {
+  private readonly logger: ServiceLogger;
+
   public constructor(
     private readonly configs: MempoolDogecoinConfigPort,
     private readonly rpc: MempoolRpcPort,
     private readonly warehouse: MempoolSampleWarehousePort,
     private readonly settings: Pick<DogecoinSettings, 'mempoolSampleIntervalMs'>,
-  ) {}
+    logger: ServiceLogger = noopServiceLogger(),
+  ) {
+    this.logger = logger;
+  }
 
   public async runOnce(): Promise<boolean> {
     const dogecoin = await this.configs.getDogecoinConfig();
@@ -49,7 +55,13 @@ export class DogecoinMempoolSamplerService {
     try {
       await this.runOnce();
     } catch (error) {
-      console.error(`[onlydoge] mempool sampler failed error=${formatError(error)}`);
+      this.logger.error(
+        {
+          component: 'mempool-sampler',
+          err: error instanceof Error ? error : new Error(formatError(error)),
+        },
+        'mempool sampler failed',
+      );
     }
   }
 }

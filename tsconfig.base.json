@@ -26,11 +26,5 @@
       "@onlydoge/indexing-pipeline": ["./packages/modules/indexing-pipeline/src/index.ts"]
     }
   },
-  "include": [
-    "apps/**/*.ts",
-    "packages/**/*.ts",
-    "scripts/deploy-*.ts",
-    "tests/**/*.ts",
-    "drizzle.config.ts"
-  ]
+  "include": ["apps/**/*.ts", "packages/**/*.ts", "scripts/deploy-*.ts", "tests/**/*.ts"]
 }

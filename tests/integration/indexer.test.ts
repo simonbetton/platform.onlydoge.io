@@ -6,14 +6,17 @@ import {
   CoreDogecoinIndexerService,
   type CoreDogecoinIndexerSettings,
   type CoreIndexerState,
+  configKeyCoreApplyRecovery,
   configKeyDogecoinAnalyticsFactsReady,
   configKeyDogecoinAnalyticsFactsTail,
   configKeyDogecoinCurrentStateReady,
   configKeyDogecoinHistoryReady,
+  configKeyDogecoinTransactionRefsReady,
   configKeyIndexerFactTail,
   configKeyIndexerProcessTail,
   configKeyIndexerStage,
   configKeyIndexerSyncTail,
+  createCoreApplyRecoveryMarker,
   type RawBlockStoragePort,
 } from '@onlydoge/indexing-pipeline';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
@@ -34,6 +37,7 @@ describe('core dogecoin indexer integration', () => {
   });
 
   afterEach(() => {
+    vi.useRealTimers();
     restoreFetch.mockRestore();
   });
 
@@ -98,6 +102,82 @@ describe('core dogecoin indexer integration', () => {
     ).resolves.toBe(2);
 
     await ctx.cleanup();
+  });
+
+  it('renews leadership during a long window and keeps a second instance passive', async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date('2026-07-15T00:00:00.000Z'));
+    const values = new Map<string, unknown>();
+    const windowStarted = deferred<void>();
+    const finishWindow = deferred<void>();
+    const successfulLeaseWrites: unknown[] = [];
+    const coordinator = memoryCoordinator(values, {
+      onSuccessfulCompareAndSwap(key, nextValue) {
+        if (key === 'primary') {
+          successfulLeaseWrites.push(nextValue);
+        }
+      },
+    });
+    const primary = deferredProcessingService(coordinator, windowStarted, finishWindow);
+    const competitor = deferredProcessingService(memoryCoordinator(values));
+
+    const primaryRun = primary.runOnce();
+    await windowStarted.promise;
+    expect(successfulLeaseWrites).toHaveLength(1);
+
+    await vi.advanceTimersByTimeAsync(16_000);
+
+    await expect(competitor.runOnce()).resolves.toBe(false);
+    expect(successfulLeaseWrites).toHaveLength(4);
+
+    finishWindow.resolve();
+    await expect(primaryRun).resolves.toBe(true);
+    expect(vi.getTimerCount()).toBe(0);
+  });
+
+  it('stops renewing and publishing after losing leadership during a long window', async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date('2026-07-15T00:00:00.000Z'));
+    const values = new Map<string, unknown>();
+    const windowStarted = deferred<void>();
+    const finishWindow = deferred<void>();
+    const publishedKeys: string[] = [];
+    const primary = deferredProcessingService(
+      memoryCoordinator(values, {
+        onSet(key) {
+          publishedKeys.push(key);
+        },
+      }),
+      windowStarted,
+      finishWindow,
+    );
+    const competitorFinish = deferred<void>();
+    competitorFinish.resolve();
+    const competitor = deferredProcessingService(
+      memoryCoordinator(values),
+      deferred<void>(),
+      competitorFinish,
+    );
+
+    const primaryRun = primary.runOnce();
+    await windowStarted.promise;
+    const writesBeforeLoss = publishedKeys.length;
+    values.set('primary', {
+      heartbeatAt: new Date(Date.now() - 20_000).toISOString(),
+      instanceId: 'competing-instance',
+    });
+
+    await vi.advanceTimersByTimeAsync(5_000);
+    await expect(competitor.runOnce()).resolves.toBe(true);
+
+    finishWindow.resolve();
+    await expect(primaryRun).resolves.toBe(false);
+    expect(publishedKeys).toHaveLength(writesBeforeLoss);
+    expect(vi.getTimerCount()).toBe(0);
+
+    const leaseAfterTakeover = values.get('primary');
+    await vi.advanceTimersByTimeAsync(20_000);
+    expect(values.get('primary')).toBe(leaseAfterTakeover);
   });
 
   it('does not start core processing until raw sync reaches the tip window', async () => {
@@ -173,6 +253,8 @@ describe('core dogecoin indexer integration', () => {
           return new Map();
         },
         materializeCoreDogecoinCurrentState: materialize,
+        async recoverCoreDogecoinWindow() {},
+        async upsertTransactionRefs() {},
         async setCoreIndexerError(error: string | null) {
           errors.push(error ?? '');
         },
@@ -265,6 +347,8 @@ describe('core dogecoin indexer integration', () => {
           return new Map();
         },
         async materializeCoreDogecoinCurrentState() {},
+        async recoverCoreDogecoinWindow() {},
+        async upsertTransactionRefs() {},
         async setCoreIndexerError(error: string | null) {
           errors.push(error ?? '');
         },
@@ -357,6 +441,8 @@ describe('core dogecoin indexer integration', () => {
           return new Map();
         },
         async materializeCoreDogecoinCurrentState() {},
+        async recoverCoreDogecoinWindow() {},
+        async upsertTransactionRefs() {},
         async setCoreIndexerError(error: string | null) {
           errors.push(error ?? '');
         },
@@ -393,8 +479,196 @@ describe('core dogecoin indexer integration', () => {
     });
   });
 
-  it('fails fast when a core block step exceeds the deadline', async () => {
+  it.each([
+    ['an absent transaction list', undefined, 'expected non-empty array'],
+    ['a non-array transaction list', 'doge-txid-only', 'expected non-empty array'],
+    [
+      'one invalid transaction among valid transactions',
+      [
+        testDogecoinTransaction('first'),
+        'sensitive malformed payload',
+        testDogecoinTransaction('last'),
+      ],
+      'tx_index=1',
+    ],
+    ['an entirely invalid transaction list', [null, 'invalid'], 'tx_index=0'],
+    ['an empty transaction list', [], 'expected non-empty array'],
+  ])('rejects %s without applying warehouse state', async (_case, transactions, expectedError) => {
+    const snapshot = testDogecoinBlockSnapshot(0);
+    const block = snapshot.block as Record<string, unknown>;
+    block.tx = transactions;
+    const { appliedWindows, errors, service } = storedSnapshotProcessingService(snapshot);
+
+    await expect(service.runOnce()).rejects.toThrow(expectedError);
+
+    expect(appliedWindows).toEqual([]);
+    expect(errors.at(-1)).toContain('height=0');
+    expect(errors.at(-1)).toContain(expectedError);
+    expect(errors.at(-1)).not.toContain('sensitive malformed payload');
+  });
+
+  it('preserves transaction order and count for a valid block', async () => {
+    const snapshot = testDogecoinBlockSnapshot(0);
+    const block = snapshot.block as Record<string, unknown>;
+    block.tx = [testDogecoinTransaction('first'), testDogecoinTransaction('second')];
+    const { appliedWindows, errors, service } = storedSnapshotProcessingService(snapshot);
+
+    await expect(service.runOnce()).resolves.toBe(true);
+
+    expect(errors).toEqual([]);
+    expect(appliedWindows).toMatchObject([
+      [
+        {
+          txCount: 2,
+          utxoCreates: [
+            { txid: 'first', txIndex: 0 },
+            { txid: 'second', txIndex: 1 },
+          ],
+        },
+      ],
+    ]);
+  });
+
+  it('recovers a persisted core apply marker before processing new windows', async () => {
+    const values = new Map<string, unknown>([[configKeyDogecoinTransactionRefsReady(), true]]);
+    const recoverCalls: number[] = [];
+    const marker = createCoreApplyRecoveryMarker({
+      instanceId: 'stale-instance',
+      startHeight: 3,
+      endHeight: 4,
+      blockHashes: ['hash-3', 'hash-4'],
+      updateCurrentState: true,
+    });
+    values.set(configKeyCoreApplyRecovery(), marker);
+
+    const service = new CoreDogecoinIndexerService(
+      memoryCoordinator(values),
+      dogecoinConfigReader(),
+      memoryRawBlockStorage(
+        new Map([
+          [0, testDogecoinBlockSnapshot(0)],
+          [1, testDogecoinBlockSnapshot(1)],
+        ]),
+      ),
+      dogecoinTipReader(1),
+      {
+        async applyCoreDogecoinBlock() {
+          throw new Error('unexpected single-block apply');
+        },
+        async applyCoreDogecoinWindow() {
+          throw new Error('apply should not run before recovery completes');
+        },
+        async getCoreIndexerState() {
+          return {
+            lastError: null,
+            onlineTip: 1,
+            processTail: 1,
+            stage: 'online',
+            syncTail: 1,
+            updatedAt: new Date().toISOString(),
+          };
+        },
+        async getCoreUtxoOutputs() {
+          return new Map();
+        },
+        async materializeCoreDogecoinCurrentState() {},
+        async recoverCoreDogecoinWindow(fromHeight) {
+          recoverCalls.push(fromHeight);
+        },
+        async upsertTransactionRefs() {},
+        async setCoreIndexerError() {},
+        async setCoreIndexerStage() {},
+        async upsertCoreBlock() {},
+        async upsertCoreIndexerState(input) {
+          return {
+            lastError: input.lastError ?? null,
+            onlineTip: input.onlineTip ?? 1,
+            processTail: input.processTail ?? -1,
+            stage: input.stage ?? 'process_backfill',
+            syncTail: input.syncTail ?? 1,
+            updatedAt: new Date().toISOString(),
+          };
+        },
+      },
+      testIndexerSettings(),
+    );
+
+    await expect(service.runOnce()).resolves.toBe(false);
+    expect(recoverCalls).toEqual([3]);
+    expect(values.has(configKeyCoreApplyRecovery())).toBe(false);
+  });
+
+  it('records marker set, apply, marker clear, and progress publish ordering', async () => {
     const values = new Map<string, unknown>();
+    const events: string[] = [];
+    let state: CoreIndexerState = {
+      lastError: null,
+      onlineTip: 0,
+      processTail: -1,
+      stage: 'process_backfill',
+      syncTail: 0,
+      updatedAt: new Date().toISOString(),
+    };
+
+    const service = new CoreDogecoinIndexerService(
+      memoryCoordinator(values, {
+        onSet(key, _value) {
+          if (key === configKeyCoreApplyRecovery()) {
+            events.push('marker-set');
+          }
+          if (key === configKeyIndexerProcessTail()) {
+            events.push('progress-publish');
+          }
+        },
+      }),
+      dogecoinConfigReader(),
+      memoryRawBlockStorage(new Map([[0, testDogecoinBlockSnapshot(0)]])),
+      dogecoinTipReader(0),
+      {
+        async applyCoreDogecoinBlock() {
+          throw new Error('unexpected single-block apply');
+        },
+        async applyCoreDogecoinWindow() {
+          events.push('apply');
+          return { applied: true, processTail: 0 };
+        },
+        async getCoreIndexerState() {
+          return state;
+        },
+        async getCoreUtxoOutputs() {
+          return new Map();
+        },
+        async materializeCoreDogecoinCurrentState() {},
+        async recoverCoreDogecoinWindow() {},
+        async upsertTransactionRefs() {},
+        async setCoreIndexerError() {},
+        async setCoreIndexerStage() {},
+        async upsertCoreBlock() {},
+        async upsertCoreIndexerState(input) {
+          state = {
+            ...state,
+            ...input,
+            lastError: input.lastError === undefined ? state.lastError : input.lastError,
+            updatedAt: new Date().toISOString(),
+          };
+          return state;
+        },
+      },
+      testIndexerSettings(),
+    );
+
+    await expect(service.runOnce()).resolves.toBe(true);
+    const markerIndex = events.indexOf('marker-set');
+    const applyIndex = events.indexOf('apply');
+    const progressIndex = events.lastIndexOf('progress-publish');
+    expect(markerIndex).toBeGreaterThanOrEqual(0);
+    expect(applyIndex).toBeGreaterThan(markerIndex);
+    expect(progressIndex).toBeGreaterThan(applyIndex);
+    expect(values.has(configKeyCoreApplyRecovery())).toBe(false);
+  });
+
+  it('fails fast when a core block step exceeds the deadline', async () => {
+    const values = new Map<string, unknown>([[configKeyDogecoinTransactionRefsReady(), true]]);
     const errors: string[] = [];
     const service = new CoreDogecoinIndexerService(
       memoryCoordinator(values),
@@ -434,6 +708,8 @@ describe('core dogecoin indexer integration', () => {
           return new Map();
         },
         async materializeCoreDogecoinCurrentState() {},
+        async recoverCoreDogecoinWindow() {},
+        async upsertTransactionRefs() {},
         async setCoreIndexerError(error: string | null) {
           errors.push(error ?? '');
         },
@@ -467,7 +743,7 @@ describe('core dogecoin indexer integration', () => {
   });
 
   it('persists async core processing errors before surfacing them', async () => {
-    const values = new Map<string, unknown>();
+    const values = new Map<string, unknown>([[configKeyDogecoinTransactionRefsReady(), true]]);
     const errors: string[] = [];
     const service = new CoreDogecoinIndexerService(
       memoryCoordinator(values),
@@ -507,6 +783,8 @@ describe('core dogecoin indexer integration', () => {
           return new Map();
         },
         async materializeCoreDogecoinCurrentState() {},
+        async recoverCoreDogecoinWindow() {},
+        async upsertTransactionRefs() {},
         async setCoreIndexerError(error: string | null) {
           errors.push(error ?? '');
         },
@@ -548,19 +826,35 @@ function testIndexerSettings(
     coreRawStorageTimeoutMs: 30_000,
     coreReprocessDepth: 10,
     coreSyncCompleteDistance: 6,
+    leaseHeartbeatIntervalMs: 5_000,
     syncConcurrency: 4,
     syncWindow: 32,
     ...overrides,
   };
 }
 
-function memoryCoordinator(values: Map<string, unknown>) {
+function memoryCoordinator(
+  values: Map<string, unknown>,
+  hooks: {
+    onSet?: (key: string, value: unknown) => void;
+    onSuccessfulCompareAndSwap?: (key: string, nextValue: unknown) => void;
+  } = {},
+) {
   return {
+    async compareAndDeleteJsonValue(key: string, expectedValue: unknown) {
+      const current = values.get(key);
+      if (JSON.stringify(current ?? null) !== JSON.stringify(expectedValue)) {
+        return false;
+      }
+      values.delete(key);
+      return true;
+    },
     async compareAndSwapJsonValue(key: string, expectedValue: unknown, nextValue: unknown) {
       if ((values.get(key) ?? null) !== expectedValue) {
         return false;
       }
       values.set(key, nextValue);
+      hooks.onSuccessfulCompareAndSwap?.(key, nextValue);
       return true;
     },
     async deleteByPrefix() {},
@@ -569,8 +863,70 @@ function memoryCoordinator(values: Map<string, unknown>) {
     },
     async setJsonValue(key: string, value: unknown) {
       values.set(key, value);
+      hooks.onSet?.(key, value);
     },
   };
+}
+
+function deferred<T>() {
+  let resolve!: (value: T | PromiseLike<T>) => void;
+  const promise = new Promise<T>((resolvePromise) => {
+    resolve = resolvePromise;
+  });
+  return { promise, resolve };
+}
+
+function deferredProcessingService(
+  coordinator: ReturnType<typeof memoryCoordinator>,
+  windowStarted = deferred<void>(),
+  finishWindow = deferred<void>(),
+) {
+  let state: CoreIndexerState = {
+    lastError: null,
+    onlineTip: 0,
+    processTail: -1,
+    stage: 'process_backfill',
+    syncTail: 0,
+    updatedAt: new Date().toISOString(),
+  };
+  return new CoreDogecoinIndexerService(
+    coordinator,
+    dogecoinConfigReader(),
+    memoryRawBlockStorage(new Map([[0, testDogecoinBlockSnapshot(0)]])),
+    dogecoinTipReader(0),
+    {
+      async applyCoreDogecoinBlock() {
+        throw new Error('window processing should not apply individual blocks');
+      },
+      async applyCoreDogecoinWindow(input) {
+        windowStarted.resolve();
+        await finishWindow.promise;
+        return { applied: true, processTail: input.at(-1)?.blockHeight ?? state.processTail };
+      },
+      async getCoreIndexerState() {
+        return state;
+      },
+      async getCoreUtxoOutputs() {
+        return new Map();
+      },
+      async materializeCoreDogecoinCurrentState() {},
+      async recoverCoreDogecoinWindow() {},
+      async upsertTransactionRefs() {},
+      async setCoreIndexerError() {},
+      async setCoreIndexerStage() {},
+      async upsertCoreBlock() {},
+      async upsertCoreIndexerState(input) {
+        state = {
+          ...state,
+          ...input,
+          lastError: input.lastError === undefined ? state.lastError : input.lastError,
+          updatedAt: new Date().toISOString(),
+        };
+        return state;
+      },
+    },
+    testIndexerSettings(),
+  );
 }
 
 function testDogecoinBlockSnapshot(
@@ -601,6 +957,78 @@ function testDogecoinBlockSnapshot(
       ],
     },
   };
+}
+
+function testDogecoinTransaction(txid: string): Record<string, unknown> {
+  return {
+    txid,
+    vin: [{ coinbase: 'coinbase' }],
+    vout: [
+      {
+        n: 0,
+        value: '10.00000000',
+        scriptPubKey: {
+          addresses: [`DTest${txid.padEnd(29, '0')}`],
+          type: 'pubkeyhash',
+        },
+      },
+    ],
+  };
+}
+
+function storedSnapshotProcessingService(snapshot: Record<string, unknown>) {
+  const values = new Map<string, unknown>([[configKeyDogecoinTransactionRefsReady(), true]]);
+  const appliedWindows: unknown[] = [];
+  const errors: string[] = [];
+  let state: CoreIndexerState = {
+    lastError: null,
+    onlineTip: 0,
+    processTail: -1,
+    stage: 'process_backfill',
+    syncTail: 0,
+    updatedAt: new Date().toISOString(),
+  };
+  const service = new CoreDogecoinIndexerService(
+    memoryCoordinator(values),
+    dogecoinConfigReader(),
+    memoryRawBlockStorage(new Map([[0, snapshot]])),
+    dogecoinTipReader(0),
+    {
+      async applyCoreDogecoinBlock() {
+        throw new Error('window processing should not apply individual blocks');
+      },
+      async applyCoreDogecoinWindow(input) {
+        appliedWindows.push(input);
+        return { applied: true, processTail: input.at(-1)?.blockHeight ?? state.processTail };
+      },
+      async getCoreIndexerState() {
+        return state;
+      },
+      async getCoreUtxoOutputs() {
+        return new Map();
+      },
+      async materializeCoreDogecoinCurrentState() {},
+      async recoverCoreDogecoinWindow() {},
+      async upsertTransactionRefs() {},
+      async setCoreIndexerError(error: string | null) {
+        errors.push(error ?? '');
+      },
+      async setCoreIndexerStage() {},
+      async upsertCoreBlock() {},
+      async upsertCoreIndexerState(input) {
+        state = {
+          ...state,
+          ...input,
+          lastError: input.lastError === undefined ? state.lastError : input.lastError,
+          updatedAt: new Date().toISOString(),
+        };
+        return state;
+      },
+    },
+    testIndexerSettings(),
+  );
+
+  return { appliedWindows, errors, service };
 }
 
 function rangeForTest(start: number, end: number): number[] {

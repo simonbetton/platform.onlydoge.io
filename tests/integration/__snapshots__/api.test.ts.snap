@@ -276,7 +276,7 @@ exports[`api integration > serves heartbeat and openapi 1`] = `
             "name": "offset",
             "required": false,
             "schema": {
-              "description": "Zero-based number of records to skip.",
+              "description": "Zero-based number of records to skip. Maximum 100000.",
               "examples": [
                 "0",
                 "25",
@@ -289,7 +289,7 @@ exports[`api integration > serves heartbeat and openapi 1`] = `
             "name": "limit",
             "required": false,
             "schema": {
-              "description": "Maximum number of records to return.",
+              "description": "Maximum number of records to return. Defaults to 50; maximum 500. Values above the maximum return a validation error.",
               "examples": [
                 "25",
                 "100",
@@ -360,7 +360,7 @@ exports[`api integration > serves heartbeat and openapi 1`] = `
             "name": "offset",
             "required": false,
             "schema": {
-              "description": "Zero-based number of records to skip.",
+              "description": "Zero-based number of records to skip. Maximum 100000.",
               "examples": [
                 "0",
                 "25",
@@ -373,7 +373,7 @@ exports[`api integration > serves heartbeat and openapi 1`] = `
             "name": "limit",
             "required": false,
             "schema": {
-              "description": "Maximum number of records to return.",
+              "description": "Maximum number of records to return. Defaults to 50; maximum 500. Values above the maximum return a validation error.",
               "examples": [
                 "20",
                 "50",
@@ -415,7 +415,7 @@ exports[`api integration > serves heartbeat and openapi 1`] = `
             "name": "offset",
             "required": false,
             "schema": {
-              "description": "Zero-based number of records to skip.",
+              "description": "Zero-based number of records to skip. Maximum 100000.",
               "examples": [
                 "0",
                 "25",
@@ -428,7 +428,7 @@ exports[`api integration > serves heartbeat and openapi 1`] = `
             "name": "limit",
             "required": false,
             "schema": {
-              "description": "Maximum number of records to return.",
+              "description": "Maximum number of records to return. Defaults to 50; maximum 500. Values above the maximum return a validation error.",
               "examples": [
                 "20",
                 "50",
@@ -458,7 +458,7 @@ exports[`api integration > serves heartbeat and openapi 1`] = `
             "name": "offset",
             "required": false,
             "schema": {
-              "description": "Zero-based number of records to skip.",
+              "description": "Zero-based number of records to skip. Maximum 100000.",
               "examples": [
                 "0",
                 "25",
@@ -471,7 +471,7 @@ exports[`api integration > serves heartbeat and openapi 1`] = `
             "name": "limit",
             "required": false,
             "schema": {
-              "description": "Maximum number of records to return.",
+              "description": "Maximum number of records to return. Defaults to 50; maximum 500. Values above the maximum return a validation error.",
               "examples": [
                 "20",
                 "50",
@@ -493,7 +493,7 @@ exports[`api integration > serves heartbeat and openapi 1`] = `
     },
     "/v1/explorer/blocks/{ref}": {
       "get": {
-        "description": "Returns a block summary and transaction summaries by raw-synced height or indexed block hash.",
+        "description": "Returns a block summary and a bounded page of transaction summaries by raw-synced height or indexed block hash. Transaction indexes remain relative to the full block.",
         "operationId": "getV1ExplorerBlocksByRef",
         "parameters": [
           {
@@ -505,6 +505,32 @@ exports[`api integration > serves heartbeat and openapi 1`] = `
               "examples": [
                 "123456",
                 "0000000000000000000000000000000000000000000000000000000000000000",
+              ],
+              "type": "string",
+            },
+          },
+          {
+            "in": "query",
+            "name": "offset",
+            "required": false,
+            "schema": {
+              "description": "Zero-based number of records to skip. Maximum 100000.",
+              "examples": [
+                "0",
+                "25",
+              ],
+              "type": "string",
+            },
+          },
+          {
+            "in": "query",
+            "name": "limit",
+            "required": false,
+            "schema": {
+              "description": "Maximum number of records to return. Defaults to 50; maximum 500. Values above the maximum return a validation error.",
+              "examples": [
+                "20",
+                "50",
               ],
               "type": "string",
             },
@@ -531,7 +557,7 @@ exports[`api integration > serves heartbeat and openapi 1`] = `
             "name": "offset",
             "required": false,
             "schema": {
-              "description": "Zero-based number of records to skip.",
+              "description": "Zero-based number of records to skip. Maximum 100000.",
               "examples": [
                 "0",
                 "25",
@@ -544,7 +570,7 @@ exports[`api integration > serves heartbeat and openapi 1`] = `
             "name": "limit",
             "required": false,
             "schema": {
-              "description": "Maximum number of records to return.",
+              "description": "Maximum number of records to return. Defaults to 50; maximum 500. Values above the maximum return a validation error.",
               "examples": [
                 "20",
                 "50",
@@ -559,6 +585,47 @@ exports[`api integration > serves heartbeat and openapi 1`] = `
           },
         ],
         "summary": "List mempool transactions",
+        "tags": [
+          "Explorer",
+        ],
+      },
+    },
+    "/v1/explorer/mempool/watch": {
+      "get": {
+        "description": "Opens a one-shot SSE session for a single Dogecoin receive address. Emits mempool.watch.appeared on the first matching mempool output (or catch-up hit), otherwise mempool.watch.timeout after five minutes. Up to five concurrent sessions per API key.",
+        "operationId": "getV1ExplorerMempoolWatch",
+        "parameters": [
+          {
+            "in": "query",
+            "name": "address",
+            "required": true,
+            "schema": {
+              "description": "Dogecoin address to watch for receiving outputs in the mempool.",
+              "examples": [
+                "DTestAddress123",
+              ],
+              "type": "string",
+            },
+          },
+          {
+            "in": "query",
+            "name": "minValueBase",
+            "required": false,
+            "schema": {
+              "description": "Optional minimum sum of matching output values in base units (1 DOGE = 100000000).",
+              "examples": [
+                "100000000",
+              ],
+              "type": "string",
+            },
+          },
+        ],
+        "security": [
+          {
+            "ApiTokenAuth": [],
+          },
+        ],
+        "summary": "Watch mempool address",
         "tags": [
           "Explorer",
         ],
@@ -734,7 +801,7 @@ exports[`api integration > serves heartbeat and openapi 1`] = `
             "name": "offset",
             "required": false,
             "schema": {
-              "description": "Zero-based number of records to skip.",
+              "description": "Zero-based number of records to skip. Maximum 100000.",
               "examples": [
                 "0",
                 "25",
@@ -747,7 +814,7 @@ exports[`api integration > serves heartbeat and openapi 1`] = `
             "name": "limit",
             "required": false,
             "schema": {
-              "description": "Maximum number of records to return.",
+              "description": "Maximum number of records to return. Defaults to 50; maximum 500. Values above the maximum return a validation error.",
               "examples": [
                 "25",
                 "100",

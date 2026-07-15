@@ -2,74 +2,94 @@
 
 import { loadSettings, RelationalMetadataStore } from '@onlydoge/platform';
 
-async function main() {
+export interface CoreIndexerHealthState {
+  lastError: string | null;
+  onlineTip: number;
+  processTail: number;
+  stage: string;
+  syncTail: number;
+  updatedAt: string;
+}
+
+export interface CoreIndexerHealthInput {
+  blockHeight: number | null;
+  now: number;
+  onlineTipDistance: number;
+  state: CoreIndexerHealthState | null;
+  watchdogMs: number;
+}
+
+async function main(): Promise<void> {
   const settings = loadSettings({ mode: 'indexer' });
   const metadata = await RelationalMetadataStore.connect(settings.database);
-  const stale = await staleCoreIndexerProgress(metadata, settings.indexer.coreProgressWatchdogMs);
-  assertNoStaleCoreIndexerProgress(stale);
-  console.log('ok');
-}
-
-async function staleCoreIndexerProgress(
-  metadata: RelationalMetadataStore,
-  watchdogMs: number,
-): Promise<string[]> {
-  const now = Date.now();
-  const stale = await staleCoreIndexerDogecoin(metadata, watchdogMs, now);
-  return stale === null ? [] : [stale];
-}
-
-async function staleCoreIndexerDogecoin(
-  metadata: RelationalMetadataStore,
-  watchdogMs: number,
-  now: number,
-): Promise<string | null> {
-  const state = await metadata.getCoreIndexerState();
-  if (!isWatchedCoreIndexerState(state)) {
-    return null;
+  const [state, blockHeight] = await Promise.all([
+    metadata.getCoreIndexerState(),
+    metadata.getJsonValue<number>('block_height'),
+  ]);
+  const unhealthy = evaluateCoreIndexerHealth({
+    blockHeight,
+    now: Date.now(),
+    onlineTipDistance: settings.indexer.coreOnlineTipDistance,
+    state,
+    watchdogMs: settings.indexer.coreProgressWatchdogMs,
+  });
+  if (unhealthy) {
+    throw new Error(`unhealthy core indexer: ${unhealthy}`);
   }
-
-  const ageMs = coreIndexerStateAgeMs(state.updatedAt, now);
-  return staleCoreIndexerDescription('Dogecoin', state, ageMs, watchdogMs);
-}
-
-function isBackfillStage(stage: string): boolean {
-  return backfillStages.has(stage);
+  console.log('ok');
 }
 
 const backfillStages = new Set(['sync_backfill', 'process_backfill']);
 
-function isWatchedCoreIndexerState(
-  state: Awaited<ReturnType<RelationalMetadataStore['getCoreIndexerState']>>,
-): state is NonNullable<typeof state> {
-  return state !== null && isBackfillStage(state.stage);
-}
-
-function staleCoreIndexerDescription(
-  chainName: string,
-  state: NonNullable<Awaited<ReturnType<RelationalMetadataStore['getCoreIndexerState']>>>,
-  ageMs: number,
-  watchdogMs: number,
-): string | null {
-  if (ageMs <= watchdogMs) {
-    return null;
+export function evaluateCoreIndexerHealth(input: CoreIndexerHealthInput): string | null {
+  if (!input.state) {
+    return 'state=missing';
   }
-
-  return `${chainName}: stage=${state.stage} sync_tail=${state.syncTail} process_tail=${state.processTail} age_ms=${ageMs}`;
+  const { state } = input;
+  const ageMs = coreIndexerStateAgeMs(state.updatedAt, input.now);
+  const details = healthDetails(state, input.blockHeight, ageMs);
+  if (state.lastError) {
+    return `${details} last_error=${redactHealthError(state.lastError)}`;
+  }
+  if (backfillStages.has(state.stage)) {
+    return ageMs > input.watchdogMs ? `${details} reason=stale_progress` : null;
+  }
+  if (state.stage !== 'online') {
+    return `${details} reason=invalid_stage`;
+  }
+  if (!Number.isFinite(ageMs)) {
+    return `${details} reason=invalid_updated_at`;
+  }
+  const nodeTip = Math.max(input.blockHeight ?? -1, state.onlineTip);
+  const lag = Math.max(0, nodeTip - state.processTail);
+  return lag > input.onlineTipDistance ? `${details} reason=online_lag` : null;
 }
 
 function coreIndexerStateAgeMs(updatedAtValue: string, now: number): number {
   const updatedAt = Date.parse(updatedAtValue);
-  return Number.isNaN(updatedAt) ? Number.POSITIVE_INFINITY : now - updatedAt;
+  return Number.isNaN(updatedAt) ? Number.POSITIVE_INFINITY : Math.max(0, now - updatedAt);
 }
 
-function assertNoStaleCoreIndexerProgress(stale: string[]): void {
-  if (stale.length > 0) {
-    throw new Error(`stale core indexer progress: ${stale.join('; ')}`);
-  }
+function healthDetails(
+  state: CoreIndexerHealthState,
+  blockHeight: number | null,
+  ageMs: number,
+): string {
+  const nodeTip = Math.max(blockHeight ?? -1, state.onlineTip);
+  const lag = Math.max(0, nodeTip - state.processTail);
+  return `stage=${state.stage} node_tip=${nodeTip} sync_tail=${state.syncTail} process_tail=${state.processTail} lag=${lag} age_ms=${ageMs}`;
 }
 
-void main().catch((error) => {
-  console.error(error instanceof Error ? error.message : String(error));
-  process.exit(1);
-});
+function redactHealthError(error: string): string {
+  return error
+    .replace(/:\/\/[^/@\s]+:[^/@\s]+@/gu, '://***:***@')
+    .replace(/(password|token|secret)=\S+/giu, '$1=***')
+    .slice(0, 500);
+}
+
+if (import.meta.main) {
+  void main().catch((error) => {
+    console.error(error instanceof Error ? error.message : String(error));
+    process.exit(1);
+  });
+}

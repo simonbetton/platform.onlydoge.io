@@ -4,5 +4,7 @@ export * from './application/core-dogecoin-indexer-settings';
 export * from './contracts/ports';
 export * from './domain/amounts';
 export * from './domain/config-keys';
+export * from './domain/core-apply-recovery';
 export * from './domain/dogecoin-block';
 export * from './domain/projection-models';
+export * from './domain/transaction-ref';

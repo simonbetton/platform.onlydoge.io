@@ -36,6 +36,7 @@ packages/
     indexing-pipeline/
 
 tests/
+  adapters/     Docker-backed production adapter integration tests
   e2e/          opt-in production E2E checks with teardown
   integration/
   unit/
@@ -66,7 +67,7 @@ Production should run split `http` and `indexer` containers.
 
 ## Requirements
 
-- Bun 1.3.x
+- Bun 1.3.14
 - Docker and Docker Compose for the bundled local or self-hosted stacks
 - PostgreSQL, ClickHouse, and S3-compatible object storage for production-style stacks
 - Dogecoin RPC endpoint for real indexing work
@@ -82,8 +83,27 @@ bun install
 bun run lint
 bun run typecheck
 bun run test
+bun run test:adapters
 bun run ci
 ```
+
+`test:adapters` is the service-backed CI lane. It starts pinned, isolated ClickHouse, PostgreSQL,
+MySQL, and MinIO containers on collision-safe ports, verifies the production adapters and split
+PostgreSQL watch flow, and removes its containers after the run. The default `test` command remains
+service-free. Set `ONLYDOGE_ADAPTER_LOG_DIR` to retain service logs in a specific directory.
+
+Treat Bun upgrades as one atomic change: update `packageManager` and
+`bun-types` in `package.json`, the `Dockerfile` base image, and every
+`oven-sh/setup-bun` workflow; refresh `bun.lock` with Bun, then run the Bun
+version consistency test, frozen install, full CI gate, and production image
+build.
+
+The out-of-process Node ZMQ bridge has its own npm manifest and lockfile under
+`scripts/zmq-rawtx-bridge`. Update it with the pinned Node toolchain, commit the
+resulting `package-lock.json`, and verify with `npm ci --omit=dev`,
+`npm audit --omit=dev --audit-level=high`, the bridge module smoke check, and
+the production image build. Dependabot maintains this npm subtree separately
+from the Bun workspace.
 
 Run locally with Docker:
 
@@ -100,6 +120,8 @@ bun run docker:local:down
 bun run docker:local:reset
 ```
 
+The local Docker stack includes `dogeorg/dogecoin-node` for Dogecoin Core RPC and ZMQ. First sync can take a long time and needs substantial disk space. On Apple Silicon, Docker runs the amd64 image under emulation. If you previously started a standalone `dogecoin-node` container on the same ports, stop and remove it before bringing this stack up.
+
 Local service endpoints:
 
 - API: `http://localhost:2277`
@@ -109,6 +131,9 @@ Local service endpoints:
 - MinIO Console: `http://localhost:9001`
 - ClickHouse HTTP: `http://localhost:8123`
 - PostgreSQL: `localhost:5432`
+- Dogecoin RPC: `http://localhost:22555`
+- Dogecoin P2P: `localhost:22556`
+- Dogecoin ZMQ: `localhost:28332`
 
 Run host-native app modes:
 
@@ -175,14 +200,14 @@ The default ClickHouse profile is tuned for stability over peak throughput.
 - Default query and insert thread counts are capped to reduce memory spikes.
 - External sort and group-by thresholds spill earlier instead of holding large intermediates in RAM.
 
-The app boots ClickHouse with runtime-safe warehouse migrations. Existing deployments automatically create and backfill the address-oriented read tables on startup before serving explorer traffic.
+The app boots ClickHouse with runtime-safe warehouse migrations. Existing deployments automatically create and backfill the address-oriented read tables on startup before serving explorer traffic. The checked-in `docker/clickhouse/init/001_schema.sql` file is retained for reference and local volume bootstrap, but production schema authority lives in the versioned ClickHouse migration ledger.
 
 ## Local Docker Workflow
 
 The local setup intentionally favors developer feedback over immutability.
 
 - The source tree is bind-mounted into the app container.
-- The app runs with `bun run --watch`.
+- The app runs `bun run apps/onlydoge/src/index.ts` without `bun --watch`; Docker restart policy recovers process exits.
 - Infrastructure is persisted in Docker volumes.
 - A MinIO bootstrap job creates the S3 bucket automatically.
 - ClickHouse is initialized with the Dogecoin warehouse schema, including the address-oriented explorer read models.
@@ -239,6 +264,13 @@ cp .env.production.example .env.production
 bun run docker:prod:up
 ```
 
+Set `ONLYDOGE_DOGECOIN_RPC_ENDPOINT` in `.env.production` to an external Dogecoin
+Core RPC endpoint that is reachable from both application containers; a host
+`127.0.0.1` address points back into each container and will not work.
+`ONLYDOGE_DOGECOIN_ZMQ_BLOCK_ENDPOINT` and `ONLYDOGE_DOGECOIN_ZMQ_TX_ENDPOINT`
+are optional for the indexer, but are recommended for low-latency mempool watch
+notifications. RPC polling remains the fallback when ZMQ is unavailable.
+
 Stop or inspect it:
 
 ```bash
@@ -252,6 +284,13 @@ Managed Docker deployment:
 cp .env.managed.example .env.managed
 bun run deploy:production
 ```
+
+Managed production requires
+`ONLYDOGE_ANALYTICS_WAREHOUSE_USER` and
+`ONLYDOGE_ANALYTICS_WAREHOUSE_PASSWORD` for a dedicated ClickHouse identity.
+Grant that identity read-only query access with safe resource settings; the
+primary read/write warehouse credentials are never used as an analytics
+fallback.
 
 The production deploy command:
 
@@ -337,6 +376,7 @@ Error payload shape:
 Explorer endpoints are networkless and do not accept `network` query parameters.
 - `GET /v1/explorer/search?q=...`
 - `GET /v1/explorer/mempool`
+- `GET /v1/explorer/mempool/watch`
 - `GET /v1/explorer/blocks`
 - `GET /v1/explorer/blocks/:ref`
 - `GET /v1/explorer/transactions/:txid`

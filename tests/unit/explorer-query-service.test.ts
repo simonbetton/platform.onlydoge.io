@@ -15,6 +15,77 @@ import {
 import { describe, expect, it } from 'vitest';
 
 describe('ExplorerQueryService', () => {
+  it('rejects oversized pages for direct service callers', async () => {
+    const service = createService({
+      rawBlocks: new Map(),
+      utxoOutputs: new Map(),
+    });
+
+    await expect(service.listBlocks(100_001, 1)).rejects.toThrow(
+      'invalid parameter for `offset`: 100001',
+    );
+    await expect(service.listMempool(0, 501)).rejects.toThrow('invalid parameter for `limit`: 501');
+    await expect(service.getBlock('1', 0, 501)).rejects.toThrow(
+      'invalid parameter for `limit`: 501',
+    );
+    await expect(service.listAddressTransactions('DAddress', 0, 501)).rejects.toThrow(
+      'invalid parameter for `limit`: 501',
+    );
+    await expect(service.listAddressUtxos('DAddress', -1, 1)).rejects.toThrow(
+      'invalid parameter for `offset`: -1',
+    );
+  });
+
+  it('resolves only the requested block page and preserves global transaction indexes', async () => {
+    const createdLookups: string[][] = [];
+    const transactions = Array.from({ length: 600 }, (_value, txIndex) => ({
+      txid: `tx-${txIndex}`,
+      vin: [{ txid: `previous-${txIndex}`, vout: 0 }],
+      vout: [{ n: 0, value: '1.00000000' }],
+    }));
+    const service = createService({
+      createdLookups,
+      rawBlocks: new Map([
+        [
+          3,
+          {
+            block: {
+              hash: 'large-block',
+              height: 3,
+              time: 1_700_000_180,
+              tx: transactions,
+            },
+          },
+        ],
+      ]),
+      utxoOutputs: new Map(),
+    });
+
+    await expect(service.getBlock('3', 497, 2)).resolves.toMatchObject({
+      block: { hash: 'large-block', txCount: 600 },
+      limit: 2,
+      offset: 497,
+      returnedCount: 2,
+      totalCount: 600,
+      transactions: [
+        { txid: 'tx-497', txIndex: 497 },
+        { txid: 'tx-498', txIndex: 498 },
+      ],
+    });
+    expect(createdLookups).toEqual([['previous-497:0', 'previous-498:0']]);
+
+    createdLookups.length = 0;
+    const defaultPage = await service.getBlock('3');
+    expect(defaultPage).toMatchObject({
+      limit: 50,
+      offset: 0,
+      returnedCount: 50,
+      totalCount: 600,
+    });
+    expect(createdLookups[0]).toHaveLength(50);
+    expect(createdLookups[0]?.[49]).toBe('previous-49:0');
+  });
+
   it('resolves transaction details from raw synced blocks when derived refs lag', async () => {
     const rawTxid = 'raw-synced-tx';
     const createdLookups: string[][] = [];

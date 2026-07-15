@@ -1,21 +1,27 @@
 import { type AuthenticatedApiKeyResolver, protectedRouteDetail } from '@onlydoge/access-control';
-import { parseNonNegativeInteger } from '@onlydoge/shared-kernel';
-import { Elysia, t } from 'elysia';
+import {
+  defaultPageLimit,
+  maxPageLimit,
+  maxPageOffset,
+  parseBoundedNonNegativeInteger,
+} from '@onlydoge/shared-kernel';
+import { Elysia, sse, t } from 'elysia';
 
 import type { ExplorerQueryService } from '../application/explorer-query-service';
+import type { ExplorerMempoolWatchPort } from '../contracts/ports';
 
 const explorerTag = 'Explorer';
 
 const paginationQuerySchema = t.Object({
   offset: t.Optional(
     t.String({
-      description: 'Zero-based number of records to skip.',
+      description: `Zero-based number of records to skip. Maximum ${maxPageOffset}.`,
       examples: ['0', '25'],
     }),
   ),
   limit: t.Optional(
     t.String({
-      description: 'Maximum number of records to return.',
+      description: `Maximum number of records to return. Defaults to ${defaultPageLimit}; maximum ${maxPageLimit}. Values above the maximum return a validation error.`,
       examples: ['20', '50'],
     }),
   ),
@@ -30,14 +36,23 @@ const addressParamsSchema = t.Object({
 
 function readPagination(query: { limit?: string; offset?: string }) {
   return {
-    offset: parseNonNegativeInteger(query.offset),
-    limit: parseNonNegativeInteger(query.limit),
+    offset: parseBoundedNonNegativeInteger(query.offset, {
+      defaultValue: 0,
+      field: 'offset',
+      maximum: maxPageOffset,
+    }),
+    limit: parseBoundedNonNegativeInteger(query.limit, {
+      defaultValue: defaultPageLimit,
+      field: 'limit',
+      maximum: maxPageLimit,
+    }),
   };
 }
 
 export function buildExplorerQueryHttp(
   service: ExplorerQueryService,
   resolveAuthenticatedApiKey: AuthenticatedApiKeyResolver,
+  mempoolWatch?: ExplorerMempoolWatchPort,
 ) {
   const describeProtected = (summary: string, description: string) =>
     protectedRouteDetail({
@@ -46,7 +61,7 @@ export function buildExplorerQueryHttp(
       description,
     });
 
-  return new Elysia({ prefix: '/v1/explorer' })
+  const app = new Elysia({ prefix: '/v1/explorer' })
     .get(
       '/search',
       ({ query, request }) => {
@@ -70,11 +85,10 @@ export function buildExplorerQueryHttp(
     )
     .get(
       '/blocks',
-      ({ query }) =>
-        service.listBlocks(
-          parseNonNegativeInteger(query.offset),
-          parseNonNegativeInteger(query.limit),
-        ),
+      ({ query }) => {
+        const { limit, offset } = readPagination(query);
+        return service.listBlocks(offset, limit);
+      },
       {
         detail: describeProtected(
           'List blocks',
@@ -97,18 +111,29 @@ export function buildExplorerQueryHttp(
         query: paginationQuerySchema,
       },
     )
-    .get('/blocks/:ref', ({ params }) => service.getBlock(params.ref), {
-      detail: describeProtected(
-        'Get block',
-        'Returns a block summary and transaction summaries by raw-synced height or indexed block hash.',
-      ),
-      params: t.Object({
-        ref: t.String({
-          description: 'Block height or block hash.',
-          examples: ['123456', '0000000000000000000000000000000000000000000000000000000000000000'],
+    .get(
+      '/blocks/:ref',
+      ({ params, query }) => {
+        const { limit, offset } = readPagination(query);
+        return service.getBlock(params.ref, offset, limit);
+      },
+      {
+        detail: describeProtected(
+          'Get block',
+          'Returns a block summary and a bounded page of transaction summaries by raw-synced height or indexed block hash. Transaction indexes remain relative to the full block.',
+        ),
+        params: t.Object({
+          ref: t.String({
+            description: 'Block height or block hash.',
+            examples: [
+              '123456',
+              '0000000000000000000000000000000000000000000000000000000000000000',
+            ],
+          }),
         }),
-      }),
-    })
+        query: paginationQuerySchema,
+      },
+    )
     .get(
       '/transactions/:txid',
       ({ params, request }) => {
@@ -169,4 +194,62 @@ export function buildExplorerQueryHttp(
         query: paginationQuerySchema,
       },
     );
+
+  if (!mempoolWatch) {
+    return app;
+  }
+
+  return app.get(
+    '/mempool/watch',
+    async function* ({ query, request, set }) {
+      const actor = resolveAuthenticatedApiKey(request);
+      set.headers['cache-control'] = 'no-store';
+      set.headers['x-accel-buffering'] = 'no';
+
+      const abort = new AbortController();
+      request.signal.addEventListener(
+        'abort',
+        () => {
+          abort.abort();
+        },
+        { once: true },
+      );
+
+      for await (const event of mempoolWatch.openSession({
+        apiKeyId: actor.id,
+        address: query.address,
+        ...(query.minValueBase === undefined ? {} : { minValueBase: query.minValueBase }),
+        signal: abort.signal,
+      })) {
+        if (event.event === 'comment') {
+          yield sse({ data: event.data });
+          continue;
+        }
+
+        yield sse({
+          event: event.event,
+          data: event.data,
+        });
+      }
+    },
+    {
+      detail: describeProtected(
+        'Watch mempool address',
+        'Opens a one-shot SSE session for a single Dogecoin receive address. Emits mempool.watch.appeared on the first matching mempool output (or catch-up hit), otherwise mempool.watch.timeout after five minutes. Up to five concurrent sessions per API key.',
+      ),
+      query: t.Object({
+        address: t.String({
+          description: 'Dogecoin address to watch for receiving outputs in the mempool.',
+          examples: ['DTestAddress123'],
+        }),
+        minValueBase: t.Optional(
+          t.String({
+            description:
+              'Optional minimum sum of matching output values in base units (1 DOGE = 100000000).',
+            examples: ['100000000'],
+          }),
+        ),
+      }),
+    },
+  );
 }

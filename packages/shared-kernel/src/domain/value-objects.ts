@@ -237,6 +237,31 @@ export function parseNonNegativeInteger(value: string | undefined): number | und
   return nonNegativeIntegerOrUndefined(parsed);
 }
 
+export const defaultPageLimit = 50;
+export const maxPageLimit = 500;
+export const maxPageOffset = 100_000;
+
+export function parseBoundedNonNegativeInteger(
+  value: number | string | undefined,
+  options: {
+    defaultValue?: number;
+    field: string;
+    maximum: number;
+  },
+): number | undefined {
+  if (value === undefined) {
+    return options.defaultValue;
+  }
+
+  const parsed =
+    typeof value === 'number' ? value : value.trim() === '' ? Number.NaN : Number(value);
+  if (!isNonNegativeInteger(parsed) || parsed > options.maximum) {
+    throw new ValidationError(`invalid parameter for \`${options.field}\`: ${String(value)}`);
+  }
+
+  return parsed;
+}
+
 function nonNegativeIntegerOrUndefined(value: number): number | undefined {
   if (!isNonNegativeInteger(value)) {
     return undefined;

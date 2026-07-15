@@ -165,6 +165,48 @@ The suite verifies:
 
 ## Health Checks
 
+### Structured logging and request correlation
+
+API requests accept an optional `x-request-id` header. When the header is missing, malformed, or unsafe, the API generates a UUID. Every response includes `x-request-id`, and the same value is stored on audit rows and attached to structured request/error logs.
+
+Background services (core indexer, mempool sampler, mempool appear detector, ZMQ bridge, warehouse recovery) log JSON via Pino with stable `service` and `component` fields. Correlate API traffic to background work by time window and shared deployment; background logs do not reuse API request IDs.
+
+Sensitive fields (`authorization`, API tokens, RPC endpoints, passwords, secrets) are redacted automatically. Do not enable body logging or paste raw credentials into log queries.
+
+Example production log tail:
+
+```bash
+docker compose --env-file .env -f docker-compose.managed.yml logs --tail=200 onlydoge-api onlydoge-indexer \
+  | rg '"service":"onlydoge"'
+```
+
+Filter API errors for a single request after capturing `x-request-id` from the client response:
+
+```bash
+curl -fsS -D - -o /dev/null https://api.example.com/v1/heartbeat/
+docker compose --env-file .env -f docker-compose.managed.yml logs --tail=500 onlydoge-api \
+  | rg 'requestId":"<value-from-x-request-id>"'
+```
+
+Inspect metadata migrations without applying changes:
+
+```bash
+bun run metadata:migrations:status
+```
+
+The command reports the immutable version/name/checksum ledger, pending versions, and detected
+schema or checksum drift. Run it with the same `ONLYDOGE_DATABASE` and TLS environment as the
+application. A drift report exits non-zero and must be inventoried before deployment; do not edit
+ledger rows or mark a baseline from table existence alone.
+
+Metadata recovery is roll-forward only. Startup serializes migrations on one verified,
+driver-specific locked connection and records a version only after schema verification. If a
+MySQL DDL step is interrupted, preserve the database, rerun status, and restart the current image;
+the replay-safe migration verifies existing work and completes it. Do not automatically roll back
+or drop/copy legacy data. A non-empty legacy table, unknown ledger version, checksum mismatch, or
+unrepresented schema state is a stop condition requiring an inventory and an explicit new
+migration.
+
 On the app host:
 
 ```bash
@@ -207,9 +249,34 @@ The known OnlyDoge production host from the 2026-05-25 UTC / 2026-05-26 NZ recov
 
 That recovery also found stale once-managed containers. `once-proxy` held ports `80/443`, and an old once-managed indexer was still running. Keep old once-managed containers stopped unless intentionally rolling back to that stack.
 
-Container health alone is not enough to prove indexing freshness. During the recovery, production stats showed `lastError = "missing current dogecoin prevout: fc0a935951a0358b1d5d5880dc6bd9e06f69c278024b65c5f98297ec701ede2d:0"`; investigate and clear stats errors separately from deploy health.
+Indexer container health evaluates persisted errors, stage-aware progress freshness, and
+online lag against `ONLYDOGE_CORE_ONLINE_TIP_DISTANCE`. Backfill may remain far behind the
+node while it is advancing, but stale backfill progress, any `lastError`, malformed state,
+or sustained online lag makes the container unhealthy. A successful processed window
+clears a recovered transient error.
 
 ## ClickHouse Operations
+
+Application startup and `bun run clickhouse:migrate` use the same ordered ClickHouse migrations.
+Inspect the durable version/name/checksum/state ledger before and after a deployment:
+
+```bash
+bun run clickhouse:migrate:status
+bun run clickhouse:migrate
+bun run clickhouse:migrate:status
+```
+
+Before a migration on a populated warehouse, stop or quiesce writers and take a tested,
+restorable ClickHouse backup. Do not continue if backup/restore cannot be guaranteed. The
+migrator holds the `clickhouse-schema` lock in the configured metadata database for the complete
+run, records `started` before executing a migration, verifies schema/data invariants, and records
+`completed` only afterward. A checksum mismatch is fatal: never edit an applied migration.
+
+Recovery is roll-forward only. If a process is interrupted, leave the ClickHouse data and ledger
+intact, correct the operational cause, and rerun `bun run clickhouse:migrate`; migration steps are
+replay-safe and verification determines completion. If verification cannot pass, restore the
+pre-migration backup before starting application writers, then deploy a new corrective migration.
+Do not manually mark ledger rows completed or run automatic down migrations.
 
 For self-hosted ClickHouse, install the checked-in tuning and retention files:
 
@@ -232,6 +299,34 @@ docker compose --env-file .env -f docker-compose.managed.yml exec -T onlydoge-ap
   bun -e 'const { createClient } = await import("@clickhouse/client"); const { loadSettings } = await import("@onlydoge/platform"); const s=loadSettings({mode:"indexer"}).warehouse; const c=createClient({url:s.location,database:s.database,username:s.user,password:s.password}); for (const query of ["SELECT name, formatReadableSize(free_space) AS free, formatReadableSize(total_space) AS total FROM system.disks", "SELECT table, count() AS mutations FROM system.mutations WHERE database=currentDatabase() AND is_done=0 GROUP BY table"]) { const r=await c.query({query,format:"JSONEachRow"}); console.log((await r.text()).trim()); } await c.close();'
 ```
 
+## Self-hosted Service Image Upgrades
+
+The self-hosted Compose files pin ClickHouse, MinIO, and the MinIO client as
+`repository:version@sha256:manifest-list-digest`. Keep each human-readable version and digest
+together, and keep the MinIO server/client versions compatible.
+
+Before changing a pin:
+
+1. Record the currently deployed image references and inspect the official ClickHouse, MinIO,
+   and MinIO client release notes for every version being crossed.
+2. Stop or quiesce writers and take restorable backups of the ClickHouse and MinIO data. Keep the
+   previous Compose file and image references with the backup.
+3. Resolve the candidate tag from the official registry with
+   `docker buildx imagetools inspect repository:version`. Use the top-level multi-platform digest,
+   and confirm the index includes every supported deployment architecture.
+4. Pull the exact candidates with `docker compose pull clickhouse minio minio-create-bucket`.
+5. On disposable data copies, start ClickHouse and verify its tables, then start MinIO and run the
+   pinned client bucket initialization. Run `bun run test:clickhouse-smoke` for the checked-in
+   schema/adapter path and `bun run ci` for migration and application regressions.
+6. Deploy the updated Compose file. Verify ClickHouse health and queries, MinIO bucket access and
+   initialization, application heartbeat, indexer health, and recent logs before resuming normal
+   operation.
+
+To roll back, restore the previous tag-and-digest references and redeploy. If the candidate wrote a
+data format that the previous release cannot read, stop the services and restore the matching
+ClickHouse/MinIO backups before starting the previous images. Do not reuse data modified by an
+incompatible candidate.
+
 ## Rollback
 
 Deploy the previous immutable image digest:
@@ -241,3 +336,13 @@ bun run deploy:docker -- --envFile .env.managed --image ghcr.io/your-org/onlydog
 ```
 
 Do not roll back ClickHouse tables with destructive commands unless the rebuild runbook explicitly calls for it and current public data can be reset.
+
+## Request correlation and structured logs
+
+The API resolves one request ID per HTTP request:
+
+- Clients may send `x-request-id` when the value is trimmed, at most 128 characters, and matches `^[\w.-]+$`.
+- Otherwise the API generates a UUID.
+- The same ID is returned in the `x-request-id` response header, stored on audit rows, and attached to structured Pino logs as `requestId`.
+
+Log fields use stable component bindings such as `service`, `component`, and `requestId`. Sensitive values (`x-api-token`, RPC credentials, tokens) are redacted to `[REDACTED]`. Correlate operator incidents by matching audit `request_id` values to API log lines with the same `requestId`.

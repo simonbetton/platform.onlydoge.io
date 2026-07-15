@@ -1,3 +1,4 @@
+import { AsyncLocalStorage } from 'node:async_hooks';
 import { mkdir, readFile, writeFile } from 'node:fs/promises';
 import { dirname } from 'node:path';
 
@@ -23,6 +24,7 @@ import {
   type CoreDogecoinApplyContext,
   type CoreDogecoinApplyResult,
   type CoreDogecoinBlockApplication,
+  type CoreWindowInsertStage,
   formatAmountBase,
   mapWithConcurrency,
   type ProjectionAppliedBlock,
@@ -42,7 +44,11 @@ import {
   resolvePendingProjectionWindow,
   toProjectionAppliedBlocks,
 } from '@onlydoge/indexing-pipeline';
-import { InfrastructureError } from '@onlydoge/shared-kernel';
+import {
+  InfrastructureError,
+  noopServiceLogger,
+  type ServiceLogger,
+} from '@onlydoge/shared-kernel';
 
 import {
   buildCoreCurrentStateOutputKeyRanges,
@@ -50,7 +56,9 @@ import {
   clickHouseStringRangeClause,
   clickHouseStringRangeParams,
 } from './clickhouse-core-dogecoin';
+import { runClickHouseMigrations } from './clickhouse-migrations';
 import type { ClickHouseCoreDogecoinStore } from './core-dogecoin-state-store';
+import type { SchemaLockPort } from './schema-lock';
 import type { WarehouseSettings } from './settings';
 import {
   chunkQueryValues,
@@ -161,6 +169,14 @@ const maxClickHouseHotOutputKeyBytesPerChunk = 6_000;
 const maxClickHouseCoreOutputKeyValuesPerChunk = 512;
 const maxClickHouseCoreOutputKeyBytesPerChunk = 48_000;
 const maxClickHouseCoreOutputKeyQueryConcurrency = 4;
+const explorerClickHouseSettings: ClickHouseCommandSettings = {
+  max_execution_time: 30,
+  max_rows_to_read: '10000000',
+  max_bytes_to_read: '1073741824',
+  max_result_rows: '100000',
+  result_overflow_mode: 'throw',
+  timeout_before_checking_execution_speed: 0,
+};
 const addressMovementsTable = 'dogecoin_address_movements_v1';
 const addressMovementsByAddressTable = 'dogecoin_address_movements_by_address_v1';
 const appliedBlocksTable = clickHouseCoreDogecoinTables.appliedBlocks;
@@ -170,6 +186,7 @@ const coreUtxoCreatesTable = clickHouseCoreDogecoinTables.coreUtxoCreates;
 const coreUtxoSpendsTable = clickHouseCoreDogecoinTables.coreUtxoSpends;
 const utxoCurrentStateTable = clickHouseCoreDogecoinTables.currentUtxos;
 const utxoCurrentStateByAddressTable = clickHouseCoreDogecoinTables.currentUtxosByAddress;
+const transactionRefsTable = 'dogecoin_transaction_refs_v1';
 const coreCurrentStateOutputKeyRanges = buildCoreCurrentStateOutputKeyRanges();
 type ClickHouseClient = ReturnType<typeof createClient>;
 type ClickHouseCommandParameters = Parameters<ClickHouseClient['command']>[0];
@@ -251,6 +268,14 @@ export class InMemoryWarehouseAdapter
     await this.afterMutation();
   }
 
+  public async recoverCoreDogecoinWindow(
+    fromBlockHeight: number,
+    _context?: CoreDogecoinApplyContext,
+  ): Promise<void> {
+    this.rewindInMemoryCoreTail(fromBlockHeight);
+    await this.afterMutation();
+  }
+
   private pendingInMemoryCoreApplications(
     input: CoreDogecoinBlockApplication[],
   ): CoreDogecoinBlockApplication[] {
@@ -297,6 +322,9 @@ export class InMemoryWarehouseAdapter
     );
     this.state.transactionFacts = this.state.transactionFacts.filter(
       (fact) => fact.blockHeight < fromBlockHeight,
+    );
+    this.state.transactionRefs = this.state.transactionRefs.filter(
+      (ref) => ref.blockHeight < fromBlockHeight,
     );
     this.state.utxoOutputs = this.state.utxoOutputs.flatMap((output) =>
       rewindInMemoryUtxoOutput(output, fromBlockHeight),
@@ -434,6 +462,11 @@ export class InMemoryWarehouseAdapter
   }
 
   public async getTransactionRef(txid: string) {
+    const indexedRef = this.latestInMemoryTransactionRef(txid);
+    if (indexedRef) {
+      return indexedRef;
+    }
+
     const output = this.state.utxoOutputs.find((candidate) => candidate.txid === txid);
     if (!output) {
       return null;
@@ -444,6 +477,51 @@ export class InMemoryWarehouseAdapter
       blockHash: output.blockHash,
       blockTime: output.blockTime,
       txIndex: output.txIndex,
+    };
+  }
+
+  public async upsertTransactionRefs(
+    refs: Array<{
+      blockHash: string;
+      blockHeight: number;
+      blockTime: number;
+      source: 'raw_sync' | 'core_process';
+      txIndex: number;
+      txid: string;
+      version: number;
+    }>,
+  ): Promise<void> {
+    for (const ref of refs) {
+      const existingIndex = this.state.transactionRefs.findIndex(
+        (candidate) => candidate.txid === ref.txid,
+      );
+      if (existingIndex < 0) {
+        this.state.transactionRefs.push({ ...ref });
+        continue;
+      }
+
+      const existing = this.state.transactionRefs[existingIndex];
+      if (!existing || ref.version >= existing.version) {
+        this.state.transactionRefs[existingIndex] = { ...ref };
+      }
+    }
+
+    await this.afterMutation();
+  }
+
+  private latestInMemoryTransactionRef(txid: string) {
+    const ref = this.state.transactionRefs
+      .filter((candidate) => candidate.txid === txid)
+      .sort((left, right) => right.version - left.version)[0];
+    if (!ref) {
+      return null;
+    }
+
+    return {
+      blockHeight: ref.blockHeight,
+      blockHash: ref.blockHash,
+      blockTime: ref.blockTime,
+      txIndex: ref.txIndex,
     };
   }
 
@@ -473,7 +551,25 @@ export class InMemoryWarehouseAdapter
 
   public async listAddressTransactions(address: string, offset = 0, limit?: number) {
     const aggregates = aggregateAddressTransactions(this.getNativeMovements(address));
-    return paginateAddressTransactions(aggregates, offset, limit);
+    const rows = paginateAddressTransactions(aggregates, offset, limit);
+    return rows.map((row) => {
+      const fact = this.state.transactionFacts.find(
+        (candidate) =>
+          candidate.txid === row.txid &&
+          candidate.blockHeight === row.blockHeight &&
+          candidate.blockHash === row.blockHash,
+      );
+
+      return {
+        ...row,
+        feeBase: fact?.feeBase ?? null,
+        inputCount: fact?.inputCount ?? 0,
+        isCoinbase: fact?.isCoinbase ?? false,
+        outputCount: fact?.outputCount ?? 0,
+        totalInputBase: fact?.totalInputBase ?? '0',
+        totalOutputBase: fact?.grossOutputBase ?? '0',
+      };
+    });
   }
 
   public async listAddressUtxos(address: string, offset = 0, limit?: number) {
@@ -632,7 +728,10 @@ export class InMemoryWarehouseAdapter
       this.upsertAnalyticsTransactionFact(row);
     }
     await this.afterMutation();
-    return { rowsInserted: rows.length, throughBlockHeight: input.throughBlockHeight };
+    return {
+      rowsInserted: rows.length,
+      throughBlockHeight: input.throughBlockHeight,
+    };
   }
 
   public async preflightAnalyticsQuery(input: {
@@ -1172,23 +1271,34 @@ export class ClickHouseWarehouseAdapter
     MempoolSampleWarehousePort
 {
   private readonly client: ReturnType<typeof createClient>;
-  private readonly analyticsClient: ReturnType<typeof createClient>;
+  private readonly analyticsClient: ReturnType<typeof createClient> | null;
+  private readonly explorerReadContext = new AsyncLocalStorage<boolean>();
+  private readonly logger: ServiceLogger;
   private readonly requestTimeoutMs: number;
 
-  public constructor(settings: WarehouseSettings) {
+  public constructor(
+    private readonly settings: WarehouseSettings,
+    private readonly schemaLock?: SchemaLockPort,
+    logger: ServiceLogger = noopServiceLogger(),
+  ) {
+    this.logger = logger;
     this.requestTimeoutMs = settings.requestTimeoutMs ?? 30_000;
     this.client = createClient(clickHouseClientOptions(settings, this.requestTimeoutMs));
-    this.analyticsClient = createClient(
-      clickHouseClientOptions(
-        settings,
-        this.requestTimeoutMs,
-        analyticsClickHouseCredentials(settings),
-      ),
-    );
+    const analyticsCredentials = analyticsClickHouseCredentials(settings);
+    this.analyticsClient = analyticsCredentials
+      ? createClient(clickHouseClientOptions(settings, this.requestTimeoutMs, analyticsCredentials))
+      : null;
   }
 
   public async boot(): Promise<void> {
-    await this.migrate();
+    if (!this.schemaLock) {
+      throw new Error('ClickHouse warehouse boot requires a metadata schema lock');
+    }
+    await runClickHouseMigrations(this.settings, this.schemaLock);
+  }
+
+  public runExplorerRead<T>(work: () => Promise<T>): Promise<T> {
+    return this.explorerReadContext.run(true, work);
   }
 
   public async applyCoreDogecoinWindow(
@@ -1200,6 +1310,13 @@ export class ClickHouseWarehouseAdapter
     }
 
     return this.applyCoreDogecoinWindowWithDeadline(input, context);
+  }
+
+  public async recoverCoreDogecoinWindow(
+    fromBlockHeight: number,
+    context?: CoreDogecoinApplyContext,
+  ): Promise<void> {
+    await this.rewindCoreDogecoinWindow(fromBlockHeight, context);
   }
 
   private async applyCoreDogecoinWindowWithDeadline(
@@ -1311,6 +1428,10 @@ export class ClickHouseWarehouseAdapter
         table: analyticsTransactionsTable,
         heightColumn: 'block_height',
       },
+      {
+        table: transactionRefsTable,
+        heightColumn: 'block_height',
+      },
     ];
 
     for (const deletion of deletes) {
@@ -1384,19 +1505,25 @@ export class ClickHouseWarehouseAdapter
       createRows.map(toCoreUtxoCreateInsertRow),
       requestContext,
     );
+    await runCoreWindowInsertStageHook(context, 'creates');
     await this.insertRows(
       coreUtxoSpendsTable,
       spendRows.map(toCoreUtxoSpendInsertRow),
       requestContext,
     );
+    await runCoreWindowInsertStageHook(context, 'spends');
     await this.insertCoreAddressMovements(pending, requestContext);
+    await runCoreWindowInsertStageHook(context, 'movements');
     await this.insertCoreTransactionFacts(pending, requestContext);
+    await runCoreWindowInsertStageHook(context, 'transactions');
     await this.applyCoreCurrentStateWindowIfEnabled(pending, context, requestContext);
+    await runCoreWindowInsertStageHook(context, 'current_state');
     await this.insertRows(
       coreProcessedBlocksTable,
       pending.map(toCoreProcessedBlockInsertRow),
       requestContext,
     );
+    await runCoreWindowInsertStageHook(context, 'processed_blocks');
   }
 
   private async insertPendingCoreWindowWithRecovery(
@@ -1431,8 +1558,17 @@ export class ClickHouseWarehouseAdapter
   ): Promise<void> {
     const windowStart = coreWindowStart(pending);
     const windowEnd = coreWindowEnd(pending);
-    console.warn(
-      `[onlydoge] phase=core-current-state-recovery action=repair-prevouts reason=missing-current-prevout output_key=${error.outputKey} window_start=${windowStart} window_end=${windowEnd}`,
+    this.logger.warn(
+      {
+        action: 'repair-prevouts',
+        component: 'warehouse',
+        endHeight: windowEnd,
+        outputKey: error.outputKey,
+        phase: 'core-current-state-recovery',
+        reason: 'missing-current-prevout',
+        startHeight: windowStart,
+      },
+      'repairing missing core current prevouts',
     );
     await this.cleanFailedCoreWindowFacts(pending, context);
     await this.repairMissingCoreCurrentPrevouts(pending, requestContext);
@@ -1658,9 +1794,14 @@ export class ClickHouseWarehouseAdapter
 
   public async resetCoreDogecoinStorage(): Promise<void> {
     for (const table of clickHouseDestructiveResetTables) {
-      await this.executeCommand({ query: `DROP TABLE IF EXISTS ${table} SYNC` });
+      await this.executeCommand({
+        query: `DROP TABLE IF EXISTS ${table} SYNC`,
+      });
     }
-    await this.migrate();
+    if (!this.schemaLock) {
+      throw new Error('ClickHouse warehouse reset requires a metadata schema lock');
+    }
+    await runClickHouseMigrations(this.settings, this.schemaLock);
   }
 
   public async resetCoreDogecoinBenchmarkStorage(
@@ -1677,7 +1818,9 @@ export class ClickHouseWarehouseAdapter
   private async dropCoreDogecoinBenchmarkTables(prefix: string): Promise<void> {
     const tables = coreBenchmarkTableNames(prefix);
     for (const table of Object.values(tables).reverse()) {
-      await this.executeCommand({ query: `DROP TABLE IF EXISTS ${table} SYNC` });
+      await this.executeCommand({
+        query: `DROP TABLE IF EXISTS ${table} SYNC`,
+      });
     }
   }
 
@@ -1706,9 +1849,13 @@ export class ClickHouseWarehouseAdapter
     asOfBlockHeight: number,
   ): Promise<void> {
     const tables = coreBenchmarkTableNames(prefix);
-    await this.executeCommand({ query: `TRUNCATE TABLE ${tables.currentUtxos}` });
+    await this.executeCommand({
+      query: `TRUNCATE TABLE ${tables.currentUtxos}`,
+    });
     await this.executeCommand({ query: `TRUNCATE TABLE ${tables.balances}` });
-    await this.executeCommand({ query: `TRUNCATE TABLE ${tables.appliedBlocks}` });
+    await this.executeCommand({
+      query: `TRUNCATE TABLE ${tables.appliedBlocks}`,
+    });
     await this.insertCoreCurrentStateMaterialization({
       asOfBlockHeight,
       createsTable: tables.creates,
@@ -1935,12 +2082,71 @@ export class ClickHouseWarehouseAdapter
   }
 
   public async getTransactionRef(txid: string) {
+    const indexedRef = await this.getIndexedTransactionRef(txid);
+    if (indexedRef) {
+      return indexedRef;
+    }
+
     const coreRef = await this.getCoreTransactionRef(txid);
     if (coreRef) {
       return coreRef;
     }
 
     return this.getCurrentTransactionRef(txid);
+  }
+
+  public async upsertTransactionRefs(
+    refs: Array<{
+      blockHash: string;
+      blockHeight: number;
+      blockTime: number;
+      source: 'raw_sync' | 'core_process';
+      txIndex: number;
+      txid: string;
+      version: number;
+    }>,
+  ): Promise<void> {
+    if (refs.length === 0) {
+      return;
+    }
+
+    await this.insertRows(
+      transactionRefsTable,
+      refs.map((ref) => ({
+        txid: ref.txid,
+        block_height: ref.blockHeight,
+        block_hash: ref.blockHash,
+        block_time: ref.blockTime,
+        tx_index: ref.txIndex,
+        source: ref.source === 'raw_sync' ? 1 : 2,
+        version: ref.version,
+      })),
+    );
+  }
+
+  private async getIndexedTransactionRef(txid: string) {
+    const rows = await this.queryRows<{
+      blockHash: string;
+      blockHeight: number;
+      blockTime: number;
+      txIndex: number;
+    }>({
+      query: `
+          SELECT
+            block_height AS "blockHeight",
+            block_hash AS "blockHash",
+            block_time AS "blockTime",
+            tx_index AS "txIndex"
+          FROM ${transactionRefsTable}
+          WHERE txid = {txid:String}
+          ORDER BY version DESC
+          LIMIT 1
+        `,
+      query_params: { txid },
+      format: 'JSONEachRow',
+    });
+
+    return rows[0] ?? null;
   }
 
   private async getCurrentTransactionRef(txid: string) {
@@ -2090,24 +2296,63 @@ export class ClickHouseWarehouseAdapter
       blockHash: string;
       blockHeight: number;
       blockTime: number;
+      feeBase: string | null;
+      inputCount: number;
+      isCoinbase: boolean;
+      outputCount: number;
       receivedBase: string;
       sentBase: string;
+      totalInputBase: string;
+      totalOutputBase: string;
       txIndex: number;
       txid: string;
     }>({
       query: `
           SELECT
-            block_height AS "blockHeight",
-            block_hash AS "blockHash",
-            block_time AS "blockTime",
-            txid,
-            tx_index AS "txIndex",
-            CAST(sumIf(amount_base_i256, direction = 'credit') AS String) AS "receivedBase",
-            CAST(sumIf(amount_base_i256, direction = 'debit') AS String) AS "sentBase"
-          FROM ${addressMovementsByAddressTable}
-          WHERE address = {address:String} AND asset_address = ''
-          GROUP BY block_height, block_hash, block_time, txid, tx_index
-          ORDER BY block_height DESC, tx_index DESC, txid DESC
+            movements.block_height AS "blockHeight",
+            movements.block_hash AS "blockHash",
+            movements.block_time AS "blockTime",
+            movements.txid,
+            movements.tx_index AS "txIndex",
+            CAST(movements.receivedBase AS String) AS "receivedBase",
+            CAST(movements.sentBase AS String) AS "sentBase",
+            facts.is_coinbase AS "isCoinbase",
+            facts.input_count AS "inputCount",
+            facts.output_count AS "outputCount",
+            facts.total_input_base AS "totalInputBase",
+            facts.gross_output_base AS "totalOutputBase",
+            facts.fee_base AS "feeBase"
+          FROM (
+            SELECT
+              block_height,
+              block_hash,
+              block_time,
+              txid,
+              tx_index,
+              sumIf(amount_base_i256, direction = 'credit') AS receivedBase,
+              sumIf(amount_base_i256, direction = 'debit') AS sentBase
+            FROM ${addressMovementsByAddressTable}
+            WHERE address = {address:String} AND asset_address = ''
+            GROUP BY block_height, block_hash, block_time, txid, tx_index
+          ) AS movements
+          LEFT JOIN (
+            SELECT
+              block_height,
+              block_hash,
+              txid,
+              argMax(is_coinbase, version) AS is_coinbase,
+              argMax(input_count, version) AS input_count,
+              argMax(output_count, version) AS output_count,
+              argMax(total_input_base, version) AS total_input_base,
+              argMax(gross_output_base, version) AS gross_output_base,
+              argMax(fee_base, version) AS fee_base
+            FROM ${analyticsTransactionsTable}
+            GROUP BY block_height, block_hash, txid
+          ) AS facts
+            ON movements.block_height = facts.block_height
+           AND movements.block_hash = facts.block_hash
+           AND movements.txid = facts.txid
+          ORDER BY movements.block_height DESC, movements.tx_index DESC, movements.txid DESC
           ${pagination.limitClause}
           ${pagination.offsetClause}
         `,
@@ -2118,7 +2363,13 @@ export class ClickHouseWarehouseAdapter
       format: 'JSONEachRow',
     });
 
-    return rows;
+    return rows.map((row) => ({
+      ...row,
+      feeBase: row.feeBase ?? null,
+      isCoinbase: Boolean(row.isCoinbase),
+      totalInputBase: row.totalInputBase ?? '0',
+      totalOutputBase: row.totalOutputBase ?? '0',
+    }));
   }
 
   public async listAddressUtxos(address: string, offset = 0, limit?: number) {
@@ -2973,110 +3224,6 @@ export class ClickHouseWarehouseAdapter
     return rowChunks.flat();
   }
 
-  private async migrate(): Promise<void> {
-    for (const statement of clickHouseWarehouseBootstrapStatements) {
-      await this.executeCommand({ query: statement });
-    }
-
-    await this.backfillTableIfEmpty(
-      utxoCurrentStateByAddressTable,
-      `
-        INSERT INTO ${utxoCurrentStateByAddressTable} (
-          block_height,
-          block_hash,
-          block_time,
-          txid,
-          tx_index,
-          vout,
-          output_key,
-          address,
-          script_type,
-          value_base,
-          is_coinbase,
-          is_spendable,
-          spent_by_txid,
-          spent_in_block,
-          spent_input_index,
-          version
-        )
-        SELECT
-          block_height,
-          block_hash,
-          block_time,
-          txid,
-          tx_index,
-          vout,
-          output_key,
-          address,
-          script_type,
-          value_base,
-          is_coinbase,
-          is_spendable,
-          spent_by_txid,
-          spent_in_block,
-          spent_input_index,
-          version
-        FROM ${utxoCurrentStateTable}
-      `,
-    );
-    await this.backfillTableIfEmpty(
-      addressMovementsByAddressTable,
-      `
-        INSERT INTO ${addressMovementsByAddressTable} (
-          movement_id,
-          block_height,
-          block_hash,
-          block_time,
-          txid,
-          tx_index,
-          entry_index,
-          address,
-          asset_address,
-          direction,
-          amount_base,
-          output_key,
-          derivation_method
-        )
-        SELECT
-          movement_id,
-          block_height,
-          block_hash,
-          block_time,
-          txid,
-          tx_index,
-          entry_index,
-          address,
-          asset_address,
-          direction,
-          amount_base,
-          output_key,
-          derivation_method
-        FROM ${addressMovementsTable}
-      `,
-    );
-  }
-
-  private async backfillTableIfEmpty(table: string, statement: string): Promise<void> {
-    if (await this.tableHasRows(table)) {
-      return;
-    }
-
-    await this.executeCommand({ query: statement });
-  }
-
-  private async tableHasRows(table: string): Promise<boolean> {
-    const rows = await this.queryRows<{ present: number }>({
-      query: `
-        SELECT 1 AS present
-        FROM ${table}
-        LIMIT 1
-      `,
-      format: 'JSONEachRow',
-    });
-
-    return rows.length > 0;
-  }
-
   public async insertAnalyticsTransactionFacts(rows: AnalyticsTransactionFact[]): Promise<void> {
     await this.insertRows(
       analyticsTransactionsTable,
@@ -3138,7 +3285,7 @@ export class ClickHouseWarehouseAdapter
     sql: string;
   }): Promise<AnalyticsQueryExecutionResult> {
     try {
-      const result = await this.analyticsClient.query({
+      const result = await this.requireAnalyticsClient().query({
         query: input.sql,
         query_params: analyticsQueryParamsRecord(input.params),
         format: 'JSON',
@@ -3152,11 +3299,20 @@ export class ClickHouseWarehouseAdapter
 
   private async queryAnalyticsRows<T>(parameters: ClickHouseJsonQueryParameters): Promise<T[]> {
     try {
-      const result = await this.analyticsClient.query(parameters);
+      const result = await this.requireAnalyticsClient().query(parameters);
       return (await result.json<T>()) as T[];
     } catch (error) {
       throw this.toInfrastructureError(error);
     }
+  }
+
+  private requireAnalyticsClient(): ReturnType<typeof createClient> {
+    if (!this.analyticsClient) {
+      throw new InfrastructureError(
+        'analytics querying is unavailable: configure ONLYDOGE_ANALYTICS_WAREHOUSE_USER and ONLYDOGE_ANALYTICS_WAREHOUSE_PASSWORD',
+      );
+    }
+    return this.analyticsClient;
   }
 
   private async queryRows<T>(
@@ -3176,7 +3332,7 @@ export class ClickHouseWarehouseAdapter
       return this.queryRowsWithRequestContext<T>(parameters, requestContext);
     }
 
-    const result = await this.client.query(parameters);
+    const result = await this.client.query(this.explorerQueryParameters(parameters));
     return (await result.json<T>()) as T[];
   }
 
@@ -3200,11 +3356,27 @@ export class ClickHouseWarehouseAdapter
   ): Promise<T[]> {
     const result = await this.runWithRequestContext(requestContext, () =>
       this.client.query({
-        ...parameters,
+        ...this.explorerQueryParameters(parameters),
         abort_signal: requestContext.signal,
       }),
     );
     return (await this.runWithRequestContext(requestContext, () => result.json<T>())) as T[];
+  }
+
+  private explorerQueryParameters(
+    parameters: ClickHouseJsonQueryParameters,
+  ): ClickHouseJsonQueryParameters {
+    if (!this.explorerReadContext.getStore()) {
+      return parameters;
+    }
+
+    return {
+      ...parameters,
+      clickhouse_settings: {
+        ...parameters.clickhouse_settings,
+        ...explorerClickHouseSettings,
+      },
+    };
   }
 
   private toDeadlineInfrastructureError(
@@ -3244,7 +3416,10 @@ export class ClickHouseWarehouseAdapter
   ): Promise<void> {
     if (requestContext) {
       await this.runWithRequestContext(requestContext, () =>
-        this.client.insert({ ...parameters, abort_signal: requestContext.signal }),
+        this.client.insert({
+          ...parameters,
+          abort_signal: requestContext.signal,
+        }),
       );
       return;
     }
@@ -3265,7 +3440,9 @@ export class ClickHouseWarehouseAdapter
       work(),
       new Promise<never>((_resolve, reject) => {
         listener = () => reject(abortReason(requestContext.signal));
-        requestContext.signal.addEventListener('abort', listener, { once: true });
+        requestContext.signal.addEventListener('abort', listener, {
+          once: true,
+        });
       }),
     ]).finally(() => {
       removeAbortListener(requestContext.signal, listener);
@@ -3285,9 +3462,11 @@ export class ClickHouseWarehouseAdapter
 
 export async function createWarehouse(
   settings: WarehouseSettings,
+  schemaLock?: SchemaLockPort,
+  logger: ServiceLogger = noopServiceLogger(),
 ): Promise<ProjectionWarehousePort & ExplorerWarehousePort & MempoolSampleWarehousePort> {
   if (settings.driver === 'clickhouse') {
-    const adapter = new ClickHouseWarehouseAdapter(settings);
+    const adapter = new ClickHouseWarehouseAdapter(settings, schemaLock, logger);
     await adapter.boot();
     return adapter;
   }
@@ -3299,6 +3478,8 @@ export async function createWarehouse(
 
 export async function createFactWarehouse(
   settings: WarehouseSettings,
+  schemaLock?: SchemaLockPort,
+  logger: ServiceLogger = noopServiceLogger(),
 ): Promise<
   AnalyticsWarehousePort &
     MempoolSampleWarehousePort &
@@ -3315,7 +3496,7 @@ export async function createFactWarehouse(
     ProjectionWarehousePort &
     ExplorerWarehousePort
 > {
-  return createWarehouse(settings) as Promise<
+  return createWarehouse(settings, schemaLock, logger) as Promise<
     AnalyticsWarehousePort &
       MempoolSampleWarehousePort &
       ProjectionFactWarehousePort &
@@ -3345,40 +3526,58 @@ export class CompositeWarehouseAdapter
   ) {}
 
   public getUtxoOutputs(outputKeys: string[]) {
-    return this.stateStore.getUtxoOutputs(outputKeys);
+    return runExplorerRead(this.stateStore, () => this.stateStore.getUtxoOutputs(outputKeys));
   }
 
   public getCreatedUtxoOutputs(outputKeys: string[]) {
-    return this.historyWarehouse.getCreatedUtxoOutputs(outputKeys);
+    return runExplorerRead(this.historyWarehouse, () =>
+      this.historyWarehouse.getCreatedUtxoOutputs(outputKeys),
+    );
   }
 
   public async getAddressSummary(address: string) {
     const [current, historical] = await Promise.all([
-      this.stateStore.getCurrentAddressSummary(address),
-      this.historyWarehouse.getAddressSummary(address),
+      runExplorerRead(this.stateStore, () => this.stateStore.getCurrentAddressSummary(address)),
+      runExplorerRead(this.historyWarehouse, () =>
+        this.historyWarehouse.getAddressSummary(address),
+      ),
     ]);
     return combineAddressSummary(current, historical);
   }
 
   public getAppliedBlockByHash(blockHash: string) {
-    return this.historyWarehouse.getAppliedBlockByHash(blockHash);
+    return runExplorerRead(this.historyWarehouse, () =>
+      this.historyWarehouse.getAppliedBlockByHash(blockHash),
+    );
   }
 
   public getTransactionRef(txid: string) {
-    return this.historyWarehouse.getTransactionRef(txid);
+    return runExplorerRead(this.historyWarehouse, () =>
+      this.historyWarehouse.getTransactionRef(txid),
+    );
   }
 
   public listAddressTransactions(address: string, offset?: number, limit?: number) {
-    return this.historyWarehouse.listAddressTransactions(address, offset, limit);
+    return runExplorerRead(this.historyWarehouse, () =>
+      this.historyWarehouse.listAddressTransactions(address, offset, limit),
+    );
   }
 
   public listAddressUtxos(address: string, offset?: number, limit?: number) {
-    return this.stateStore.listAddressUtxos(address, offset, limit);
+    return runExplorerRead(this.stateStore, () =>
+      this.stateStore.listAddressUtxos(address, offset, limit),
+    );
   }
 
   public listAppliedBlocks(offset?: number, limit?: number) {
-    return this.historyWarehouse.listAppliedBlocks(offset, limit);
+    return runExplorerRead(this.historyWarehouse, () =>
+      this.historyWarehouse.listAppliedBlocks(offset, limit),
+    );
   }
+}
+
+function runExplorerRead<T>(warehouse: object, work: () => Promise<T>): Promise<T> {
+  return warehouse instanceof ClickHouseWarehouseAdapter ? warehouse.runExplorerRead(work) : work();
 }
 
 function combineAddressSummary(
@@ -3667,6 +3866,13 @@ function shouldValidateCorePrevouts(context: CoreDogecoinApplyContext | undefine
   }
 
   return context.validatePrevouts !== false;
+}
+
+async function runCoreWindowInsertStageHook(
+  context: CoreDogecoinApplyContext | undefined,
+  stage: CoreWindowInsertStage,
+): Promise<void> {
+  await context?.testHooks?.afterStage?.(stage);
 }
 
 function shouldUpdateCoreCurrentState(context: CoreDogecoinApplyContext | undefined): boolean {
@@ -4572,16 +4778,16 @@ function analyticsClickHouseSettings(limits: AnalyticsQueryLimits): ClickHouseCo
 
 function analyticsClickHouseCredentials(
   settings: WarehouseSettings,
-): { password?: string; user?: string } | undefined {
-  const credentials: { password?: string; user?: string } = {};
-  if (settings.analyticsUser) {
-    credentials.user = settings.analyticsUser;
+): { password: string; user: string } | null {
+  if (!settings.analyticsUser && !settings.analyticsPassword) {
+    return null;
   }
-  if (settings.analyticsPassword) {
-    credentials.password = settings.analyticsPassword;
+  if (!settings.analyticsUser || !settings.analyticsPassword) {
+    throw new InfrastructureError(
+      'analytics warehouse credentials must configure both ONLYDOGE_ANALYTICS_WAREHOUSE_USER and ONLYDOGE_ANALYTICS_WAREHOUSE_PASSWORD',
+    );
   }
-
-  return Object.keys(credentials).length > 0 ? credentials : undefined;
+  return { password: settings.analyticsPassword, user: settings.analyticsUser };
 }
 
 function analyticsQueryParamsRecord(params: AnalyticsQueryParams): Record<string, unknown> {
@@ -4852,264 +5058,8 @@ function coreBenchmarkBootstrapStatements(tables: CoreBenchmarkTables): string[]
   ];
 }
 
-const clickHouseWarehouseBootstrapStatements = [
-  `
-    CREATE TABLE IF NOT EXISTS ${utxoCurrentStateTable}
-    (
-      block_height UInt64,
-      block_hash String,
-      block_time UInt64,
-      txid String,
-      tx_index UInt64,
-      vout UInt64,
-      output_key String,
-      address String,
-      script_type String,
-      value_base String,
-      is_coinbase UInt8,
-      is_spendable UInt8,
-      spent_by_txid Nullable(String),
-      spent_in_block Nullable(UInt64),
-      spent_input_index Nullable(UInt64),
-      version UInt64
-    )
-    ENGINE = ReplacingMergeTree(version)
-    ORDER BY (output_key)
-    SETTINGS old_parts_lifetime = 0
-  `,
-  `
-    CREATE TABLE IF NOT EXISTS ${utxoCurrentStateByAddressTable}
-    (
-      block_height UInt64,
-      block_hash String,
-      block_time UInt64,
-      txid String,
-      tx_index UInt64,
-      vout UInt64,
-      output_key String,
-      address String,
-      script_type String,
-      value_base String,
-      is_coinbase UInt8,
-      is_spendable UInt8,
-      spent_by_txid Nullable(String),
-      spent_in_block Nullable(UInt64),
-      spent_input_index Nullable(UInt64),
-      version UInt64
-    )
-    ENGINE = ReplacingMergeTree(version)
-    ORDER BY (address, output_key)
-    SETTINGS old_parts_lifetime = 0
-  `,
-  `
-    CREATE MATERIALIZED VIEW IF NOT EXISTS ${utxoCurrentStateByAddressTable}_mv
-    TO ${utxoCurrentStateByAddressTable}
-    AS
-    SELECT
-      block_height,
-      block_hash,
-      block_time,
-      txid,
-      tx_index,
-      vout,
-      output_key,
-      address,
-      script_type,
-      value_base,
-      is_coinbase,
-      is_spendable,
-      spent_by_txid,
-      spent_in_block,
-      spent_input_index,
-      version
-    FROM ${utxoCurrentStateTable}
-  `,
-  `
-    CREATE TABLE IF NOT EXISTS ${addressMovementsTable}
-    (
-      movement_id String,
-      block_height UInt64,
-      block_hash String,
-      block_time UInt64,
-      txid String,
-      tx_index UInt64,
-      entry_index UInt64,
-      address String,
-      asset_address String,
-      direction String,
-      amount_base String,
-      output_key Nullable(String),
-      derivation_method String
-    )
-    ENGINE = MergeTree
-    ORDER BY (movement_id)
-  `,
-  `
-    CREATE TABLE IF NOT EXISTS ${addressMovementsByAddressTable}
-    (
-      movement_id String,
-      block_height UInt64,
-      block_hash String,
-      block_time UInt64,
-      txid String,
-      tx_index UInt64,
-      entry_index UInt64,
-      address String,
-      asset_address String,
-      direction String,
-      amount_base String,
-      amount_base_i256 Int256 MATERIALIZED toInt256(amount_base),
-      output_key Nullable(String),
-      derivation_method String
-    )
-    ENGINE = MergeTree
-    ORDER BY (address, block_height, tx_index, entry_index, movement_id)
-  `,
-  `
-    CREATE MATERIALIZED VIEW IF NOT EXISTS ${addressMovementsByAddressTable}_mv
-    TO ${addressMovementsByAddressTable}
-    AS
-    SELECT
-      movement_id,
-      block_height,
-      block_hash,
-      block_time,
-      txid,
-      tx_index,
-      entry_index,
-      address,
-      asset_address,
-      direction,
-      amount_base,
-      output_key,
-      derivation_method
-    FROM ${addressMovementsTable}
-  `,
-  `
-    CREATE TABLE IF NOT EXISTS ${balancesTable}
-    (
-      address String,
-      asset_address String,
-      balance String,
-      as_of_block_height UInt64,
-      version UInt64
-    )
-    ENGINE = ReplacingMergeTree(version)
-    ORDER BY (address, asset_address)
-  `,
-  `
-    CREATE TABLE IF NOT EXISTS ${appliedBlocksTable}
-    (
-      block_height UInt64,
-      block_hash String
-    )
-    ENGINE = MergeTree
-    ORDER BY (block_height, block_hash)
-  `,
-  `
-    CREATE TABLE IF NOT EXISTS ${coreUtxoCreatesTable}
-    (
-      block_height UInt64,
-      block_hash String,
-      block_time UInt64,
-      txid String,
-      tx_index UInt64,
-      vout UInt64,
-      output_key String,
-      address String,
-      script_type String,
-      value_base String,
-      is_coinbase UInt8,
-      is_spendable UInt8,
-      version UInt64
-    )
-    ENGINE = ReplacingMergeTree(version)
-    ORDER BY (output_key)
-  `,
-  `
-    ALTER TABLE ${coreUtxoCreatesTable}
-    ADD INDEX IF NOT EXISTS core_utxo_creates_address_idx address TYPE bloom_filter(0.01) GRANULARITY 4
-  `,
-  `
-    CREATE TABLE IF NOT EXISTS ${coreUtxoSpendsTable}
-    (
-      spent_output_key String,
-      spent_by_txid String,
-      spent_in_block UInt64,
-      spent_input_index UInt64,
-      version UInt64
-    )
-    ENGINE = ReplacingMergeTree(version)
-    ORDER BY (spent_output_key)
-  `,
-  `
-    CREATE TABLE IF NOT EXISTS ${coreProcessedBlocksTable}
-    (
-      block_height UInt64,
-      block_hash String,
-      block_time UInt64,
-      tx_count UInt64,
-      version UInt64
-    )
-    ENGINE = ReplacingMergeTree(version)
-    ORDER BY (block_height)
-  `,
-  `
-    CREATE TABLE IF NOT EXISTS ${analyticsTransactionsTable}
-    (
-      block_height UInt64,
-      block_hash String,
-      block_time UInt64,
-      txid String,
-      tx_index UInt64,
-      is_coinbase UInt8,
-      input_count UInt64,
-      output_count UInt64,
-      total_input_base String,
-      gross_output_base String,
-      fee_base Nullable(String),
-      total_input_base_i256 Int256 MATERIALIZED toInt256(total_input_base),
-      gross_output_base_i256 Int256 MATERIALIZED toInt256(gross_output_base),
-      fee_base_i256 Nullable(Int256) MATERIALIZED if(isNull(fee_base), NULL, toInt256(fee_base)),
-      version UInt64
-    )
-    ENGINE = ReplacingMergeTree(version)
-    ORDER BY (block_time, block_height, tx_index, txid)
-    SETTINGS old_parts_lifetime = 0
-  `,
-  `
-    CREATE TABLE IF NOT EXISTS analytics_balances_current_v1
-    (
-      address String,
-      asset_address String,
-      balance String,
-      balance_i256 Int256 MATERIALIZED toInt256(balance),
-      as_of_block_height UInt64,
-      version UInt64
-    )
-    ENGINE = ReplacingMergeTree(version)
-    ORDER BY (asset_address, balance_i256, address)
-    SETTINGS old_parts_lifetime = 0
-  `,
-  `
-    CREATE TABLE IF NOT EXISTS mempool_samples_v1
-    (
-      sampled_at DateTime,
-      txid String,
-      entry_time Nullable(UInt64),
-      height Nullable(UInt64),
-      size_bytes Nullable(UInt64),
-      fee_base Nullable(String),
-      fee_rate_base_per_kilobyte Nullable(String),
-      raw_json String
-    )
-    ENGINE = MergeTree
-    ORDER BY (sampled_at, txid)
-    TTL sampled_at + INTERVAL 1 HOUR
-  `,
-];
-
 const clickHouseDestructiveResetTables = [
+  'onlydoge_schema_migrations',
   `${utxoCurrentStateByAddressTable}_mv`,
   `${addressMovementsByAddressTable}_mv`,
   'applied_blocks',

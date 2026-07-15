@@ -35,11 +35,16 @@ export interface IndexerSettings extends CoreDogecoinIndexerSettings {}
 export interface DogecoinSettings {
   blockTime: number;
   chainId: number;
+  mempoolWatchCacheMaxTxids: number;
+  mempoolWatchRpcBatchSize: number;
+  mempoolWatchRpcConcurrency: number;
+  mempoolWatchRpcPollMs: number;
   mempoolRetentionSeconds: number;
   mempoolSampleIntervalMs: number;
   rpcEndpoint: string;
   rps: number;
   zmqBlockEndpoint?: string | null;
+  zmqTxEndpoint?: string | null;
 }
 
 export interface AppSettings {
@@ -86,6 +91,13 @@ function parseDogecoinSettings(env: NodeJS.ProcessEnv): DogecoinSettings {
   return {
     blockTime: parsePositiveInteger(env.ONLYDOGE_DOGECOIN_BLOCK_TIME, 60),
     chainId: parseNonNegativeInteger(env.ONLYDOGE_DOGECOIN_CHAIN_ID, 0),
+    mempoolWatchCacheMaxTxids: parsePositiveInteger(
+      env.ONLYDOGE_MEMPOOL_WATCH_CACHE_MAX_TXIDS,
+      100_000,
+    ),
+    mempoolWatchRpcBatchSize: parsePositiveInteger(env.ONLYDOGE_MEMPOOL_WATCH_RPC_BATCH_SIZE, 100),
+    mempoolWatchRpcConcurrency: parsePositiveInteger(env.ONLYDOGE_MEMPOOL_WATCH_RPC_CONCURRENCY, 4),
+    mempoolWatchRpcPollMs: parsePositiveInteger(env.ONLYDOGE_MEMPOOL_WATCH_RPC_POLL_MS, 1_000),
     mempoolRetentionSeconds: parsePositiveInteger(env.ONLYDOGE_MEMPOOL_RETENTION_SECONDS, 60 * 60),
     mempoolSampleIntervalMs: parsePositiveInteger(env.ONLYDOGE_MEMPOOL_SAMPLE_INTERVAL_MS, 15_000),
     rpcEndpoint: resolveSettingsValue(
@@ -95,6 +107,8 @@ function parseDogecoinSettings(env: NodeJS.ProcessEnv): DogecoinSettings {
     ),
     rps: parsePositiveInteger(env.ONLYDOGE_DOGECOIN_RPC_RPS, 25),
     zmqBlockEndpoint: env.ONLYDOGE_DOGECOIN_ZMQ_BLOCK_ENDPOINT ?? null,
+    zmqTxEndpoint:
+      env.ONLYDOGE_DOGECOIN_ZMQ_TX_ENDPOINT ?? env.ONLYDOGE_DOGECOIN_ZMQ_BLOCK_ENDPOINT ?? null,
   };
 }
 
@@ -469,6 +483,10 @@ function parseIndexerSettings(env: NodeJS.ProcessEnv): IndexerSettings {
     coreRawStorageTimeoutMs: parsePositiveInteger(env.ONLYDOGE_CORE_RAW_STORAGE_TIMEOUT_MS, 30_000),
     coreReprocessDepth: parsePositiveInteger(env.ONLYDOGE_CORE_REPROCESS_DEPTH, 10),
     coreSyncCompleteDistance: parsePositiveInteger(env.ONLYDOGE_CORE_SYNC_COMPLETE_DISTANCE, 6),
+    leaseHeartbeatIntervalMs: parsePositiveInteger(
+      env.ONLYDOGE_INDEXER_LEASE_HEARTBEAT_INTERVAL_MS,
+      5_000,
+    ),
     syncWindow: parsePositiveInteger(env.ONLYDOGE_INDEXER_SYNC_WINDOW, 32),
     syncConcurrency: parsePositiveInteger(env.ONLYDOGE_INDEXER_SYNC_CONCURRENCY, 4),
   };

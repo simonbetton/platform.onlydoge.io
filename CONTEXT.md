@@ -56,6 +56,14 @@ _Avoid_: Transfer value, sent amount, economic value
 A guarded read-only ClickHouse query generated for the AI chat application against OnlyDoge's curated analytics schema. An AI analytics query is not free-form access to internal warehouse tables.
 _Avoid_: Raw SQL endpoint, warehouse mutation, admin SQL
 
+**Mempool watch session**:
+A short-lived, API-key-authenticated wait for unconfirmed funds to one Dogecoin address. One API key may hold at most five concurrent mempool watch sessions; each session ends on the first qualifying mempool appear or after five minutes.
+_Avoid_: Subscription, webhook, persistent watchlist, address alert
+
+**Mempool appear**:
+The event that a watched address is present as a receiving output in a mempool transaction, optionally meeting a minimum output value. A mempool appear is not confirmation and does not cover spends from the address.
+_Avoid_: Payment confirmed, deposit settled, address activity
+
 ## Example Dialogue
 
 Developer: "Should we rate limit the user?"
@@ -69,3 +77,6 @@ Domain expert: "No. Sent amount comes from resolved spends of previous outputs c
 
 Developer: "Can a balance row be trusted by itself?"
 Domain expert: "Only if it agrees with the current UTXO set for the same address."
+
+Developer: "How do I get notified when payment hits an address in the mempool?"
+Domain expert: "Open one mempool watch session for that address. You get a mempool appear when receiving outputs show up, then the session ends."

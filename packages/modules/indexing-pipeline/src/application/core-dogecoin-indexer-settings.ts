@@ -8,6 +8,7 @@ export interface CoreDogecoinIndexerSettings {
   coreRawStorageTimeoutMs: number;
   coreReprocessDepth: number;
   coreSyncCompleteDistance: number;
+  leaseHeartbeatIntervalMs: number;
   syncConcurrency: number;
   syncWindow: number;
 }

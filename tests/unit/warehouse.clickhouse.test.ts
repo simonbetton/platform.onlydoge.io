@@ -1,5 +1,9 @@
 import type { CoreDogecoinBlockApplication } from '@onlydoge/indexing-pipeline';
-import { ClickHouseWarehouseAdapter } from '@onlydoge/platform';
+import {
+  ClickHouseWarehouseAdapter,
+  CompositeWarehouseAdapter,
+  clickHouseMigrations,
+} from '@onlydoge/platform';
 import { InfrastructureError } from '@onlydoge/shared-kernel';
 import { describe, expect, it, vi } from 'vitest';
 
@@ -10,6 +14,57 @@ interface ClickHouseCommandCall {
 }
 
 describe('clickhouse warehouse adapter', () => {
+  it('applies explorer query budgets without changing indexer reads', async () => {
+    const adapter = new ClickHouseWarehouseAdapter({
+      driver: 'clickhouse',
+      location: 'http://clickhouse:8123',
+    });
+    const query = vi.fn(async (_parameters: ClickHouseCommandCall) => ({
+      json: async () => [],
+    }));
+    (adapter as unknown as { client: { query: typeof query } }).client = {
+      query,
+    };
+    const explorer = new CompositeWarehouseAdapter(adapter, adapter);
+
+    await explorer.listAppliedBlocks(0, 50);
+    expect(query.mock.calls[0]?.[0].clickhouse_settings).toEqual({
+      max_execution_time: 30,
+      max_rows_to_read: '10000000',
+      max_bytes_to_read: '1073741824',
+      max_result_rows: '100000',
+      result_overflow_mode: 'throw',
+      timeout_before_checking_execution_speed: 0,
+    });
+
+    await adapter.listAppliedBlocks(0, 50);
+    expect(query.mock.calls[1]?.[0].clickhouse_settings).toBeUndefined();
+  });
+
+  it('does not fall back to primary credentials for analytics queries', () => {
+    const adapter = new ClickHouseWarehouseAdapter({
+      driver: 'clickhouse',
+      location: 'http://clickhouse:8123',
+      user: 'primary',
+      password: 'primary-secret',
+    });
+
+    expect((adapter as unknown as { analyticsClient: unknown }).analyticsClient).toBeNull();
+  });
+
+  it('rejects an incomplete analytics credential pair', () => {
+    expect(
+      () =>
+        new ClickHouseWarehouseAdapter({
+          driver: 'clickhouse',
+          location: 'http://clickhouse:8123',
+          user: 'primary',
+          password: 'primary-secret',
+          analyticsUser: 'analytics',
+        }),
+    ).toThrow(/both ONLYDOGE_ANALYTICS_WAREHOUSE_USER and ONLYDOGE_ANALYTICS_WAREHOUSE_PASSWORD/u);
+  });
+
   it('surfaces warehouse connection failures as infrastructure errors', async () => {
     const adapter = new ClickHouseWarehouseAdapter({
       driver: 'clickhouse',
@@ -21,7 +76,9 @@ describe('clickhouse warehouse adapter', () => {
       throw error;
     });
 
-    (adapter as unknown as { client: { query: typeof query } }).client = { query };
+    (adapter as unknown as { client: { query: typeof query } }).client = {
+      query,
+    };
 
     await expect(adapter.listAppliedBlocks(7)).rejects.toEqual(
       new InfrastructureError('warehouse unavailable', {
@@ -41,7 +98,9 @@ describe('clickhouse warehouse adapter', () => {
       throw error;
     });
 
-    (adapter as unknown as { client: { query: typeof query } }).client = { query };
+    (adapter as unknown as { client: { query: typeof query } }).client = {
+      query,
+    };
 
     await expect(adapter.listAppliedBlocks(7)).rejects.toEqual(
       new InfrastructureError('warehouse query exceeded memory limit', {
@@ -68,7 +127,9 @@ describe('clickhouse warehouse adapter', () => {
       },
     );
 
-    (adapter as unknown as { client: { query: typeof query } }).client = { query };
+    (adapter as unknown as { client: { query: typeof query } }).client = {
+      query,
+    };
 
     await expect(
       adapter.listCurrentBalancesPage(null, 5000, {
@@ -99,7 +160,9 @@ describe('clickhouse warehouse adapter', () => {
         }),
     );
 
-    (adapter as unknown as { client: { query: typeof query } }).client = { query };
+    (adapter as unknown as { client: { query: typeof query } }).client = {
+      query,
+    };
 
     await expect(
       adapter.listCurrentBalancesPage(null, 5000, {
@@ -133,7 +196,9 @@ describe('clickhouse warehouse adapter', () => {
       }),
     );
 
-    (adapter as unknown as { client: { query: typeof query } }).client = { query };
+    (adapter as unknown as { client: { query: typeof query } }).client = {
+      query,
+    };
 
     const outputKeys = Array.from(
       { length: 400 },
@@ -307,7 +372,9 @@ describe('clickhouse warehouse adapter', () => {
       return { json: async () => [] };
     });
 
-    (adapter as unknown as { client: { query: typeof query } }).client = { query };
+    (adapter as unknown as { client: { query: typeof query } }).client = {
+      query,
+    };
 
     const rows = await adapter.listAddressUtxos('DInputAddress', 0, 50);
     const statements = query.mock.calls.map(([parameters]) => parameters.query);
@@ -363,7 +430,9 @@ describe('clickhouse warehouse adapter', () => {
 
       return { json: async () => [] };
     });
-    (adapter as unknown as { client: { query: typeof query } }).client = { query };
+    (adapter as unknown as { client: { query: typeof query } }).client = {
+      query,
+    };
 
     const rows = await adapter.getUtxoOutputs(['prev-txid:1']);
 
@@ -424,7 +493,9 @@ describe('clickhouse warehouse adapter', () => {
       return { json: async () => [] };
     });
 
-    (adapter as unknown as { client: { query: typeof query } }).client = { query };
+    (adapter as unknown as { client: { query: typeof query } }).client = {
+      query,
+    };
 
     const rows = await adapter.getUtxoOutputs(['prev-txid:1']);
     const statements = query.mock.calls.map(([parameters]) => parameters.query);
@@ -475,7 +546,9 @@ describe('clickhouse warehouse adapter', () => {
       return { json: async () => [] };
     });
 
-    (adapter as unknown as { client: { query: typeof query } }).client = { query };
+    (adapter as unknown as { client: { query: typeof query } }).client = {
+      query,
+    };
 
     const rows = await adapter.getCreatedUtxoOutputs(['prev-txid:1']);
     const statements = query.mock.calls.map(([parameters]) => parameters.query);
@@ -493,13 +566,13 @@ describe('clickhouse warehouse adapter', () => {
     expect(statements[0]).not.toContain('spent_by_txid');
   });
 
-  it('uses core Dogecoin output-key index first for transaction refs', async () => {
+  it('uses indexed transaction refs before core output-key lookup', async () => {
     const adapter = new ClickHouseWarehouseAdapter({
       driver: 'clickhouse',
       location: 'http://clickhouse:8123',
     });
     const query = vi.fn(async ({ query: statement }: { query: string }) => {
-      if (statement.includes('FROM dogecoin_core_utxo_creates_v1')) {
+      if (statement.includes('FROM dogecoin_transaction_refs_v1')) {
         return {
           json: async () => [
             {
@@ -512,14 +585,16 @@ describe('clickhouse warehouse adapter', () => {
         };
       }
 
-      if (statement.includes('FROM dogecoin_utxo_outputs_current_v1')) {
-        throw new Error('current-state txid scan should not run before the core output-key lookup');
+      if (statement.includes('FROM dogecoin_core_utxo_creates_v1')) {
+        throw new Error('core output-key lookup should not run when indexed refs hit');
       }
 
       return { json: async () => [] };
     });
 
-    (adapter as unknown as { client: { query: typeof query } }).client = { query };
+    (adapter as unknown as { client: { query: typeof query } }).client = {
+      query,
+    };
 
     const ref = await adapter.getTransactionRef('doge-txid');
     const statements = query.mock.calls.map(([parameters]) => parameters.query);
@@ -530,23 +605,19 @@ describe('clickhouse warehouse adapter', () => {
       blockTime: 456,
       txIndex: 7,
     });
-    expect(statements[0]).toContain('FROM dogecoin_core_utxo_creates_v1');
-    expect(
-      statements.some(
-        (statement) =>
-          statement.includes('FROM dogecoin_core_utxo_creates_v1') &&
-          statement.includes('output_key >= {prefix:String}') &&
-          statement.includes('output_key < {prefixEnd:String}'),
-      ),
-    ).toBe(true);
+    expect(statements[0]).toContain('FROM dogecoin_transaction_refs_v1');
   });
 
-  it('falls back to current UTXO state for transaction refs missing from core outputs', async () => {
+  it('falls back to core and current UTXO state when indexed refs miss', async () => {
     const adapter = new ClickHouseWarehouseAdapter({
       driver: 'clickhouse',
       location: 'http://clickhouse:8123',
     });
     const query = vi.fn(async ({ query: statement }: { query: string }) => {
+      if (statement.includes('FROM dogecoin_transaction_refs_v1')) {
+        return { json: async () => [] };
+      }
+
       if (statement.includes('FROM dogecoin_core_utxo_creates_v1')) {
         return { json: async () => [] };
       }
@@ -567,7 +638,9 @@ describe('clickhouse warehouse adapter', () => {
       return { json: async () => [] };
     });
 
-    (adapter as unknown as { client: { query: typeof query } }).client = { query };
+    (adapter as unknown as { client: { query: typeof query } }).client = {
+      query,
+    };
 
     const ref = await adapter.getTransactionRef('doge-txid');
     const statements = query.mock.calls.map(([parameters]) => parameters.query);
@@ -578,77 +651,35 @@ describe('clickhouse warehouse adapter', () => {
       blockTime: 654,
       txIndex: 9,
     });
-    expect(statements[0]).toContain('FROM dogecoin_core_utxo_creates_v1');
-    expect(statements[1]).toContain('FROM dogecoin_utxo_outputs_current_v1');
+    expect(statements[0]).toContain('FROM dogecoin_transaction_refs_v1');
+    expect(statements[1]).toContain('FROM dogecoin_core_utxo_creates_v1');
+    expect(statements[2]).toContain('FROM dogecoin_utxo_outputs_current_v1');
   });
 
-  it('boots clickhouse with address-oriented read models and backfills them once', async () => {
-    const adapter = new ClickHouseWarehouseAdapter({
-      driver: 'clickhouse',
-      location: 'http://clickhouse:8123',
-    });
-    const command = vi.fn(async () => undefined);
-    const query = vi.fn(async () => ({ json: async () => [] }));
+  it('defines ordered checksummed schema and read-model migrations', () => {
+    const migrations = clickHouseMigrations();
 
-    (
-      adapter as unknown as {
-        client: {
-          command: typeof command;
-          query: typeof query;
-        };
-      }
-    ).client = {
-      command,
-      query,
-    };
-
-    await adapter.boot();
-
-    const statements = command.mock.calls.map(
-      (call) => (call as Array<{ query: string }>).at(0)?.query ?? '',
+    expect(migrations.map(({ name, version }) => ({ name, version }))).toEqual([
+      { name: 'canonical_schema', version: 1 },
+      { name: 'address_read_models_backfill', version: 2 },
+      { name: 'transaction_refs_table', version: 3 },
+    ]);
+    expect(migrations.every((migration) => migration.checksum.length === 64)).toBe(true);
+    expect(migrations[0]?.source).toContain(
+      'CREATE MATERIALIZED VIEW IF NOT EXISTS dogecoin_utxo_outputs_current_by_address_v1_mv',
     );
-
-    expect(
-      statements.some((statement) =>
-        statement.includes(
-          'CREATE TABLE IF NOT EXISTS dogecoin_utxo_outputs_current_by_address_v1',
-        ),
-      ),
-    ).toBe(true);
-    expect(
-      statements.some((statement) =>
-        statement.includes(
-          'CREATE MATERIALIZED VIEW IF NOT EXISTS dogecoin_utxo_outputs_current_by_address_v1_mv',
-        ),
-      ),
-    ).toBe(true);
-    expect(
-      statements.some((statement) =>
-        statement.includes('CREATE TABLE IF NOT EXISTS dogecoin_address_movements_by_address_v1'),
-      ),
-    ).toBe(true);
-    expect(
-      statements.some((statement) =>
-        statement.includes(
-          'CREATE MATERIALIZED VIEW IF NOT EXISTS dogecoin_address_movements_by_address_v1_mv',
-        ),
-      ),
-    ).toBe(true);
-    expect(
-      statements.some((statement) =>
-        statement.includes('INSERT INTO dogecoin_utxo_outputs_current_by_address_v1'),
-      ),
-    ).toBe(true);
-    expect(
-      statements.some((statement) =>
-        statement.includes('INSERT INTO dogecoin_address_movements_by_address_v1'),
-      ),
-    ).toBe(true);
-    expect(
-      statements.some((statement) =>
-        statement.includes('ADD INDEX IF NOT EXISTS core_utxo_creates_address_idx'),
-      ),
-    ).toBe(true);
+    expect(migrations[0]?.source).toContain(
+      'CREATE MATERIALIZED VIEW IF NOT EXISTS dogecoin_address_movements_by_address_v1_mv',
+    );
+    expect(migrations[0]?.source).toContain(
+      'ADD INDEX IF NOT EXISTS core_utxo_creates_address_idx',
+    );
+    expect(migrations[1]?.source).toContain(
+      'LEFT ANTI JOIN dogecoin_utxo_outputs_current_by_address_v1',
+    );
+    expect(migrations[1]?.source).toContain(
+      'LEFT ANTI JOIN dogecoin_address_movements_by_address_v1',
+    );
   });
 
   it('uses address-oriented movement reads with a precomputed integer amount column', async () => {
@@ -704,6 +735,12 @@ describe('clickhouse warehouse adapter', () => {
               txIndex: 2,
               receivedBase: '11',
               sentBase: '0',
+              isCoinbase: 0,
+              inputCount: 1,
+              outputCount: 1,
+              totalInputBase: '0',
+              totalOutputBase: '11',
+              feeBase: null,
             },
           ],
         };
@@ -712,7 +749,9 @@ describe('clickhouse warehouse adapter', () => {
       return { json: async () => [] };
     });
 
-    (adapter as unknown as { client: { query: typeof query } }).client = { query };
+    (adapter as unknown as { client: { query: typeof query } }).client = {
+      query,
+    };
 
     const rows = await adapter.listAddressTransactions('DInputAddress', 0, 5);
     const statements = query.mock.calls.map(([parameters]) => parameters.query);
@@ -724,10 +763,12 @@ describe('clickhouse warehouse adapter', () => {
     });
     expect(
       statements.some((statement) =>
-        statement.includes('ORDER BY block_height DESC, tx_index DESC, txid DESC'),
+        statement.includes('ORDER BY movements.block_height DESC, movements.tx_index DESC'),
       ),
     ).toBe(true);
-    expect(statements.some((statement) => statement.includes('address_outputs AS'))).toBe(false);
+    expect(statements.some((statement) => statement.includes('analytics_transactions_v1'))).toBe(
+      true,
+    );
   });
 
   it('appends core Dogecoin create, spend, and processed-block rows by window', async () => {
@@ -999,7 +1040,11 @@ describe('clickhouse warehouse adapter', () => {
             creates: ['new-tx:0'],
           }),
         ],
-        { updateCurrentState: true, validatePrevouts: false, statementTimeoutMs: 30000 },
+        {
+          updateCurrentState: true,
+          validatePrevouts: false,
+          statementTimeoutMs: 30000,
+        },
       ),
     ).resolves.toEqual({
       applied: true,
@@ -1136,7 +1181,11 @@ describe('clickhouse warehouse adapter', () => {
             creates: ['new-tx:0'],
           }),
         ],
-        { updateCurrentState: true, validatePrevouts: false, statementTimeoutMs: 30000 },
+        {
+          updateCurrentState: true,
+          validatePrevouts: false,
+          statementTimeoutMs: 30000,
+        },
       ),
     ).resolves.toEqual({
       applied: true,
@@ -1167,7 +1216,12 @@ describe('clickhouse warehouse adapter', () => {
     expect(insert).toHaveBeenCalledWith(
       expect.objectContaining({
         table: 'dogecoin_core_processed_blocks_v1',
-        values: [expect.objectContaining({ block_hash: 'new-block-2', block_height: 2 })],
+        values: [
+          expect.objectContaining({
+            block_hash: 'new-block-2',
+            block_height: 2,
+          }),
+        ],
       }),
     );
   });
@@ -1175,7 +1229,9 @@ describe('clickhouse warehouse adapter', () => {
   it('materializes core Dogecoin current state in bounded output-key ranges', async () => {
     const { adapter, command } = installEmptyClickHouseClient();
 
-    await adapter.materializeCoreDogecoinCurrentState(25, { statementTimeoutMs: 30000 });
+    await adapter.materializeCoreDogecoinCurrentState(25, {
+      statementTimeoutMs: 30000,
+    });
 
     const commands = command.mock.calls.map(([parameters]) => parameters);
     const statements = commands.map((parameters) => parameters.query);
@@ -1286,8 +1342,16 @@ function coreApplication(input: {
 }
 
 function addressSummaryAdapter(input: {
-  addressMovementRows: Array<{ receivedBase: string; sentBase: string; txCount: number }>;
-  coreMovementRows?: Array<{ receivedBase: string; sentBase: string; txCount: number }>;
+  addressMovementRows: Array<{
+    receivedBase: string;
+    sentBase: string;
+    txCount: number;
+  }>;
+  coreMovementRows?: Array<{
+    receivedBase: string;
+    sentBase: string;
+    txCount: number;
+  }>;
   coreSpendableRows?: Array<{ balance: string; utxoCount: number }>;
 }) {
   const adapter = new ClickHouseWarehouseAdapter({
@@ -1321,7 +1385,9 @@ function addressSummaryAdapter(input: {
     return jsonRows([]);
   });
 
-  (adapter as unknown as { client: { query: typeof query } }).client = { query };
+  (adapter as unknown as { client: { query: typeof query } }).client = {
+    query,
+  };
   return { adapter, query };
 }
 
@@ -1388,7 +1454,11 @@ function installClickHouseClient(
   const command = vi.fn(async (_parameters: ClickHouseCommandCall) => undefined);
   (
     adapter as unknown as {
-      client: { command: typeof command; insert: typeof insert; query: typeof query };
+      client: {
+        command: typeof command;
+        insert: typeof insert;
+        query: typeof query;
+      };
     }
   ).client = {
     command,

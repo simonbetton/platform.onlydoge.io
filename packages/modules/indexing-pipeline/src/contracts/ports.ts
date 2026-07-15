@@ -16,6 +16,7 @@ import type {
 } from '../domain/projection-models';
 
 export interface CoordinatorConfigPort {
+  compareAndDeleteJsonValue<T>(key: string, expectedValue: T): Promise<boolean>;
   compareAndSwapJsonValue<T>(key: string, expectedValue: T | null, nextValue: T): Promise<boolean>;
   deleteByPrefix(prefix: string): Promise<void>;
   getJsonValue<T>(key: string): Promise<T | null>;
@@ -67,9 +68,24 @@ export interface CoreDogecoinStateStorePort {
     asOfBlockHeight: number,
     context?: CoreDogecoinApplyContext,
   ): Promise<void>;
+  recoverCoreDogecoinWindow(
+    fromBlockHeight: number,
+    context?: CoreDogecoinApplyContext,
+  ): Promise<void>;
   setCoreIndexerError(error: string | null): Promise<void>;
   setCoreIndexerStage(stage: CoreIndexerStage): Promise<void>;
   upsertCoreBlock(record: CoreBlockRecord): Promise<void>;
+  upsertTransactionRefs(
+    refs: Array<{
+      blockHash: string;
+      blockHeight: number;
+      blockTime: number;
+      source: 'raw_sync' | 'core_process';
+      txIndex: number;
+      txid: string;
+      version: number;
+    }>,
+  ): Promise<void>;
   upsertCoreIndexerState(input: {
     lastError?: string | null;
     onlineTip?: number;
@@ -79,11 +95,42 @@ export interface CoreDogecoinStateStorePort {
   }): Promise<CoreIndexerState>;
 }
 
+export type CoreWindowInsertStage =
+  | 'creates'
+  | 'spends'
+  | 'movements'
+  | 'transactions'
+  | 'current_state'
+  | 'processed_blocks';
+
 export interface CoreDogecoinApplyContext {
   abortSignal?: AbortSignal;
   statementTimeoutMs?: number;
+  testHooks?: {
+    afterStage?: (stage: CoreWindowInsertStage) => void | Promise<void>;
+  };
   updateCurrentState?: boolean;
   validatePrevouts?: boolean;
+}
+
+export interface TransactionRefWarehousePort {
+  getTransactionRef(txid: string): Promise<{
+    blockHash: string;
+    blockHeight: number;
+    blockTime: number;
+    txIndex: number;
+  } | null>;
+  upsertTransactionRefs(
+    refs: Array<{
+      blockHash: string;
+      blockHeight: number;
+      blockTime: number;
+      source: 'raw_sync' | 'core_process';
+      txIndex: number;
+      txid: string;
+      version: number;
+    }>,
+  ): Promise<void>;
 }
 
 export interface BlockchainRpcPort {

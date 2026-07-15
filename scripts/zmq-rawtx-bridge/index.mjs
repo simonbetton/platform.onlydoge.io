@@ -4,7 +4,7 @@
  * Bun cannot load native zeromq; run this under Node and pipe hex lines to stdout.
  *
  * Usage: node scripts/zmq-rawtx-bridge/index.mjs tcp://dogecoin:28332
- * Install: cd scripts/zmq-rawtx-bridge && npm install
+ * Install: npm ci --omit=dev --prefix scripts/zmq-rawtx-bridge
  */
 import { createRequire } from 'node:module';
 
@@ -20,7 +20,9 @@ let zmq;
 try {
   zmq = require('zeromq');
 } catch (error) {
-  console.error('zeromq is not installed. Run: cd scripts/zmq-rawtx-bridge && npm install');
+  console.error(
+    'zeromq is not installed. Run: npm ci --omit=dev --prefix scripts/zmq-rawtx-bridge',
+  );
   console.error(error);
   process.exit(1);
 }

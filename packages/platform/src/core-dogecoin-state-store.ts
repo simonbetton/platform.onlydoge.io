@@ -23,6 +23,21 @@ export interface ClickHouseCoreDogecoinStore {
     asOfBlockHeight: number,
     context?: CoreDogecoinApplyContext,
   ): Promise<void>;
+  recoverCoreDogecoinWindow(
+    fromBlockHeight: number,
+    context?: CoreDogecoinApplyContext,
+  ): Promise<void>;
+  upsertTransactionRefs(
+    refs: Array<{
+      blockHash: string;
+      blockHeight: number;
+      blockTime: number;
+      source: 'raw_sync' | 'core_process';
+      txIndex: number;
+      txid: string;
+      version: number;
+    }>,
+  ): Promise<void>;
 }
 
 export function isClickHouseCoreDogecoinStore(
@@ -38,6 +53,8 @@ const clickHouseCoreDogecoinStoreMethods = [
   'applyCoreDogecoinWindow',
   'getUtxoOutputs',
   'materializeCoreDogecoinCurrentState',
+  'recoverCoreDogecoinWindow',
+  'upsertTransactionRefs',
 ] as const;
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -85,6 +102,24 @@ export class ClickHouseCoreDogecoinStateStore implements CoreDogecoinStateStoreP
       this.metadata.setJsonValue(configKeyDogecoinCurrentStateReady(), true),
       this.metadata.setJsonValue(configKeyDogecoinHistoryReady(), false),
     ]);
+  }
+
+  public recoverCoreDogecoinWindow(fromBlockHeight: number, context?: CoreDogecoinApplyContext) {
+    return this.clickhouse.recoverCoreDogecoinWindow(fromBlockHeight, context);
+  }
+
+  public upsertTransactionRefs(
+    refs: Array<{
+      blockHash: string;
+      blockHeight: number;
+      blockTime: number;
+      source: 'raw_sync' | 'core_process';
+      txIndex: number;
+      txid: string;
+      version: number;
+    }>,
+  ) {
+    return this.clickhouse.upsertTransactionRefs(refs);
   }
 
   public setCoreIndexerError(error: string | null) {

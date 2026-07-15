@@ -66,6 +66,19 @@ describe('deploy config', () => {
     );
   });
 
+  it.each([
+    'ONLYDOGE_ANALYTICS_WAREHOUSE_USER',
+    'ONLYDOGE_ANALYTICS_WAREHOUSE_PASSWORD',
+  ] as const)('rejects a missing or empty %s', (key) => {
+    const missing = canonicalEnv();
+    delete missing[key];
+    expect(() => createDeployConfig(deployConfigInput(missing))).toThrow(key);
+
+    const empty = canonicalEnv();
+    empty[key] = '';
+    expect(() => createDeployConfig(deployConfigInput(empty))).toThrow(key);
+  });
+
   it('ignores non-canonical deploy env keys', () => {
     const env = {
       ...canonicalEnv(),
@@ -141,6 +154,8 @@ function deployConfigInput(fileValues: Record<string, string>) {
 
 function canonicalEnv(): Record<string, string> {
   return {
+    ONLYDOGE_ANALYTICS_WAREHOUSE_PASSWORD: 'analytics-secret',
+    ONLYDOGE_ANALYTICS_WAREHOUSE_USER: 'onlydoge_analytics',
     ONLYDOGE_CORE_BLOCK_TIMEOUT_MS: '120000',
     ONLYDOGE_DATABASE: 'postgres://onlydoge:secret@db/onlydoge',
     ONLYDOGE_DOGECOIN_RPC_ENDPOINT: 'http://rpc-user:rpc-password@dogecoin-rpc:22555/',

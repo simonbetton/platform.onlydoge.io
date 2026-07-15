@@ -1,5 +1,7 @@
 import { randomUUID } from 'node:crypto';
 
+import { noopServiceLogger, type ServiceLogger } from '@onlydoge/shared-kernel';
+
 import type {
   BlockchainRpcPort,
   CoordinatorConfigPort,
@@ -10,10 +12,13 @@ import type {
 import { fromDecimalUnits } from '../domain/amounts';
 import {
   configKeyBlockHeight,
+  configKeyCoreApplyRecovery,
   configKeyDogecoinAnalyticsFactsReady,
   configKeyDogecoinAnalyticsFactsTail,
   configKeyDogecoinCurrentStateReady,
   configKeyDogecoinHistoryReady,
+  configKeyDogecoinTransactionRefsBackfillTail,
+  configKeyDogecoinTransactionRefsReady,
   configKeyIndexerFactProgress,
   configKeyIndexerFactTail,
   configKeyIndexerFinalizedTail,
@@ -25,6 +30,11 @@ import {
   configKeyIndexerSyncTail,
   configKeyPrimary,
 } from '../domain/config-keys';
+import {
+  type CoreApplyRecoveryMarkerV1,
+  createCoreApplyRecoveryMarker,
+  parseCoreApplyRecoveryMarker,
+} from '../domain/core-apply-recovery';
 import {
   type DogecoinTransaction,
   type DogecoinVin,
@@ -39,6 +49,7 @@ import type {
   CoreIndexerState,
   ProjectionUtxoOutput,
 } from '../domain/projection-models';
+import { deriveTransactionRefsFromBlock, type TransactionRef } from '../domain/transaction-ref';
 import { mapWithConcurrency, range } from './concurrency';
 import type { CoreDogecoinIndexerSettings } from './core-dogecoin-indexer-settings';
 
@@ -49,6 +60,7 @@ interface PrimaryLease {
 
 export interface CoreDogecoinIndexerServiceOptions {
   exitProcess?: (code: number) => never;
+  logger?: ServiceLogger;
 }
 
 interface DogecoinRuntimeConfig {
@@ -61,7 +73,6 @@ interface DogecoinRuntimeConfig {
 }
 
 const workerIdleMs = 250;
-const leaseTimeoutMs = 15_000;
 const rawBlockPart = 'block';
 
 interface ProgressObservation {
@@ -129,9 +140,17 @@ class CoreBlockTimeoutError extends Error {
   }
 }
 
+class PrimaryLeaseLostError extends Error {
+  public constructor() {
+    super('core indexer primary lease lost');
+  }
+}
+
 export class CoreDogecoinIndexerService {
   private readonly instanceId = randomUUID();
+  private readonly logger: ServiceLogger;
   private activeBlockAttempt: CoreBlockAttempt | null = null;
+  private primaryLease: PrimaryLease | null = null;
   private progressObservation: ProgressObservation | null = null;
 
   public constructor(
@@ -142,11 +161,16 @@ export class CoreDogecoinIndexerService {
     private readonly stateStore: CoreDogecoinStateStorePort,
     private readonly settings: CoreDogecoinIndexerSettings,
     private readonly options: CoreDogecoinIndexerServiceOptions = {},
-  ) {}
+  ) {
+    this.logger = options.logger ?? noopServiceLogger();
+  }
 
   // fallow-ignore-next-line unused-class-member
   public async start(signal?: AbortSignal): Promise<void> {
-    console.info('[onlydoge] core dogecoin indexer loop started');
+    this.logger.info(
+      { component: 'core-indexer', instanceId: this.instanceId },
+      'indexer loop started',
+    );
     while (shouldContinueStartLoop(signal)) {
       await this.runStartLoopIteration();
     }
@@ -157,39 +181,31 @@ export class CoreDogecoinIndexerService {
       return false;
     }
 
-    return this.runDogecoin();
+    return this.runWithPrimaryLeaseHeartbeat(() => this.runDogecoin());
   }
 
   private async runStartLoopIteration(): Promise<void> {
     try {
       await this.runPrimaryLoopWork();
     } catch (error) {
-      console.error(`[onlydoge] core indexer loop failed error=${formatError(error)}`);
+      this.logger.error(this.errorBindings(error), 'core indexer loop failed');
       await sleep(1_000);
     }
   }
 
   private async runPrimaryLoopWork(): Promise<void> {
-    const idleMs = await this.primaryLoopIdleMs();
-    if (idleMs !== null) {
-      await sleep(idleMs);
-    }
-  }
-
-  private async primaryLoopIdleMs(): Promise<number | null> {
     if (!(await this.leaseLeadership())) {
-      return 1_000;
+      await sleep(1_000);
+      return;
     }
 
-    return this.dogecoinWorkIdleMs();
-  }
-
-  private async dogecoinWorkIdleMs(): Promise<number | null> {
-    if (await this.runOnce()) {
-      return null;
-    }
-
-    return workerIdleMs;
+    await this.runWithPrimaryLeaseHeartbeat(async () => {
+      const didWork = await this.runDogecoin();
+      if (!didWork) {
+        await sleep(workerIdleMs);
+      }
+      return didWork;
+    });
   }
 
   private async runDogecoin(): Promise<boolean> {
@@ -199,15 +215,21 @@ export class CoreDogecoinIndexerService {
 
   private async runDogecoinConfig(dogecoin: DogecoinRuntimeConfig): Promise<boolean> {
     const latest = await this.rpc.getBlockHeight(dogecoin);
-    await this.configs.setJsonValue(configKeyBlockHeight(), latest);
-
-    const state = await this.ensureState(dogecoin, latest);
-    await this.publishProgress(latest, state);
-    await this.assertProgressWatchdog(dogecoin, latest, state);
+    this.assertPrimaryLease();
 
     try {
+      await this.recoverPendingCoreApplyIfNeeded(dogecoin);
+      await this.backfillTransactionRefsIfNeeded(dogecoin);
+      await this.configs.setJsonValue(configKeyBlockHeight(), latest);
+
+      const state = await this.ensureState(dogecoin, latest);
+      await this.publishProgress(latest, state);
+      await this.assertProgressWatchdog(dogecoin, latest, state);
       return await this.runDogecoinStage(dogecoin, latest, state);
     } catch (error) {
+      if (error instanceof PrimaryLeaseLostError) {
+        throw error;
+      }
       await this.stateStore.setCoreIndexerError(formatError(error));
       throw error;
     }
@@ -244,8 +266,15 @@ export class CoreDogecoinIndexerService {
       onlineTip: latest,
       lastError: null,
     });
-    console.info(
-      `[onlydoge] core indexer initialized chain=${dogecoin.id} stage=sync_backfill sync_tail=${syncTail} process_tail=-1`,
+    this.logger.info(
+      {
+        chain: dogecoin.id,
+        component: 'core-indexer',
+        processTail: -1,
+        stage: 'sync_backfill',
+        syncTail,
+      },
+      'core indexer initialized',
     );
     return state;
   }
@@ -266,8 +295,15 @@ export class CoreDogecoinIndexerService {
         onlineTip: latest,
       });
       await this.configs.setJsonValue(configKeyIndexerStage(), 'process_backfill');
-      console.info(
-        `[onlydoge] core stage changed chain=${dogecoin.id} stage=process_backfill sync_tail=${state.syncTail} latest=${latest}`,
+      this.logger.info(
+        {
+          chain: dogecoin.id,
+          component: 'core-indexer',
+          latest,
+          stage: 'process_backfill',
+          syncTail: state.syncTail,
+        },
+        'core stage changed',
       );
       return true;
     }
@@ -296,6 +332,7 @@ export class CoreDogecoinIndexerService {
     stage: CoreIndexerState['stage'],
   ): Promise<boolean> {
     await this.storeRawBlockHeights(dogecoin, heights);
+    this.assertPrimaryLease();
 
     const nextState = await this.stateStore.upsertCoreIndexerState({
       stage,
@@ -304,8 +341,15 @@ export class CoreDogecoinIndexerService {
       lastError: null,
     });
     await this.publishProgress(latest, nextState);
-    console.info(
-      `[onlydoge] core synced chain=${dogecoin.id} blocks=${heights.at(0) ?? state.syncTail + 1}-${heights.at(-1) ?? syncTail} latest=${latest}`,
+    this.logger.info(
+      {
+        blockEnd: heights.at(-1) ?? syncTail,
+        blockStart: heights.at(0) ?? state.syncTail + 1,
+        chain: dogecoin.id,
+        component: 'core-indexer',
+        latest,
+      },
+      'core synced',
     );
     return true;
   }
@@ -314,12 +358,26 @@ export class CoreDogecoinIndexerService {
     dogecoin: DogecoinRuntimeConfig,
     heights: number[],
   ): Promise<void> {
+    const transactionRefs: TransactionRef[] = [];
+
     await mapWithConcurrency(heights, this.settings.syncConcurrency, async (height) => {
+      this.assertPrimaryLease();
       const snapshot = await this.rpc.getBlockSnapshot(dogecoin, height);
       await this.rawBlocks.putPart(height, rawBlockPart, snapshot, {
         timeoutMs: this.settings.coreRawStorageTimeoutMs,
       });
       const block = parseDogecoinBlockSnapshot(snapshot);
+      transactionRefs.push(
+        ...deriveTransactionRefsFromBlock({
+          blockHash: block.hash,
+          blockHeight: block.height,
+          blockTime: block.time,
+          source: 'raw_sync',
+          transactions: block.tx.map((transaction) => ({
+            txid: requireString(transaction.txid, 'tx.txid'),
+          })),
+        }),
+      );
       await this.stateStore.upsertCoreBlock({
         blockHeight: block.height,
         blockHash: block.hash,
@@ -331,6 +389,75 @@ export class CoreDogecoinIndexerService {
         processedAt: null,
       });
     });
+
+    if (transactionRefs.length > 0) {
+      await this.stateStore.upsertTransactionRefs(transactionRefs);
+    }
+  }
+
+  private async backfillTransactionRefsIfNeeded(dogecoin: DogecoinRuntimeConfig): Promise<void> {
+    if (
+      (await this.configs.getJsonValue<boolean>(configKeyDogecoinTransactionRefsReady())) === true
+    ) {
+      return;
+    }
+
+    const state = await this.stateStore.getCoreIndexerState();
+    const syncTail = state?.syncTail ?? -1;
+    if (syncTail < 0) {
+      return;
+    }
+
+    const backfillTail =
+      (await this.configs.getJsonValue<number>(configKeyDogecoinTransactionRefsBackfillTail())) ??
+      -1;
+    const startHeight = backfillTail + 1;
+    if (startHeight > syncTail) {
+      await this.configs.setJsonValue(configKeyDogecoinTransactionRefsReady(), true);
+      return;
+    }
+
+    const endHeight = Math.min(syncTail, startHeight + this.settings.coreProcessWindow - 1);
+    const refs: TransactionRef[] = [];
+
+    for (const height of range(startHeight, endHeight)) {
+      const snapshot = await this.rawBlocks.getPart<Record<string, unknown>>(height, rawBlockPart, {
+        timeoutMs: this.settings.coreRawStorageTimeoutMs,
+      });
+      if (!snapshot) {
+        continue;
+      }
+
+      const block = parseDogecoinBlockSnapshot(snapshot);
+      refs.push(
+        ...deriveTransactionRefsFromBlock({
+          blockHash: block.hash,
+          blockHeight: block.height,
+          blockTime: block.time,
+          source: 'raw_sync',
+          transactions: block.tx.map((transaction) => ({
+            txid: requireString(transaction.txid, 'tx.txid'),
+          })),
+        }),
+      );
+    }
+
+    if (refs.length > 0) {
+      await this.stateStore.upsertTransactionRefs(refs);
+    }
+
+    await this.configs.setJsonValue(configKeyDogecoinTransactionRefsBackfillTail(), endHeight);
+    if (endHeight >= syncTail) {
+      await this.configs.setJsonValue(configKeyDogecoinTransactionRefsReady(), true);
+      this.logger.info(
+        {
+          chain: dogecoin.id,
+          component: 'core-indexer',
+          throughHeight: syncTail,
+        },
+        'transaction refs backfill complete',
+      );
+    }
   }
 
   private async processBackfill(
@@ -384,8 +511,15 @@ export class CoreDogecoinIndexerService {
         toProgress(state.processTail, latest),
       ),
     ]);
-    console.info(
-      `[onlydoge] core stage changed chain=${dogecoin.id} stage=online process_tail=${state.processTail} latest=${latest}`,
+    this.logger.info(
+      {
+        chain: dogecoin.id,
+        component: 'core-indexer',
+        latest,
+        processTail: state.processTail,
+        stage: 'online',
+      },
+      'core stage changed',
     );
   }
 
@@ -412,8 +546,16 @@ export class CoreDogecoinIndexerService {
       onlineTip: latest,
     });
     await this.configs.setJsonValue(configKeyIndexerStage(), 'sync_backfill');
-    console.info(
-      `[onlydoge] core stage changed chain=${dogecoin.id} stage=sync_backfill reason=tip-advanced process_tail=${state.processTail} latest=${latest}`,
+    this.logger.info(
+      {
+        chain: dogecoin.id,
+        component: 'core-indexer',
+        latest,
+        processTail: state.processTail,
+        reason: 'tip-advanced',
+        stage: 'sync_backfill',
+      },
+      'core stage changed',
     );
   }
 
@@ -429,8 +571,16 @@ export class CoreDogecoinIndexerService {
     const metrics = await this.processWindow(dogecoin, latest, heights, currentStateReady);
     await this.publishWindowProgress(dogecoin, latest, metrics, stage);
 
-    console.info(
-      `[onlydoge] core processed chain=${dogecoin.id} blocks=${metrics.start}-${metrics.end} sync_tail=${state.syncTail} latest=${latest}`,
+    this.logger.info(
+      {
+        blockEnd: metrics.end,
+        blockStart: metrics.start,
+        chain: dogecoin.id,
+        component: 'core-indexer',
+        latest,
+        syncTail: state.syncTail,
+      },
+      'core processed',
     );
     return true;
   }
@@ -486,11 +636,8 @@ export class CoreDogecoinIndexerService {
       snapshots,
       attempt,
     );
-    const { result: applyResult, elapsedMs: applyMs } = await this.applyWindowApplications(
-      applications,
-      updateCurrentState,
-      attempt,
-    );
+    const { result: applyResult, elapsedMs: applyMs } =
+      await this.applyWindowApplicationsWithRecovery(applications, updateCurrentState, attempt);
 
     return coreWindowMetrics({
       applications,
@@ -552,6 +699,131 @@ export class CoreDogecoinIndexerService {
     );
   }
 
+  private async applyWindowApplicationsWithRecovery(
+    applications: CoreDogecoinBlockApplication[],
+    updateCurrentState: boolean,
+    attempt: CoreBlockAttempt,
+  ): Promise<{ elapsedMs: number; result: CoreDogecoinApplyResult }> {
+    if (applications.length === 0) {
+      return this.applyWindowApplications(applications, updateCurrentState, attempt);
+    }
+
+    const firstApplication = applications[0];
+    if (!firstApplication) {
+      return this.applyWindowApplications(applications, updateCurrentState, attempt);
+    }
+
+    const lastApplication = applications.at(-1) ?? firstApplication;
+    const marker = createCoreApplyRecoveryMarker({
+      instanceId: this.instanceId,
+      startHeight: firstApplication.blockHeight,
+      endHeight: lastApplication.blockHeight,
+      blockHashes: applications.map((application) => application.blockHash),
+      updateCurrentState,
+    });
+    await this.configs.setJsonValue(configKeyCoreApplyRecovery(), marker);
+    this.logger.info(
+      {
+        action: 'marker-set',
+        component: 'core-indexer',
+        endHeight: marker.endHeight,
+        instanceId: marker.instanceId,
+        phase: 'core-apply-recovery',
+        startHeight: marker.startHeight,
+      },
+      'core apply recovery marker set',
+    );
+
+    try {
+      const applied = await this.applyWindowApplications(applications, updateCurrentState, attempt);
+      await this.clearCoreApplyRecoveryMarker(marker);
+      return applied;
+    } catch (error) {
+      this.logger.error(
+        {
+          action: 'marker-retained',
+          component: 'core-indexer',
+          endHeight: marker.endHeight,
+          instanceId: marker.instanceId,
+          phase: 'core-apply-recovery',
+          startHeight: marker.startHeight,
+          ...this.errorBindings(error),
+        },
+        'core apply failed with recovery marker retained',
+      );
+      throw error;
+    }
+  }
+
+  private async recoverPendingCoreApplyIfNeeded(dogecoin: DogecoinRuntimeConfig): Promise<void> {
+    const rawMarker = await this.configs.getJsonValue<unknown>(configKeyCoreApplyRecovery());
+    if (!rawMarker) {
+      return;
+    }
+
+    const marker = parseCoreApplyRecoveryMarker(rawMarker);
+    this.logger.warn(
+      {
+        action: 'recover',
+        component: 'core-indexer',
+        endHeight: marker.endHeight,
+        instanceId: this.instanceId,
+        markerInstanceId: marker.instanceId,
+        phase: 'core-apply-recovery',
+        startHeight: marker.startHeight,
+      },
+      'recovering pending core apply window',
+    );
+    await this.stateStore.recoverCoreDogecoinWindow(marker.startHeight, {
+      statementTimeoutMs: this.settings.coreDbStatementTimeoutMs,
+      updateCurrentState: marker.updateCurrentState,
+      validatePrevouts: false,
+    });
+    const cleared = await this.configs.compareAndDeleteJsonValue(
+      configKeyCoreApplyRecovery(),
+      marker,
+    );
+    if (!cleared) {
+      throw new Error(
+        `core apply recovery marker changed during recovery chain=${dogecoin.id} window=${marker.startHeight}-${marker.endHeight}`,
+      );
+    }
+    this.logger.info(
+      {
+        action: 'marker-cleared',
+        component: 'core-indexer',
+        endHeight: marker.endHeight,
+        instanceId: this.instanceId,
+        phase: 'core-apply-recovery',
+        startHeight: marker.startHeight,
+      },
+      'core apply recovery marker cleared',
+    );
+  }
+
+  private async clearCoreApplyRecoveryMarker(marker: CoreApplyRecoveryMarkerV1): Promise<void> {
+    const cleared = await this.configs.compareAndDeleteJsonValue(
+      configKeyCoreApplyRecovery(),
+      marker,
+    );
+    if (!cleared) {
+      throw new Error(
+        `core apply recovery marker changed during apply instance=${marker.instanceId} window=${marker.startHeight}-${marker.endHeight}`,
+      );
+    }
+    this.logger.info(
+      {
+        action: 'marker-cleared',
+        component: 'core-indexer',
+        endHeight: marker.endHeight,
+        instanceId: marker.instanceId,
+        phase: 'core-apply-recovery',
+        startHeight: marker.startHeight,
+      },
+      'core apply recovery marker cleared',
+    );
+  }
+
   private clearActiveBlockAttempt(attempt: CoreBlockAttempt): void {
     if (this.activeBlockAttempt === attempt) {
       this.activeBlockAttempt = null;
@@ -598,8 +870,24 @@ export class CoreDogecoinIndexerService {
       throw error;
     }
 
-    console.info(
-      `[onlydoge] phase=core-process-window chain=${dogecoin.id} blocks=${metrics.start}-${metrics.end} applied=${metrics.applied} load_raw_ms=${metrics.loadRawMs} build_ms=${metrics.buildMs} apply_ms=${metrics.applyMs} publish_progress_ms=${publishMs} total_ms=${metrics.totalMs + publishMs} creates=${metrics.creates} spends=${metrics.spends} process_tail=${nextState.processTail}`,
+    this.logger.info(
+      {
+        applied: metrics.applied,
+        applyMs: metrics.applyMs,
+        blockEnd: metrics.end,
+        blockStart: metrics.start,
+        buildMs: metrics.buildMs,
+        chain: dogecoin.id,
+        component: 'core-indexer',
+        creates: metrics.creates,
+        loadRawMs: metrics.loadRawMs,
+        phase: 'core-process-window',
+        processTail: nextState.processTail,
+        publishProgressMs: publishMs,
+        spends: metrics.spends,
+        totalMs: metrics.totalMs + publishMs,
+      },
+      'core process window completed',
     );
   }
 
@@ -614,8 +902,16 @@ export class CoreDogecoinIndexerService {
 
     const message = `core block timed out chain=${dogecoin.id} height=${height} active_step=${error.step} timeout_ms=${error.timeoutMs}`;
     await this.stateStore.setCoreIndexerError(message);
-    console.error(
-      `[onlydoge] phase=core-process error=timeout chain=${dogecoin.id} height=${height} active_step=${error.step} timeout_ms=${error.timeoutMs}`,
+    this.logger.error(
+      {
+        activeStep: error.step,
+        chain: dogecoin.id,
+        component: 'core-indexer',
+        height,
+        phase: 'core-process',
+        timeoutMs: error.timeoutMs,
+      },
+      'core block timed out',
     );
     this.exitProcess(1);
   }
@@ -702,7 +998,6 @@ export class CoreDogecoinIndexerService {
     return this.stateStore.upsertCoreIndexerState({
       stage: 'online',
       onlineTip: latest,
-      lastError: null,
     });
   }
 
@@ -791,8 +1086,16 @@ export class CoreDogecoinIndexerService {
     const metrics = await this.processWindow(dogecoin, latest, heights, currentStateReady);
     await this.publishWindowProgress(dogecoin, latest, metrics, 'online');
 
-    console.info(
-      `[onlydoge] core processed chain=${dogecoin.id} blocks=${metrics.start}-${metrics.end} sync_tail=${state.syncTail} latest=${latest}`,
+    this.logger.info(
+      {
+        blockEnd: metrics.end,
+        blockStart: metrics.start,
+        chain: dogecoin.id,
+        component: 'core-indexer',
+        latest,
+        syncTail: state.syncTail,
+      },
+      'core processed',
     );
     return metrics.applied || state.processTail < metrics.end;
   }
@@ -800,8 +1103,9 @@ export class CoreDogecoinIndexerService {
   private async publishProgress(latest: number, state: CoreIndexerState): Promise<void> {
     const historyReady =
       (await this.configs.getJsonValue<boolean>(configKeyDogecoinHistoryReady())) === true;
+    const analyticsFactsReady = await this.isDogecoinAnalyticsFactsReady();
+    this.assertPrimaryLease();
     const writes = [
-      this.configs.setJsonValue(configKeyPrimary(), createLease(this.instanceId)),
       this.configs.setJsonValue(configKeyIndexerStage(), state.stage),
       this.configs.setJsonValue(configKeyIndexerSyncTail(), state.syncTail),
       this.configs.setJsonValue(configKeyIndexerProcessTail(), state.processTail),
@@ -825,7 +1129,7 @@ export class CoreDogecoinIndexerService {
         ),
       );
     }
-    if (await this.isDogecoinAnalyticsFactsReady()) {
+    if (analyticsFactsReady) {
       writes.push(
         this.configs.setJsonValue(
           configKeyDogecoinAnalyticsFactsTail(),
@@ -849,6 +1153,7 @@ export class CoreDogecoinIndexerService {
     step: CoreBlockStep,
     work: (abortSignal: AbortSignal) => Promise<T>,
   ): Promise<{ elapsedMs: number; result: T }> {
+    this.assertPrimaryLease();
     attempt.activeStep = step;
     const startedAt = Date.now();
     const controller = new AbortController();
@@ -861,6 +1166,7 @@ export class CoreDogecoinIndexerService {
         return error;
       },
     );
+    this.assertPrimaryLease();
     return {
       elapsedMs: Date.now() - startedAt,
       result,
@@ -927,8 +1233,19 @@ export class CoreDogecoinIndexerService {
     const activeAttempt = activeAttemptLog(this.activeBlockAttempt ?? undefined);
     const message = `core progress watchdog expired chain=${dogecoin.id} stage=${state.stage} sync_tail=${state.syncTail} process_tail=${state.processTail} age_ms=${ageMs}`;
     await this.stateStore.setCoreIndexerError(message);
-    console.error(
-      `[onlydoge] phase=core-watchdog error=no-progress chain=${dogecoin.id} stage=${state.stage} sync_tail=${state.syncTail} process_tail=${state.processTail} age_ms=${ageMs} active_height=${activeAttempt.height} active_step=${activeAttempt.step}`,
+    this.logger.error(
+      {
+        activeHeight: activeAttempt.height,
+        activeStep: activeAttempt.step,
+        ageMs,
+        chain: dogecoin.id,
+        component: 'core-indexer',
+        phase: 'core-watchdog',
+        processTail: state.processTail,
+        stage: state.stage,
+        syncTail: state.syncTail,
+      },
+      'core progress watchdog expired',
     );
     this.exitProcess(1);
   }
@@ -961,6 +1278,12 @@ export class CoreDogecoinIndexerService {
     process.exit(code);
   }
 
+  private errorBindings(error: unknown): Record<string, unknown> {
+    return {
+      err: error instanceof Error ? error : new Error(formatError(error)),
+    };
+  }
+
   private async leaseLeadership(): Promise<boolean> {
     const current = await this.configs.getJsonValue<PrimaryLease | string>(configKeyPrimary());
     const currentLease = toPrimaryLease(current);
@@ -976,7 +1299,7 @@ export class CoreDogecoinIndexerService {
     currentLease: PrimaryLease,
   ): Promise<boolean> {
     if (currentLease.instanceId === this.instanceId) {
-      return this.refreshPrimaryLease();
+      return this.renewPrimaryLease(currentLease);
     }
 
     return this.leaseCompetingPrimary(current, currentLease);
@@ -986,31 +1309,95 @@ export class CoreDogecoinIndexerService {
     current: PrimaryLease | string | null,
     currentLease: PrimaryLease,
   ): Promise<boolean> {
-    if (isFreshPrimaryLease(currentLease)) {
+    if (isFreshPrimaryLease(currentLease, this.settings.leaseHeartbeatIntervalMs)) {
+      this.primaryLease = null;
       return false;
     }
 
     return this.claimPrimaryLease(current, ' replaced-stale-primary');
   }
 
-  private async refreshPrimaryLease(): Promise<boolean> {
-    await this.configs.setJsonValue(configKeyPrimary(), createLease(this.instanceId));
-    return true;
+  private async renewPrimaryLease(expectedLease: PrimaryLease): Promise<boolean> {
+    const nextLease = createLease(this.instanceId);
+    try {
+      const renewed = await this.configs.compareAndSwapJsonValue(
+        configKeyPrimary(),
+        expectedLease,
+        nextLease,
+      );
+      this.primaryLease = renewed ? nextLease : null;
+      return renewed;
+    } catch (error) {
+      this.primaryLease = null;
+      this.logger.error(this.errorBindings(error), 'core indexer lease renewal failed');
+      return false;
+    }
   }
 
   private async claimPrimaryLease(
     current: PrimaryLease | string | null,
     logSuffix: string,
   ): Promise<boolean> {
+    const nextLease = createLease(this.instanceId);
     const claimed = await this.configs.compareAndSwapJsonValue(
       configKeyPrimary(),
       current,
-      createLease(this.instanceId),
+      nextLease,
     );
     if (claimed) {
-      console.info(`[onlydoge] core indexer primary instance=${this.instanceId}${logSuffix}`);
+      this.primaryLease = nextLease;
+      this.logger.info(
+        { component: 'core-indexer', instanceId: this.instanceId, logSuffix },
+        'core indexer claimed primary lease',
+      );
+    } else {
+      this.primaryLease = null;
     }
     return claimed;
+  }
+
+  private async runWithPrimaryLeaseHeartbeat(work: () => Promise<boolean>): Promise<boolean> {
+    let stopped = false;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    let renewal: Promise<void> | undefined;
+
+    const scheduleRenewal = () => {
+      timer = setTimeout(() => {
+        renewal = renew();
+      }, this.settings.leaseHeartbeatIntervalMs);
+    };
+    const renew = async (): Promise<void> => {
+      const expectedLease = this.primaryLease;
+      if (stopped || !expectedLease) {
+        return;
+      }
+      if ((await this.renewPrimaryLease(expectedLease)) && !stopped) {
+        scheduleRenewal();
+      }
+    };
+
+    scheduleRenewal();
+    let result = false;
+    try {
+      result = await work();
+    } catch (error) {
+      if (!(error instanceof PrimaryLeaseLostError)) {
+        throw error;
+      }
+    } finally {
+      stopped = true;
+      if (timer) {
+        clearTimeout(timer);
+      }
+      await renewal;
+    }
+    return result && this.primaryLease !== null;
+  }
+
+  private assertPrimaryLease(): void {
+    if (!this.primaryLease) {
+      throw new PrimaryLeaseLostError();
+    }
   }
 }
 
@@ -1177,8 +1564,8 @@ function hasSameProgressValues(previous: ProgressObservation, state: CoreIndexer
   ].every(Boolean);
 }
 
-function isFreshPrimaryLease(lease: PrimaryLease): boolean {
-  return Date.now() - Date.parse(lease.heartbeatAt) <= leaseTimeoutMs;
+function isFreshPrimaryLease(lease: PrimaryLease, heartbeatIntervalMs: number): boolean {
+  return Date.now() - Date.parse(lease.heartbeatAt) <= heartbeatIntervalMs * 3;
 }
 
 function activeAttemptLog(attempt: CoreBlockAttempt | undefined): {
@@ -1274,13 +1661,15 @@ function parseDogecoinBlockSnapshot(snapshot: Record<string, unknown>): ParsedDo
   previousHash: string | null;
 } {
   const candidate = requireBlockRecord(snapshot.block);
+  const hash = requireString(candidate.hash, 'block.hash');
+  const height = requireNumber(candidate.height, 'block.height');
 
   return {
-    hash: requireString(candidate.hash, 'block.hash'),
-    height: requireNumber(candidate.height, 'block.height'),
+    hash,
+    height,
     time: requireNumber(candidate.time, 'block.time'),
     previousHash: readPreviousBlockHash(candidate.previousblockhash),
-    tx: readDogecoinTransactions(candidate.tx),
+    tx: readDogecoinTransactions(candidate.tx, height),
   };
 }
 
@@ -1481,8 +1870,24 @@ function requireBlockRecord(value: unknown): Record<string, unknown> {
   return value;
 }
 
-function readDogecoinTransactions(value: unknown): DogecoinTransaction[] {
-  return Array.isArray(value) ? value.filter(isDogecoinTransaction) : [];
+function readDogecoinTransactions(value: unknown, blockHeight: number): DogecoinTransaction[] {
+  if (!Array.isArray(value) || value.length === 0) {
+    throw new Error(
+      `invalid dogecoin block transactions height=${blockHeight}: expected non-empty array`,
+    );
+  }
+
+  const transactions: DogecoinTransaction[] = [];
+  for (const [transactionIndex, transaction] of value.entries()) {
+    if (!isDogecoinTransaction(transaction)) {
+      throw new Error(
+        `invalid dogecoin block transaction height=${blockHeight} tx_index=${transactionIndex}`,
+      );
+    }
+    transactions.push(transaction);
+  }
+
+  return transactions;
 }
 
 function readPreviousBlockHash(value: unknown): string | null {

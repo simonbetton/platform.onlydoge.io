@@ -8,6 +8,7 @@ import type {
   RawBlockStoragePort,
   RawBlockStorageRequestContext,
 } from '@onlydoge/indexing-pipeline';
+import { InfrastructureError } from '@onlydoge/shared-kernel';
 
 import type { StorageSettings } from './settings';
 
@@ -25,9 +26,14 @@ export class FileRawBlockStorageAdapter implements RawBlockStoragePort {
       const payload = await readFile(filePath);
       assertNotAborted(context);
       return decodeJsonGzip<T>(payload);
-    } catch {
+    } catch (error) {
       assertNotAborted(context);
-      return null;
+      if (isFileNotFoundError(error)) {
+        return null;
+      }
+      throw new InfrastructureError(`raw block storage file read failed path=${filePath}`, {
+        cause: error,
+      });
     }
   }
 
@@ -68,9 +74,14 @@ export class S3RawBlockStorageAdapter implements RawBlockStoragePort {
       const body = await this.getObjectBody(key, request);
       assertNotAborted(context);
       return decodeJsonGzip<T>(body);
-    } catch {
+    } catch (error) {
       throwIfRequestAborted(request, `raw block storage get timed out key=${key}`);
-      return null;
+      if (isS3NotFoundError(error)) {
+        return null;
+      }
+      throw new InfrastructureError(`raw block storage S3 get failed key=${key}`, {
+        cause: error,
+      });
     } finally {
       request.cleanup();
     }
@@ -221,6 +232,26 @@ function hasS3Credentials(settings: StorageSettings): settings is StorageSetting
 
 function decodeJsonGzip<T extends Record<string, unknown>>(payload: Uint8Array): T {
   return JSON.parse(gunzipSync(payload).toString('utf8'));
+}
+
+function isFileNotFoundError(error: unknown): boolean {
+  return isObjectValue(error) && Reflect.get(error, 'code') === 'ENOENT';
+}
+
+function isS3NotFoundError(error: unknown): boolean {
+  if (!isObjectValue(error)) {
+    return false;
+  }
+
+  return (
+    ['NoSuchKey', 'NotFound'].includes(String(Reflect.get(error, 'name'))) ||
+    s3HttpStatusCode(error) === 404
+  );
+}
+
+function s3HttpStatusCode(error: object): unknown {
+  const metadata = Reflect.get(error, '$metadata');
+  return isObjectValue(metadata) ? Reflect.get(metadata, 'httpStatusCode') : undefined;
 }
 
 interface RawBlockStorageAbortRequest {

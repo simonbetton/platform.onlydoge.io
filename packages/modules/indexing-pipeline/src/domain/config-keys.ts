@@ -85,3 +85,15 @@ export function configKeyProjectionBootstrapCursorBalance(): string {
 export function configKeyProjectionBootstrapStartedAt(): string {
   return 'projection_bootstrap_started_at';
 }
+
+export function configKeyCoreApplyRecovery(): string {
+  return 'dogecoin_core_apply_recovery';
+}
+
+export function configKeyDogecoinTransactionRefsReady(): string {
+  return 'dogecoin_transaction_refs_ready';
+}
+
+export function configKeyDogecoinTransactionRefsBackfillTail(): string {
+  return 'dogecoin_transaction_refs_backfill_tail';
+}

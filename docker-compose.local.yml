@@ -17,7 +17,7 @@ services:
       - postgres_local:/var/lib/postgresql/data
 
   minio:
-    image: minio/minio:latest
+    image: minio/minio:RELEASE.2025-09-07T16-13-09Z@sha256:14cea493d9a34af32f524e538b8346cf79f3321eff8e708c1e2960462bd8936e
     command: ['server', '/data', '--console-address', ':9001']
     environment:
       MINIO_ROOT_USER: ${MINIO_ROOT_USER:-onlydoge}
@@ -29,7 +29,7 @@ services:
       - minio_local:/data
 
   minio-create-bucket:
-    image: minio/mc:latest
+    image: minio/mc:RELEASE.2025-08-13T08-35-41Z@sha256:a7fe349ef4bd8521fb8497f55c6042871b2ae640607cf99d9bede5e9bdf11727
     depends_on:
       - minio
     entrypoint:
@@ -48,7 +48,7 @@ services:
     restart: 'no'
 
   clickhouse:
-    image: clickhouse/clickhouse-server:latest
+    image: clickhouse/clickhouse-server:26.6.1.1193@sha256:1d1f6508eba2dccce2cee9913907c5f7766327debc57a6b1991f2c9e3176c163
     environment:
       CLICKHOUSE_DB: ${CLICKHOUSE_DB:-onlydoge}
       CLICKHOUSE_USER: ${CLICKHOUSE_USER:-onlydoge}
@@ -69,7 +69,6 @@ services:
       start_period: 10s
     volumes:
       - clickhouse_local:/var/lib/clickhouse
-      - ./docker/clickhouse/init/001_schema.sql:/docker-entrypoint-initdb.d/001_schema.sql:ro
       - ./docker/clickhouse/config.d/onlydoge-memory.xml:/etc/clickhouse-server/config.d/onlydoge-memory.xml:ro
       - ./docker/clickhouse/users.d/onlydoge-memory.xml:/etc/clickhouse-server/users.d/onlydoge-memory.xml:ro
       - ./docker/clickhouse/users.d/onlydoge-analytics.xml:/etc/clickhouse-server/users.d/onlydoge-analytics.xml:ro
@@ -100,6 +99,7 @@ services:
           -rpcport=$$rpcport \
           -rpcbind=0.0.0.0 \
           -rpcallowip=0.0.0.0/0 \
+          -rpcworkqueue=${DOGECOIN_RPC_WORKQUEUE:-128} \
           -zmqpubrawblock=$$zmqpubrawblock \
           -zmqpubhashblock=$$zmqpubhashblock \
           -zmqpubhashtx=$$zmqpubhashtx \
@@ -130,7 +130,12 @@ services:
     command:
       - /bin/sh
       - -lc
-      - bun install --frozen-lockfile && npm install --omit=dev --prefix scripts/zmq-rawtx-bridge && bun run --watch apps/onlydoge/src/index.ts --mode=both --ip=0.0.0.0 --port=2277
+      - |
+        bun install --frozen-lockfile
+        npm ci --omit=dev --prefix scripts/zmq-rawtx-bridge
+        # Avoid `bun --watch`: it survives app crashes and leaves :2277 dead while the
+        # container stays "up". Docker restart policy recovers process.exit failures.
+        exec bun run apps/onlydoge/src/index.ts --mode=both --ip=0.0.0.0 --port=2277
     depends_on:
       dogecoin:
         condition: service_healthy
@@ -152,7 +157,7 @@ services:
       ONLYDOGE_INDEXER_SYNC_WINDOW: ${ONLYDOGE_INDEXER_SYNC_WINDOW:-128}
       ONLYDOGE_INDEXER_SYNC_WINDOW_MIN: ${ONLYDOGE_INDEXER_SYNC_WINDOW_MIN:-32}
       ONLYDOGE_INDEXER_SYNC_WINDOW_MAX: ${ONLYDOGE_INDEXER_SYNC_WINDOW_MAX:-256}
-      ONLYDOGE_INDEXER_SYNC_CONCURRENCY: ${ONLYDOGE_INDEXER_SYNC_CONCURRENCY:-16}
+      ONLYDOGE_INDEXER_SYNC_CONCURRENCY: ${ONLYDOGE_INDEXER_SYNC_CONCURRENCY:-4}
       ONLYDOGE_INDEXER_SYNC_TARGET_MS: ${ONLYDOGE_INDEXER_SYNC_TARGET_MS:-15000}
       ONLYDOGE_INDEXER_SYNC_TIMEOUT_MS: ${ONLYDOGE_INDEXER_SYNC_TIMEOUT_MS:-120000}
       ONLYDOGE_INDEXER_FACT_WINDOW: ${ONLYDOGE_INDEXER_FACT_WINDOW:-64}
@@ -186,7 +191,7 @@ services:
       ONLYDOGE_ANALYTICS_WAREHOUSE_USER: ${CLICKHOUSE_ANALYTICS_USER:-onlydoge_analytics}
       ONLYDOGE_ANALYTICS_WAREHOUSE_PASSWORD: ${CLICKHOUSE_ANALYTICS_PASSWORD:-onlydoge_analytics}
       ONLYDOGE_DOGECOIN_RPC_ENDPOINT: ${ONLYDOGE_DOGECOIN_RPC_ENDPOINT:-http://gigawallet:gigawallet@dogecoin:22555/}
-      ONLYDOGE_DOGECOIN_RPC_RPS: ${ONLYDOGE_DOGECOIN_RPC_RPS:-200}
+      ONLYDOGE_DOGECOIN_RPC_RPS: ${ONLYDOGE_DOGECOIN_RPC_RPS:-32}
       ONLYDOGE_DOGECOIN_ZMQ_BLOCK_ENDPOINT: ${ONLYDOGE_DOGECOIN_ZMQ_BLOCK_ENDPOINT:-tcp://dogecoin:28332}
       ONLYDOGE_DOGECOIN_ZMQ_TX_ENDPOINT: ${ONLYDOGE_DOGECOIN_ZMQ_TX_ENDPOINT:-tcp://dogecoin:28332}
     healthcheck:

@@ -1,4 +1,12 @@
-import { InfrastructureError, OnlyDogeError, UnauthorizedError } from '@onlydoge/shared-kernel';
+import {
+  defaultPageLimit,
+  InfrastructureError,
+  maxPageLimit,
+  maxPageOffset,
+  parseBoundedNonNegativeInteger,
+  UnauthorizedError,
+  ValidationError,
+} from '@onlydoge/shared-kernel';
 import { Elysia, t } from 'elysia';
 
 import type {
@@ -45,25 +53,17 @@ const auditEventStringFilterKeys: AuditEventStringFilterKey[] = [
 ];
 const auditEventNumericFilterKeys: AuditEventNumericFilterKey[] = ['limit', 'offset', 'statusCode'];
 
-function parsePagination(value: string | undefined): number | undefined {
-  if (!value) {
+function parseNumericFilter(value: string | undefined, field: string): number | undefined {
+  if (value === undefined) {
     return undefined;
   }
 
   const parsed = Number(value);
-  assertPaginationValue(parsed, value);
+  if (!Number.isInteger(parsed) || parsed < 0) {
+    throw new ValidationError(`invalid parameter for \`${field}\`: ${value}`);
+  }
 
   return parsed;
-}
-
-function assertPaginationValue(parsed: number, raw: string): void {
-  if (!isPaginationValue(parsed)) {
-    throw new OnlyDogeError(`invalid parameter for \`${raw}\`: ${raw}`);
-  }
-}
-
-function isPaginationValue(value: number): boolean {
-  return [Number.isInteger(value), value >= 0].every(Boolean);
 }
 
 export const apiTokenSecuritySchemeName = 'ApiTokenAuth';
@@ -85,13 +85,13 @@ const accessControlTag = 'Access Control';
 
 const offsetQuerySchema = t.Optional(
   t.String({
-    description: 'Zero-based number of records to skip.',
+    description: `Zero-based number of records to skip. Maximum ${maxPageOffset}.`,
     examples: ['0', '25'],
   }),
 );
 const limitQuerySchema = t.Optional(
   t.String({
-    description: 'Maximum number of records to return.',
+    description: `Maximum number of records to return. Defaults to ${defaultPageLimit}; maximum ${maxPageLimit}. Values above the maximum return a validation error.`,
     examples: ['25', '100'],
   }),
 );
@@ -104,10 +104,14 @@ const paginationQuerySchema = t.Object({
 const auditQuerySchema = t.Object({
   actor: t.Optional(t.String({ description: 'Actor API key id.', examples: ['key_operator'] })),
   from: t.Optional(
-    t.String({ description: 'Inclusive lower bound for event creation time as ISO-8601.' }),
+    t.String({
+      description: 'Inclusive lower bound for event creation time as ISO-8601.',
+    }),
   ),
   to: t.Optional(
-    t.String({ description: 'Exclusive upper bound for event creation time as ISO-8601.' }),
+    t.String({
+      description: 'Exclusive upper bound for event creation time as ISO-8601.',
+    }),
   ),
   method: t.Optional(t.String({ description: 'HTTP method.', examples: ['POST'] })),
   outcome: t.Optional(
@@ -163,8 +167,16 @@ export function buildAccessControlHttp(
         .get(
           '/',
           async ({ query, request }) => {
-            const offset = parsePagination(query.offset);
-            const limit = parsePagination(query.limit);
+            const offset = parseBoundedNonNegativeInteger(query.offset, {
+              defaultValue: 0,
+              field: 'offset',
+              maximum: maxPageOffset,
+            });
+            const limit = parseBoundedNonNegativeInteger(query.limit, {
+              defaultValue: defaultPageLimit,
+              field: 'limit',
+              maximum: maxPageLimit,
+            });
 
             return service.listKeys(resolveAuthenticatedApiKey(request), offset, limit);
           },
@@ -330,7 +342,21 @@ function auditEventNumericFiltersFromQuery(query: AuditEventQuery): AuditEventFi
   const filters: AuditEventFilters = {};
 
   for (const key of auditEventNumericFilterKeys) {
-    assignAuditEventNumericFilter(filters, key, parsePagination(query[key]));
+    const value =
+      key === 'limit'
+        ? parseBoundedNonNegativeInteger(query[key], {
+            defaultValue: defaultPageLimit,
+            field: key,
+            maximum: maxPageLimit,
+          })
+        : key === 'offset'
+          ? parseBoundedNonNegativeInteger(query[key], {
+              defaultValue: 0,
+              field: key,
+              maximum: maxPageOffset,
+            })
+          : parseNumericFilter(query[key], key);
+    assignAuditEventNumericFilter(filters, key, value);
   }
 
   return filters;
@@ -448,7 +474,9 @@ function authenticationError(error: unknown): Error {
     return error;
   }
 
-  return new InfrastructureError('authentication store unavailable', { cause: error });
+  return new InfrastructureError('authentication store unavailable', {
+    cause: error,
+  });
 }
 
 export function apiKeyRateLimitHeaders(result: ApiKeyRateLimitResult): Record<string, string> {
