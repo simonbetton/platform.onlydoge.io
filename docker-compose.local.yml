@@ -48,7 +48,7 @@ services:
     restart: 'no'
 
   clickhouse:
-    image: clickhouse/clickhouse-server:26.6.1.1193@sha256:1d1f6508eba2dccce2cee9913907c5f7766327debc57a6b1991f2c9e3176c163
+    image: clickhouse/clickhouse-server:26.7.4.58@sha256:5a94a6cc2005af20844c31aa49906d55c3c48b0e0fb9f29bf0d6c29e52692f3a
     environment:
       CLICKHOUSE_DB: ${CLICKHOUSE_DB:-onlydoge}
       CLICKHOUSE_USER: ${CLICKHOUSE_USER:-onlydoge}
