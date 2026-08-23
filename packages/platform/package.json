@@ -4,16 +4,16 @@
   "type": "module",
   "exports": "./src/index.ts",
   "dependencies": {
-    "@aws-sdk/client-s3": "3.1063.0",
-    "@clickhouse/client": "1.20.0",
+    "@aws-sdk/client-s3": "3.1115.0",
+    "@clickhouse/client": "1.23.1",
     "@libsql/client": "^0.17.4",
     "@onlydoge/access-control": "workspace:*",
     "@onlydoge/analytics-query": "workspace:*",
     "@onlydoge/explorer-query": "workspace:*",
     "@onlydoge/indexing-pipeline": "workspace:*",
     "@onlydoge/shared-kernel": "workspace:*",
-    "mysql2": "^3.22.5",
-    "pg": "^8.21.0",
+    "mysql2": "^3.23.4",
+    "pg": "^8.23.0",
     "pino": "10.3.1"
   }
 }
