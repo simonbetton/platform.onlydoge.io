@@ -1,0 +1,27 @@
+# Keep only Dogecoin's large, sequentially accessed chain data on the external HDD.
+# Database services use Docker-managed Linux volumes to avoid macOS bind-mount stalls.
+services:
+  dogecoin:
+    command:
+      - /bin/sh
+      - -c
+      - |
+        exec dogecoind \
+          -uacomment="$$uacomment" \
+          -disablewallet=$$disablewallet \
+          -datadir=$$datadir \
+          -server=1 \
+          -listen=1 \
+          -txindex=1 \
+          -dbcache=4096 \
+          -rpcuser="$$rpcuser" \
+          -rpcpassword="$$rpcpassword" \
+          -rpcport=$$rpcport \
+          -rpcbind=0.0.0.0 \
+          -rpcallowip=0.0.0.0/0 \
+          -rpcworkqueue=${DOGECOIN_RPC_WORKQUEUE:-128} \
+          -zmqpubrawblock=$$zmqpubrawblock \
+          -zmqpubhashblock=$$zmqpubhashblock \
+          -zmqpubhashtx=$$zmqpubhashtx \
+          -zmqpubrawtx=$$zmqpubrawtx \
+          -zmqpubhashtxhwm=$$zmqpubhashtxhwm

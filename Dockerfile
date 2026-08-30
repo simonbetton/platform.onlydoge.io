@@ -3,6 +3,9 @@ WORKDIR /app
 RUN apk upgrade --no-cache
 # Node runs the out-of-process ZMQ rawtx bridge; native zeromq crashes Bun in-process.
 RUN apk add --no-cache nodejs npm
+# OrbStack's container IPv6 route can make Node's dual-stack connection attempts
+# time out even when IPv4 works, which otherwise breaks npm and the ZMQ bridge.
+ENV NODE_OPTIONS="--dns-result-order=ipv4first --no-network-family-autoselection"
 
 FROM base AS deps
 COPY package.json bun.lock tsconfig.base.json biome.json vitest.config.ts ./
@@ -19,10 +22,10 @@ RUN bun install --frozen-lockfile
 RUN find node_modules -name bun.lock -delete
 
 FROM deps AS development
-# Keep native-build tooling: local compose bind-mounts the bridge and npm-installs into a volume at start.
+# Keep native-build tooling: local compose bind-mounts the bridge and npm-installs into a volume at start
+# (see docker-compose.local.yml). Skip build-time npm ci so flaky registry access cannot block `docker:local:up`.
 RUN apk add --no-cache python3 make g++ cmake linux-headers
 COPY . .
-RUN npm ci --omit=dev --prefix scripts/zmq-rawtx-bridge
 EXPOSE 2277
 CMD ["bun", "run", "--watch", "apps/onlydoge/src/index.ts", "--mode=both", "--ip=0.0.0.0", "--port=2277"]
 
@@ -38,7 +41,7 @@ LABEL org.opencontainers.image.description="Dogecoin explorer backend and indexe
 COPY --from=prod-deps /app/node_modules /app/node_modules
 COPY . .
 RUN apk add --no-cache --virtual .zmq-build python3 make g++ cmake linux-headers \
-    && npm ci --omit=dev --prefix scripts/zmq-rawtx-bridge \
+    && npm ci --omit=dev --fetch-retries=5 --fetch-retry-mintimeout=20000 --fetch-retry-maxtimeout=120000 --prefix scripts/zmq-rawtx-bridge \
     && apk del .zmq-build
 EXPOSE 80
 ENTRYPOINT ["bun", "run", "apps/onlydoge/src/index.ts"]

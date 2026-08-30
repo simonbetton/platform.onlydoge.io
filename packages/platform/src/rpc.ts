@@ -59,6 +59,8 @@ export class HttpBlockchainRpcGateway implements BlockchainRpcPort {
   ): Promise<Record<string, unknown>> {
     // Dogecoin Core only accepts boolean getblock verbosity. Integer verbosity 2
     // (Bitcoin Core) fails, so request verbose JSON and hydrate txids in one batch.
+    // Genesis coinbase is absent from txindex; getrawtransaction -5 falls back to
+    // decoderawtransaction on the raw block hex.
     const block = await this.callDogecoin<Record<string, unknown>>(
       dogecoin.rpcEndpoint,
       dogecoin.rps,
@@ -67,7 +69,7 @@ export class HttpBlockchainRpcGateway implements BlockchainRpcPort {
     );
 
     if (needsTransactionHydration(block.tx)) {
-      block.tx = await this.hydrateDogecoinTransactions(dogecoin, block.tx);
+      block.tx = await this.hydrateDogecoinTransactions(dogecoin, block.tx, hash);
     }
 
     return block;
@@ -79,11 +81,12 @@ export class HttpBlockchainRpcGateway implements BlockchainRpcPort {
       rps: number;
     },
     txids: string[],
+    blockHash?: string,
   ): Promise<Record<string, unknown>[]> {
-    const transactions: Record<string, unknown>[] = [];
+    const transactions: Array<Record<string, unknown> | null> = [];
 
     for (const chunk of chunkArray(txids, rawTransactionBatchSize)) {
-      const decoded = await this.callDogecoinBatch<Record<string, unknown>>(
+      const decoded = await this.callDogecoinBatchAllowingMissing<Record<string, unknown>>(
         dogecoin.rpcEndpoint,
         dogecoin.rps,
         chunk.map((txid) => ({
@@ -94,7 +97,63 @@ export class HttpBlockchainRpcGateway implements BlockchainRpcPort {
       transactions.push(...decoded);
     }
 
-    return transactions;
+    if (transactions.every(isPlainRecord)) {
+      return transactions;
+    }
+
+    return this.hydrateMissingTransactionsFromRawBlock(dogecoin, txids, transactions, blockHash);
+  }
+
+  private async hydrateMissingTransactionsFromRawBlock(
+    dogecoin: {
+      rpcEndpoint: string;
+      rps: number;
+    },
+    txids: string[],
+    transactions: Array<Record<string, unknown> | null>,
+    blockHash?: string,
+  ): Promise<Record<string, unknown>[]> {
+    if (!blockHash) {
+      throw new InfrastructureError('could not load dogecoin transactions missing from node index');
+    }
+
+    const blockHex = await this.callDogecoin<string>(
+      dogecoin.rpcEndpoint,
+      dogecoin.rps,
+      'getblock',
+      [blockHash, false],
+    );
+    const hexes = extractRawTransactionHexes(blockHex);
+    if (hexes.length !== txids.length) {
+      throw new InfrastructureError('dogecoin raw block transaction count mismatch');
+    }
+
+    const missingIndexes = transactions.flatMap((transaction, index) =>
+      transaction ? [] : [index],
+    );
+    const decoded = await this.callDogecoinBatch<Record<string, unknown>>(
+      dogecoin.rpcEndpoint,
+      dogecoin.rps,
+      missingIndexes.map((index) => ({
+        method: 'decoderawtransaction',
+        params: [hexes[index]],
+      })),
+    );
+
+    let nextDecoded = 0;
+    return transactions.map((transaction) => {
+      if (transaction) {
+        return transaction;
+      }
+
+      const decodedTransaction = decoded[nextDecoded];
+      nextDecoded += 1;
+      if (!isPlainRecord(decodedTransaction)) {
+        throw new InfrastructureError('invalid dogecoin rpc response for decoderawtransaction');
+      }
+
+      return decodedTransaction;
+    });
   }
 
   public async getMempoolSnapshot(dogecoin: {
@@ -200,6 +259,19 @@ export class HttpBlockchainRpcGateway implements BlockchainRpcPort {
     return this.callJsonRpcBatch(rpcEndpoint, rps, calls, timeoutMs);
   }
 
+  private async callDogecoinBatchAllowingMissing<T>(
+    rpcEndpoint: string,
+    rps: number,
+    calls: Array<{ method: string; params: unknown[] }>,
+    timeoutMs = this.timeoutMs,
+  ): Promise<Array<T | null>> {
+    if (calls.length === 0) {
+      return [];
+    }
+
+    return this.callJsonRpcBatchAllowingMissing(rpcEndpoint, rps, calls, timeoutMs);
+  }
+
   private async callJsonRpc<T>(
     rpcEndpoint: string,
     rps: number,
@@ -236,27 +308,59 @@ export class HttpBlockchainRpcGateway implements BlockchainRpcPort {
     timeoutMs: number,
   ): Promise<T[]> {
     return this.withRpcRetry(rpcEndpoint, async () => {
-      const request = this.toRpcRequest(rpcEndpoint);
-      await this.waitForRateLimit(request.url, rps);
-      const response = await fetch(request.url, {
-        method: 'POST',
-        headers: request.headers,
-        signal: AbortSignal.timeout(timeoutMs),
-        body: JSON.stringify(
-          calls.map((call, index) => ({
-            jsonrpc: '1.0',
-            id: index,
-            method: call.method,
-            params: call.params,
-          })),
-        ),
-      });
-      const body = await readResponseBody(response);
-      assertNotWorkQueueExceeded(body, rpcEndpoint);
-      const payload = parseRpcJsonBody<Array<{ error?: unknown; id?: unknown; result?: T }>>(body);
-
-      return readRpcBatchResults(response, payload, rpcEndpoint, calls.length);
+      const batch = await this.fetchJsonRpcBatch<T>(rpcEndpoint, rps, calls, timeoutMs);
+      return readRpcBatchResults(batch.response, batch.payload, rpcEndpoint, calls.length);
     });
+  }
+
+  private async callJsonRpcBatchAllowingMissing<T>(
+    rpcEndpoint: string,
+    rps: number,
+    calls: Array<{ method: string; params: unknown[] }>,
+    timeoutMs: number,
+  ): Promise<Array<T | null>> {
+    return this.withRpcRetry(rpcEndpoint, async () => {
+      const batch = await this.fetchJsonRpcBatch<T>(rpcEndpoint, rps, calls, timeoutMs);
+      return readRpcBatchResultsAllowingMissing(
+        batch.response,
+        batch.payload,
+        rpcEndpoint,
+        calls.length,
+      );
+    });
+  }
+
+  private async fetchJsonRpcBatch<T>(
+    rpcEndpoint: string,
+    rps: number,
+    calls: Array<{ method: string; params: unknown[] }>,
+    timeoutMs: number,
+  ): Promise<{
+    payload: Array<{ error?: unknown; id?: unknown; result?: T }> | null;
+    response: Response;
+  }> {
+    const request = this.toRpcRequest(rpcEndpoint);
+    await this.waitForRateLimit(request.url, rps);
+    const response = await fetch(request.url, {
+      method: 'POST',
+      headers: request.headers,
+      signal: AbortSignal.timeout(timeoutMs),
+      body: JSON.stringify(
+        calls.map((call, index) => ({
+          jsonrpc: '1.0',
+          id: index,
+          method: call.method,
+          params: call.params,
+        })),
+      ),
+    });
+    const body = await readResponseBody(response);
+    assertNotWorkQueueExceeded(body, rpcEndpoint);
+
+    return {
+      payload: parseRpcJsonBody<Array<{ error?: unknown; id?: unknown; result?: T }>>(body),
+      response,
+    };
   }
 
   private async withRpcRetry<T>(rpcEndpoint: string, operation: () => Promise<T>): Promise<T> {
@@ -501,6 +605,153 @@ function readRpcBatchResults<T>(
   }
 
   return results as T[];
+}
+
+function readRpcBatchResultsAllowingMissing<T>(
+  response: Response,
+  payload: Array<{ error?: unknown; id?: unknown; result?: T }> | null,
+  rpcEndpoint: string,
+  expectedCount: number,
+): Array<T | null> {
+  if (!response.ok || !Array.isArray(payload) || payload.length !== expectedCount) {
+    throw new InfrastructureError(rpcConnectionErrorMessage(rpcEndpoint));
+  }
+
+  const results = new Array<T | null>(expectedCount).fill(null);
+  const seen = new Array<boolean>(expectedCount).fill(false);
+  for (const entry of payload) {
+    if (!isBatchResultIndex(entry.id, expectedCount)) {
+      throw new InfrastructureError(rpcConnectionErrorMessage(rpcEndpoint));
+    }
+
+    if (isMissingTransactionRpcError(entry.error)) {
+      seen[entry.id] = true;
+      continue;
+    }
+
+    if (isInvalidRpcPayload(entry)) {
+      throw new InfrastructureError(rpcConnectionErrorMessage(rpcEndpoint));
+    }
+
+    results[entry.id] = entry.result as T;
+    seen[entry.id] = true;
+  }
+
+  if (seen.some((value) => !value)) {
+    throw new InfrastructureError(rpcConnectionErrorMessage(rpcEndpoint));
+  }
+
+  return results;
+}
+
+function isMissingTransactionRpcError(error: unknown): boolean {
+  return isPlainRecord(error) && error.code === -5;
+}
+
+function extractRawTransactionHexes(blockHex: string): string[] {
+  const bytes = hexToBytes(blockHex);
+  const txCount = readCompactSize(bytes, 80);
+  let offset = txCount.nextOffset;
+  const hexes: string[] = [];
+
+  for (let index = 0; index < txCount.value; index += 1) {
+    const start = offset;
+    offset = skipRawTransaction(bytes, offset);
+    hexes.push(bytesToHex(bytes.subarray(start, offset)));
+  }
+
+  if (offset !== bytes.length) {
+    throw new InfrastructureError('invalid dogecoin raw block payload');
+  }
+
+  return hexes;
+}
+
+function skipRawTransaction(bytes: Uint8Array, offset: number): number {
+  let cursor = offset + 4;
+  const inputs = readCompactSize(bytes, cursor);
+  cursor = inputs.nextOffset;
+
+  for (let index = 0; index < inputs.value; index += 1) {
+    cursor += 36;
+    const script = readCompactSize(bytes, cursor);
+    cursor = script.nextOffset + script.value + 4;
+  }
+
+  const outputs = readCompactSize(bytes, cursor);
+  cursor = outputs.nextOffset;
+
+  for (let index = 0; index < outputs.value; index += 1) {
+    cursor += 8;
+    const script = readCompactSize(bytes, cursor);
+    cursor = script.nextOffset + script.value;
+  }
+
+  return cursor + 4;
+}
+
+function readCompactSize(
+  bytes: Uint8Array,
+  offset: number,
+): { nextOffset: number; value: number } {
+  const first = requireByte(bytes, offset);
+  if (first < 0xfd) {
+    return { nextOffset: offset + 1, value: first };
+  }
+
+  if (first === 0xfd) {
+    return { nextOffset: offset + 3, value: readUint16LE(bytes, offset + 1) };
+  }
+
+  if (first === 0xfe) {
+    return { nextOffset: offset + 5, value: readUint32LE(bytes, offset + 1) };
+  }
+
+  throw new InfrastructureError('invalid dogecoin raw block payload');
+}
+
+function readUint16LE(bytes: Uint8Array, offset: number): number {
+  return requireByte(bytes, offset) | (requireByte(bytes, offset + 1) << 8);
+}
+
+function readUint32LE(bytes: Uint8Array, offset: number): number {
+  return (
+    requireByte(bytes, offset) |
+    (requireByte(bytes, offset + 1) << 8) |
+    (requireByte(bytes, offset + 2) << 16) |
+    (requireByte(bytes, offset + 3) << 24)
+  ) >>> 0;
+}
+
+function requireByte(bytes: Uint8Array, offset: number): number {
+  const value = bytes[offset];
+  if (value === undefined) {
+    throw new InfrastructureError('invalid dogecoin raw block payload');
+  }
+
+  return value;
+}
+
+function hexToBytes(hex: string): Uint8Array {
+  if (hex.length % 2 !== 0) {
+    throw new InfrastructureError('invalid dogecoin raw block payload');
+  }
+
+  const bytes = new Uint8Array(hex.length / 2);
+  for (let index = 0; index < bytes.length; index += 1) {
+    const value = Number.parseInt(hex.slice(index * 2, index * 2 + 2), 16);
+    if (!Number.isInteger(value)) {
+      throw new InfrastructureError('invalid dogecoin raw block payload');
+    }
+
+    bytes[index] = value;
+  }
+
+  return bytes;
+}
+
+function bytesToHex(bytes: Uint8Array): string {
+  return Buffer.from(bytes).toString('hex');
 }
 
 function isBatchResultIndex(value: unknown, expectedCount: number): value is number {

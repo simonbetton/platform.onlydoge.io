@@ -36,6 +36,11 @@ describe('api integration', () => {
   it('serves heartbeat and openapi', async () => {
     const ctx = await createTestApp();
 
+    const root = await request(ctx.app, '/');
+    expect(root.status).toBe(200);
+    expect(root.headers.get('cache-control')).toBe('no-store');
+    expect(await root.text()).toBe('ok');
+
     const up = await request(ctx.app, '/up');
     expect(up.status).toBe(200);
     expect(up.headers.get('cache-control')).toBe('no-store');
@@ -137,6 +142,10 @@ describe('api integration', () => {
     expect(await readJsonObject(deniedInvalidToken)).toEqual({
       error: 'unauthorized',
     });
+
+    const root = await request(ctx.app, '/');
+    expect(root.status).toBe(200);
+    expect(await root.text()).toBe('ok');
 
     const heartbeat = await request(ctx.app, '/v1/heartbeat');
     expect(heartbeat.status).toBe(204);

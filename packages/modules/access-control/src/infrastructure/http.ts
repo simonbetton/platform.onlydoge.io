@@ -428,7 +428,7 @@ function stripTrailingSlash(path: string): string {
 }
 
 function isPublicRoute(path: string): boolean {
-  if (path === '/up') {
+  if (path === '/' || path === '/up') {
     return true;
   }
 

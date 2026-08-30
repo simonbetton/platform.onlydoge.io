@@ -64,6 +64,7 @@ export function buildApiApp(runtime: Runtime) {
   };
 
   return new Elysia()
+    .get('/', () => handleUp(runtime))
     .get('/up', () => handleUp(runtime))
     .onBeforeHandle((context) =>
       handleBeforeHandle(context, runtime, requestAuth, requestContexts, recordAudit),
@@ -122,7 +123,7 @@ export function buildApiApp(runtime: Runtime) {
         specPath: '/openapi/json',
         provider: 'scalar',
         exclude: {
-          paths: ['/up'],
+          paths: ['/', '/up'],
         },
         documentation: {
           info: {
@@ -1125,7 +1126,7 @@ const cachePolicyRules: Array<{
   policy: CachePolicy;
 }> = [
   {
-    matches: (path) => path === '/up' || path.startsWith('/v1/heartbeat'),
+    matches: (path) => path === '/' || path === '/up' || path.startsWith('/v1/heartbeat'),
     policy: noStorePolicy,
   },
   {

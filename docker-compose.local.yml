@@ -110,7 +110,7 @@ services:
       - '${DOGECOIN_P2P_PORT:-22556}:22556'
       - '${DOGECOIN_ZMQ_PORT:-28332}:28332'
     volumes:
-      - dogecoin_local:/data
+      - ${ONLYDOGE_DATA_DOGECOIN:-dogecoin_local}:/data
     healthcheck:
       test:
         [

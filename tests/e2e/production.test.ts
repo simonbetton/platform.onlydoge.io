@@ -75,6 +75,9 @@ async function expectPublicHealth(client: ProductionApiClient): Promise<void> {
   await eventually(
     'production public health',
     async () => {
+      const root = await client.get('/');
+      expect(root.text.trim()).toBe('ok');
+
       const up = await client.get('/up');
       expect(up.text.trim()).toBe('ok');
 
