@@ -68,7 +68,7 @@
     "@types/pg": "8.23.1",
     "bun-types": "1.4.0",
     "fallow": "3.20.0",
-    "typescript": "6.0.3",
+    "typescript": "7.0.2",
     "vitest": "4.1.11"
   },
   "overrides": {
