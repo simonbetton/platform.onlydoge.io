@@ -67,7 +67,7 @@ Production should run split `http` and `indexer` containers.
 
 ## Requirements
 
-- Bun 1.3.14
+- Bun 1.4.0
 - Docker and Docker Compose for the bundled local or self-hosted stacks
 - PostgreSQL, ClickHouse, and S3-compatible object storage for production-style stacks
 - Dogecoin RPC endpoint for real indexing work

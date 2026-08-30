@@ -7,7 +7,7 @@
     "@onlydoge/access-control": "workspace:*",
     "@onlydoge/indexing-pipeline": "workspace:*",
     "@onlydoge/shared-kernel": "workspace:*",
-    "elysia": "1.4.28",
+    "elysia": "1.4.30",
     "node-sql-parser": "5.4.0"
   }
 }

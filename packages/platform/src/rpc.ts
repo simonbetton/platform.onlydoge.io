@@ -690,10 +690,7 @@ function skipRawTransaction(bytes: Uint8Array, offset: number): number {
   return cursor + 4;
 }
 
-function readCompactSize(
-  bytes: Uint8Array,
-  offset: number,
-): { nextOffset: number; value: number } {
+function readCompactSize(bytes: Uint8Array, offset: number): { nextOffset: number; value: number } {
   const first = requireByte(bytes, offset);
   if (first < 0xfd) {
     return { nextOffset: offset + 1, value: first };
@@ -716,11 +713,12 @@ function readUint16LE(bytes: Uint8Array, offset: number): number {
 
 function readUint32LE(bytes: Uint8Array, offset: number): number {
   return (
-    requireByte(bytes, offset) |
-    (requireByte(bytes, offset + 1) << 8) |
-    (requireByte(bytes, offset + 2) << 16) |
-    (requireByte(bytes, offset + 3) << 24)
-  ) >>> 0;
+    (requireByte(bytes, offset) |
+      (requireByte(bytes, offset + 1) << 8) |
+      (requireByte(bytes, offset + 2) << 16) |
+      (requireByte(bytes, offset + 3) << 24)) >>>
+    0
+  );
 }
 
 function requireByte(bytes: Uint8Array, offset: number): number {
