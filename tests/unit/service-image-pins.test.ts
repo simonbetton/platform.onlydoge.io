@@ -2,8 +2,7 @@ import { readFile } from 'node:fs/promises';
 import { describe, expect, it } from 'vitest';
 
 const root = new URL('../../', import.meta.url);
-const localCompose = new URL('docker-compose.local.yml', root);
-const productionCompose = new URL('docker-compose.prod.yml', root);
+const baseCompose = new URL('docker-compose.yml', root);
 const clickHouseSmoke = new URL('tests/integration/clickhouse-analytics-smoke.test.ts', root);
 const dependabot = new URL('.github/dependabot.yml', root);
 
@@ -25,8 +24,8 @@ function serviceImage(compose: string, service: string): string {
 }
 
 describe('service image pins', () => {
-  it('uses identical immutable infrastructure images in local and production Compose', async () => {
-    for (const composePath of [localCompose, productionCompose]) {
+  it('pins immutable infrastructure images in the default Compose file', async () => {
+    for (const composePath of [baseCompose]) {
       const compose = await readFile(composePath, 'utf8');
 
       expect(serviceImage(compose, 'clickhouse')).toBe(images.clickhouse);

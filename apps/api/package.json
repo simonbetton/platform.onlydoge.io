@@ -9,7 +9,7 @@
     "@onlydoge/explorer-query": "workspace:*",
     "@onlydoge/platform": "workspace:*",
     "@onlydoge/shared-kernel": "workspace:*",
-    "@elysiajs/openapi": "1.4.15",
+    "@elysiajs/openapi": "1.4.16",
     "elysia": "1.4.30"
   }
 }

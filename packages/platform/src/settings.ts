@@ -42,6 +42,7 @@ export interface DogecoinSettings {
   mempoolRetentionSeconds: number;
   mempoolSampleIntervalMs: number;
   rpcEndpoint: string;
+  rpcTimeoutMs: number;
   rps: number;
   zmqBlockEndpoint?: string | null;
   zmqTxEndpoint?: string | null;
@@ -105,7 +106,8 @@ function parseDogecoinSettings(env: NodeJS.ProcessEnv): DogecoinSettings {
       env.ONLYDOGE_RPC_ENDPOINT,
       'http://127.0.0.1:22555',
     ),
-    rps: parsePositiveInteger(env.ONLYDOGE_DOGECOIN_RPC_RPS, 25),
+    rpcTimeoutMs: parsePositiveInteger(env.ONLYDOGE_DOGECOIN_RPC_TIMEOUT_MS, 60_000),
+    rps: parsePositiveInteger(env.ONLYDOGE_DOGECOIN_RPC_RPS, 64),
     zmqBlockEndpoint: env.ONLYDOGE_DOGECOIN_ZMQ_BLOCK_ENDPOINT ?? null,
     zmqTxEndpoint:
       env.ONLYDOGE_DOGECOIN_ZMQ_TX_ENDPOINT ?? env.ONLYDOGE_DOGECOIN_ZMQ_BLOCK_ENDPOINT ?? null,
@@ -487,8 +489,11 @@ function parseIndexerSettings(env: NodeJS.ProcessEnv): IndexerSettings {
       env.ONLYDOGE_INDEXER_LEASE_HEARTBEAT_INTERVAL_MS,
       5_000,
     ),
-    syncWindow: parsePositiveInteger(env.ONLYDOGE_INDEXER_SYNC_WINDOW, 32),
-    syncConcurrency: parsePositiveInteger(env.ONLYDOGE_INDEXER_SYNC_CONCURRENCY, 4),
+    syncBatchSize: parsePositiveInteger(env.ONLYDOGE_INDEXER_SYNC_BATCH_SIZE, 16),
+    syncConcurrency: parsePositiveInteger(env.ONLYDOGE_INDEXER_SYNC_CONCURRENCY, 8),
+    syncRetryAttempts: parsePositiveInteger(env.ONLYDOGE_INDEXER_SYNC_RETRY_ATTEMPTS, 6),
+    syncRetryBaseDelayMs: parsePositiveInteger(env.ONLYDOGE_INDEXER_SYNC_RETRY_BASE_DELAY_MS, 500),
+    syncWindow: parsePositiveInteger(env.ONLYDOGE_INDEXER_SYNC_WINDOW, 256),
   };
 }
 

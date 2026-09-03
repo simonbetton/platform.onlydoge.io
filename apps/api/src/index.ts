@@ -11,7 +11,12 @@ import {
 import { buildAnalyticsQueryHttp } from '@onlydoge/analytics-query';
 import { buildExplorerQueryHttp } from '@onlydoge/explorer-query';
 import type { Runtime } from '@onlydoge/platform';
-import { createLogger, type OnlyDogeLogger, resolveRequestId } from '@onlydoge/platform';
+import {
+  createLogger,
+  type OnlyDogeLogger,
+  readIndexerStatus,
+  resolveRequestId,
+} from '@onlydoge/platform';
 import {
   InfrastructureError,
   maskRpcEndpointAuth,
@@ -109,6 +114,19 @@ export function buildApiApp(runtime: Runtime) {
         },
       },
     )
+    .get('/v1/status/', () => handleStatus(runtime), {
+      detail: {
+        tags: ['Health'],
+        summary: 'Indexer status',
+        description:
+          'Public indexer progress: stage, node tip, sync/process tails, throughput, ETA, readiness flags, and the last (redacted) error.',
+        responses: {
+          200: {
+            description: 'Current indexer status.',
+          },
+        },
+      },
+    })
     .use(buildAnalyticsQueryHttp(runtime.analyticsQuery, resolveAuthenticatedApiKey))
     .use(
       buildExplorerQueryHttp(
@@ -309,6 +327,15 @@ type ErrorContext = {
     status?: number | string;
   };
 };
+
+async function handleStatus(runtime: Runtime): Promise<Response> {
+  const status = await readIndexerStatus(runtime.metadata);
+  return Response.json(status, {
+    headers: {
+      'cache-control': 'no-store',
+    },
+  });
+}
 
 async function handleUp(_runtime: Runtime): Promise<Response> {
   return new Response('ok', {
@@ -1126,7 +1153,11 @@ const cachePolicyRules: Array<{
   policy: CachePolicy;
 }> = [
   {
-    matches: (path) => path === '/' || path === '/up' || path.startsWith('/v1/heartbeat'),
+    matches: (path) =>
+      path === '/' ||
+      path === '/up' ||
+      path.startsWith('/v1/heartbeat') ||
+      path.startsWith('/v1/status'),
     policy: noStorePolicy,
   },
   {

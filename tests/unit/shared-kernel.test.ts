@@ -38,8 +38,11 @@ describe('shared kernel', () => {
       coreProgressWatchdogMs: 180000,
       coreRawStorageTimeoutMs: 30000,
       coreSyncCompleteDistance: 6,
-      syncConcurrency: 4,
-      syncWindow: 32,
+      syncBatchSize: 16,
+      syncConcurrency: 8,
+      syncRetryAttempts: 6,
+      syncRetryBaseDelayMs: 500,
+      syncWindow: 256,
     });
     expect(settings.storage.driver).toBe('file');
     expect(settings.warehouse.driver).toBe('duckdb');

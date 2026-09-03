@@ -9,7 +9,7 @@ import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 
 import type { DockerService } from '../adapters/docker-service';
 import { clickHouseQuery, startClickHouse } from '../adapters/services';
-import { dogecoinFixture } from '../fixtures/dogecoin';
+import { dogecoinFixture, dogecoinTxid } from '../fixtures/dogecoin';
 import { installRpcMock, request, requireString, runIndexerUntilProcessed } from '../helpers';
 
 const runSmoke = process.env.ONLYDOGE_RUN_CLICKHOUSE_SMOKE === '1';
@@ -87,7 +87,7 @@ describeSmoke('clickhouse analytics smoke', () => {
         });
         expect(payload.rows).toEqual([
           expect.objectContaining({
-            txid: 'doge-tx-1',
+            txid: dogecoinTxid('doge-tx-1'),
           }),
         ]);
         expect(String(readFirstRow(payload.rows).fee_base)).toBe('100000000');
@@ -184,15 +184,19 @@ async function expectExplorerReads(
   expect(blockResponse.status).toBe(200);
   expect(await readJsonObject(blockResponse)).toMatchObject({
     block: { height: 2 },
-    transactions: [expect.objectContaining({ txid: 'doge-tx-2' })],
+    transactions: [expect.objectContaining({ txid: dogecoinTxid('doge-tx-2') })],
   });
 
-  const transactionResponse = await request(app, '/v1/explorer/transactions/doge-tx-2', {
-    headers,
-  });
+  const transactionResponse = await request(
+    app,
+    `/v1/explorer/transactions/${dogecoinTxid('doge-tx-2')}`,
+    {
+      headers,
+    },
+  );
   expect(transactionResponse.status).toBe(200);
   expect(await readJsonObject(transactionResponse)).toMatchObject({
-    transaction: { txid: 'doge-tx-2' },
+    transaction: { txid: dogecoinTxid('doge-tx-2') },
   });
 
   const addressResponse = await request(

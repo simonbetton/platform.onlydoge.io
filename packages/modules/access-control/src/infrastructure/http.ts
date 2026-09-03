@@ -435,7 +435,7 @@ function isPublicRoute(path: string): boolean {
   return publicRoutePrefixes.some((prefix) => path.startsWith(prefix));
 }
 
-const publicRoutePrefixes = ['/v1/heartbeat', '/openapi'];
+const publicRoutePrefixes = ['/v1/heartbeat', '/v1/status', '/openapi'];
 
 function isBootstrapKeyRoute(method: string, path: string, hasConfiguredKeys: boolean): boolean {
   return [method.toUpperCase() === 'POST', path === '/v1/keys', !hasConfiguredKeys].every(Boolean);

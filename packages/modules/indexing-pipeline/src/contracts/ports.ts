@@ -147,6 +147,14 @@ export interface BlockchainRpcPort {
     },
     blockHeight: number,
   ): Promise<Record<string, unknown>>;
+  getBlockSnapshots(
+    dogecoin: {
+      architecture: 'dogecoin';
+      rpcEndpoint: string;
+      rps: number;
+    },
+    blockHeights: number[],
+  ): Promise<Record<string, unknown>[]>;
 }
 
 export interface ProjectionWarehousePort {

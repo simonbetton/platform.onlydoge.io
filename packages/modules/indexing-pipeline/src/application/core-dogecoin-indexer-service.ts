@@ -22,10 +22,15 @@ import {
   configKeyIndexerFactProgress,
   configKeyIndexerFactTail,
   configKeyIndexerFinalizedTail,
+  configKeyIndexerLastActivityAt,
+  configKeyIndexerProcessBlocksPerSecond,
+  configKeyIndexerProcessEtaSeconds,
   configKeyIndexerProcessProgress,
   configKeyIndexerProcessTail,
   configKeyIndexerReprocessDepth,
   configKeyIndexerStage,
+  configKeyIndexerSyncBlocksPerSecond,
+  configKeyIndexerSyncEtaSeconds,
   configKeyIndexerSyncProgress,
   configKeyIndexerSyncTail,
   configKeyPrimary,
@@ -52,6 +57,7 @@ import type {
 import { deriveTransactionRefsFromBlock, type TransactionRef } from '../domain/transaction-ref';
 import { mapWithConcurrency, range } from './concurrency';
 import type { CoreDogecoinIndexerSettings } from './core-dogecoin-indexer-settings';
+import { RawBlockSyncer, type RawBlockSyncHooks, rawBlockPart } from './raw-block-sync';
 
 interface PrimaryLease {
   heartbeatAt: string;
@@ -73,7 +79,8 @@ interface DogecoinRuntimeConfig {
 }
 
 const workerIdleMs = 250;
-const rawBlockPart = 'block';
+const loopFailureBackoffMaxMs = 30_000;
+const throughputSmoothing = 0.3;
 
 interface ProgressObservation {
   observedAtMs: number;
@@ -149,9 +156,14 @@ class PrimaryLeaseLostError extends Error {
 export class CoreDogecoinIndexerService {
   private readonly instanceId = randomUUID();
   private readonly logger: ServiceLogger;
+  private readonly syncer: RawBlockSyncer;
   private activeBlockAttempt: CoreBlockAttempt | null = null;
+  private consecutiveLoopFailures = 0;
+  private lastActivityAtMs = Date.now();
   private primaryLease: PrimaryLease | null = null;
+  private processBlocksPerSecond: number | null = null;
   private progressObservation: ProgressObservation | null = null;
+  private syncBlocksPerSecond: number | null = null;
 
   public constructor(
     private readonly configs: CoordinatorConfigPort,
@@ -163,6 +175,23 @@ export class CoreDogecoinIndexerService {
     private readonly options: CoreDogecoinIndexerServiceOptions = {},
   ) {
     this.logger = options.logger ?? noopServiceLogger();
+    this.syncer = new RawBlockSyncer(
+      rpc,
+      rawBlocks,
+      stateStore,
+      (snapshot) => {
+        const block = parseDogecoinBlockSnapshot(snapshot);
+        return {
+          hash: block.hash,
+          height: block.height,
+          previousHash: block.previousHash,
+          time: block.time,
+          txids: block.tx.map((transaction) => requireString(transaction.txid, 'tx.txid')),
+        };
+      },
+      settings,
+      { logger: this.logger },
+    );
   }
 
   // fallow-ignore-next-line unused-class-member
@@ -187,9 +216,15 @@ export class CoreDogecoinIndexerService {
   private async runStartLoopIteration(): Promise<void> {
     try {
       await this.runPrimaryLoopWork();
+      this.consecutiveLoopFailures = 0;
     } catch (error) {
-      this.logger.error(this.errorBindings(error), 'core indexer loop failed');
-      await sleep(1_000);
+      this.consecutiveLoopFailures += 1;
+      const backoffMs = loopFailureBackoffMs(this.consecutiveLoopFailures);
+      this.logger.error(
+        { ...this.errorBindings(error), backoffMs, failures: this.consecutiveLoopFailures },
+        'core indexer loop failed',
+      );
+      await sleep(backoffMs);
     }
   }
 
@@ -331,8 +366,11 @@ export class CoreDogecoinIndexerService {
     syncTail: number,
     stage: CoreIndexerState['stage'],
   ): Promise<boolean> {
-    await this.storeRawBlockHeights(dogecoin, heights);
+    const result = await this.storeRawBlockHeights(dogecoin, heights, {
+      onCheckpoint: (frontier) => this.checkpointSyncTail(latest, state, frontier, stage),
+    });
     this.assertPrimaryLease();
+    this.recordSyncThroughput(result.blocks, result.elapsedMs);
 
     const nextState = await this.stateStore.upsertCoreIndexerState({
       stage,
@@ -345,54 +383,65 @@ export class CoreDogecoinIndexerService {
       {
         blockEnd: heights.at(-1) ?? syncTail,
         blockStart: heights.at(0) ?? state.syncTail + 1,
+        blocksPerSecond: roundRate(this.syncBlocksPerSecond),
         chain: dogecoin.id,
         component: 'core-indexer',
+        concurrency: this.syncer.currentConcurrency,
+        elapsedMs: result.elapsedMs,
+        failedAttempts: result.failedAttempts,
         latest,
+        remaining: Math.max(0, latest - syncTail),
+        rpcMs: result.rpcMs,
+        storeMs: result.storeMs,
       },
       'core synced',
     );
     return true;
   }
 
-  private async storeRawBlockHeights(
+  private async checkpointSyncTail(
+    latest: number,
+    state: CoreIndexerState,
+    frontier: number,
+    stage: CoreIndexerState['stage'],
+  ): Promise<void> {
+    if (frontier <= state.syncTail) {
+      return;
+    }
+
+    this.assertPrimaryLease();
+    const nextState = await this.stateStore.upsertCoreIndexerState({
+      stage,
+      syncTail: frontier,
+      onlineTip: latest,
+      lastError: null,
+    });
+    state.syncTail = frontier;
+    this.observeProgress(nextState);
+  }
+
+  private storeRawBlockHeights(
     dogecoin: DogecoinRuntimeConfig,
     heights: number[],
-  ): Promise<void> {
-    const transactionRefs: TransactionRef[] = [];
-
-    await mapWithConcurrency(heights, this.settings.syncConcurrency, async (height) => {
-      this.assertPrimaryLease();
-      const snapshot = await this.rpc.getBlockSnapshot(dogecoin, height);
-      await this.rawBlocks.putPart(height, rawBlockPart, snapshot, {
-        timeoutMs: this.settings.coreRawStorageTimeoutMs,
-      });
-      const block = parseDogecoinBlockSnapshot(snapshot);
-      transactionRefs.push(
-        ...deriveTransactionRefsFromBlock({
-          blockHash: block.hash,
-          blockHeight: block.height,
-          blockTime: block.time,
-          source: 'raw_sync',
-          transactions: block.tx.map((transaction) => ({
-            txid: requireString(transaction.txid, 'tx.txid'),
-          })),
-        }),
-      );
-      await this.stateStore.upsertCoreBlock({
-        blockHeight: block.height,
-        blockHash: block.hash,
-        previousBlockHash: block.previousHash,
-        blockTime: block.time,
-        txCount: block.tx.length,
-        rawStorageKey: rawBlockPart,
-        fetchedAt: new Date().toISOString(),
-        processedAt: null,
-      });
+    hooks: Pick<RawBlockSyncHooks, 'onCheckpoint'> = {},
+  ) {
+    return this.syncer.sync(dogecoin, heights, {
+      ...hooks,
+      assertActive: () => this.assertPrimaryLease(),
+      onActivity: () => this.recordActivity(),
     });
+  }
 
-    if (transactionRefs.length > 0) {
-      await this.stateStore.upsertTransactionRefs(transactionRefs);
-    }
+  private recordActivity(): void {
+    this.lastActivityAtMs = Date.now();
+  }
+
+  private recordSyncThroughput(blocks: number, elapsedMs: number): void {
+    this.syncBlocksPerSecond = smoothRate(this.syncBlocksPerSecond, blocks, elapsedMs);
+  }
+
+  private recordProcessThroughput(blocks: number, elapsedMs: number): void {
+    this.processBlocksPerSecond = smoothRate(this.processBlocksPerSecond, blocks, elapsedMs);
   }
 
   private async backfillTransactionRefsIfNeeded(dogecoin: DogecoinRuntimeConfig): Promise<void> {
@@ -869,6 +918,7 @@ export class CoreDogecoinIndexerService {
       await this.exitForCoreBlockTimeout(error, dogecoin, metrics.end);
       throw error;
     }
+    this.recordProcessThroughput(metrics.blocks, metrics.totalMs + publishMs);
 
     this.logger.info(
       {
@@ -876,6 +926,7 @@ export class CoreDogecoinIndexerService {
         applyMs: metrics.applyMs,
         blockEnd: metrics.end,
         blockStart: metrics.start,
+        blocksPerSecond: roundRate(this.processBlocksPerSecond),
         buildMs: metrics.buildMs,
         chain: dogecoin.id,
         component: 'core-indexer',
@@ -1119,6 +1170,26 @@ export class CoreDogecoinIndexerService {
         configKeyIndexerProcessProgress(),
         toProgress(state.processTail, latest),
       ),
+      this.configs.setJsonValue(
+        configKeyIndexerSyncBlocksPerSecond(),
+        roundRate(this.syncBlocksPerSecond),
+      ),
+      this.configs.setJsonValue(
+        configKeyIndexerSyncEtaSeconds(),
+        etaSeconds(latest - state.syncTail, this.syncBlocksPerSecond),
+      ),
+      this.configs.setJsonValue(
+        configKeyIndexerProcessBlocksPerSecond(),
+        roundRate(this.processBlocksPerSecond),
+      ),
+      this.configs.setJsonValue(
+        configKeyIndexerProcessEtaSeconds(),
+        etaSeconds(latest - state.processTail, this.processBlocksPerSecond),
+      ),
+      this.configs.setJsonValue(
+        configKeyIndexerLastActivityAt(),
+        new Date(this.lastActivityAtMs).toISOString(),
+      ),
     ];
     if (historyReady) {
       writes.push(
@@ -1166,6 +1237,7 @@ export class CoreDogecoinIndexerService {
         return error;
       },
     );
+    this.recordActivity();
     this.assertPrimaryLease();
     return {
       elapsedMs: Date.now() - startedAt,
@@ -1213,6 +1285,12 @@ export class CoreDogecoinIndexerService {
     );
   }
 
+  /**
+   * Age of the last sign of life while a backlog exists. Both progress and
+   * completed attempts (including failed RPC batches) count as life: a slow or
+   * unreachable node is reported through `lastError`/health, not by killing
+   * the process, which would only re-enqueue the same work against the node.
+   */
   private coreProgressBacklogAgeMs(
     state: CoreIndexerState,
     latest: number,
@@ -1222,7 +1300,7 @@ export class CoreDogecoinIndexerService {
       return null;
     }
 
-    return Date.now() - observation.observedAtMs;
+    return Date.now() - Math.max(observation.observedAtMs, this.lastActivityAtMs);
   }
 
   private async exitForExpiredProgressWatchdog(
@@ -1608,6 +1686,39 @@ function isPrimaryLeaseCandidate(value: PrimaryLease | string | null): value is 
 
 function hasPrimaryLeaseShape(value: PrimaryLease): boolean {
   return typeof value.instanceId === 'string' && typeof value.heartbeatAt === 'string';
+}
+
+function loopFailureBackoffMs(failures: number): number {
+  return Math.min(loopFailureBackoffMaxMs, 1_000 * 2 ** Math.max(0, failures - 1));
+}
+
+function smoothRate(previous: number | null, blocks: number, elapsedMs: number): number | null {
+  if (blocks <= 0 || elapsedMs <= 0) {
+    return previous;
+  }
+
+  const sample = (blocks * 1_000) / elapsedMs;
+  if (previous === null) {
+    return sample;
+  }
+
+  return previous + throughputSmoothing * (sample - previous);
+}
+
+function roundRate(rate: number | null): number | null {
+  if (rate === null) {
+    return null;
+  }
+
+  return Math.round(rate * 100) / 100;
+}
+
+function etaSeconds(remaining: number, rate: number | null): number | null {
+  if (rate === null || rate <= 0) {
+    return null;
+  }
+
+  return Math.max(0, Math.round(remaining / rate));
 }
 
 function toProgress(tail: number, latest: number): number {

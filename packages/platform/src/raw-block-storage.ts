@@ -1,6 +1,7 @@
 import { mkdir, readFile, writeFile } from 'node:fs/promises';
 import { dirname, join } from 'node:path';
-import { gunzipSync, gzipSync } from 'node:zlib';
+import { promisify } from 'node:util';
+import { gunzip, gzip } from 'node:zlib';
 
 import { GetObjectCommand, PutObjectCommand, S3Client } from '@aws-sdk/client-s3';
 
@@ -25,7 +26,7 @@ export class FileRawBlockStorageAdapter implements RawBlockStoragePort {
     try {
       const payload = await readFile(filePath);
       assertNotAborted(context);
-      return decodeJsonGzip<T>(payload);
+      return await decodeJsonGzip<T>(payload);
     } catch (error) {
       assertNotAborted(context);
       if (isFileNotFoundError(error)) {
@@ -46,7 +47,7 @@ export class FileRawBlockStorageAdapter implements RawBlockStoragePort {
     assertNotAborted(context);
     const filePath = join(this.basePath, String(blockHeight), `${part}.json.gz`);
     await mkdir(dirname(filePath), { recursive: true });
-    await writeFile(filePath, gzipSync(Buffer.from(JSON.stringify(payload))));
+    await writeFile(filePath, await encodeJsonGzip(payload));
     assertNotAborted(context);
   }
 }
@@ -73,7 +74,7 @@ export class S3RawBlockStorageAdapter implements RawBlockStoragePort {
     try {
       const body = await this.getObjectBody(key, request);
       assertNotAborted(context);
-      return decodeJsonGzip<T>(body);
+      return await decodeJsonGzip<T>(body);
     } catch (error) {
       throwIfRequestAborted(request, `raw block storage get timed out key=${key}`);
       if (isS3NotFoundError(error)) {
@@ -125,7 +126,7 @@ export class S3RawBlockStorageAdapter implements RawBlockStoragePort {
       new PutObjectCommand({
         Bucket: this.bucket,
         Key: key,
-        Body: gzipSync(Buffer.from(JSON.stringify(payload))),
+        Body: await encodeJsonGzip(payload),
         ContentType: 'application/json',
         ContentEncoding: 'gzip',
       }),
@@ -230,8 +231,17 @@ function hasS3Credentials(settings: StorageSettings): settings is StorageSetting
   return [settings.accessKeyId, settings.secretAccessKey].every(Boolean);
 }
 
-function decodeJsonGzip<T extends Record<string, unknown>>(payload: Uint8Array): T {
-  return JSON.parse(gunzipSync(payload).toString('utf8'));
+// Async zlib runs on the libuv threadpool, so compressing/decompressing block
+// snapshots does not stall the indexer's single JS thread.
+const gzipAsync = promisify(gzip);
+const gunzipAsync = promisify(gunzip);
+
+async function encodeJsonGzip(payload: Record<string, unknown>): Promise<Buffer> {
+  return gzipAsync(Buffer.from(JSON.stringify(payload)));
+}
+
+async function decodeJsonGzip<T extends Record<string, unknown>>(payload: Uint8Array): Promise<T> {
+  return JSON.parse((await gunzipAsync(payload)).toString('utf8'));
 }
 
 function isFileNotFoundError(error: unknown): boolean {

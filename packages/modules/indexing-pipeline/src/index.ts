@@ -1,6 +1,7 @@
 export * from './application/concurrency';
 export * from './application/core-dogecoin-indexer-service';
 export * from './application/core-dogecoin-indexer-settings';
+export * from './application/raw-block-sync';
 export * from './contracts/ports';
 export * from './domain/amounts';
 export * from './domain/config-keys';

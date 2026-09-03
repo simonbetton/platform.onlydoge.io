@@ -1,0 +1,215 @@
+# Default OnlyDoge stack: Dogecoin Core, PostgreSQL, ClickHouse, MinIO, and the
+# split API + indexer containers built from the production image target.
+#
+#   docker compose up -d                      # self-hosted, reads ./.env if present
+#   bun run docker:local:up                   # adds docker-compose.local.yml (dev overrides)
+#
+# Every variable has a working default; copy .env.example to .env (or .env.local
+# for the local override) to change any of them. To use an external Dogecoin
+# node, set ONLYDOGE_DOGECOIN_RPC_ENDPOINT and start with `--scale dogecoin=0`.
+
+x-onlydoge-env: &onlydoge-env
+  ONLYDOGE_DATABASE: postgres://${POSTGRES_USER:-onlydoge}:${POSTGRES_PASSWORD:-onlydoge}@postgres:5432/${POSTGRES_DB:-onlydoge}
+  ONLYDOGE_STORAGE: http://minio:9000/${MINIO_BUCKET:-onlydoge-raw}/${MINIO_PREFIX:-storage}
+  ONLYDOGE_S3_ACCESS_KEY_ID: ${MINIO_ROOT_USER:-onlydoge}
+  ONLYDOGE_S3_SECRET_ACCESS_KEY: ${MINIO_ROOT_PASSWORD:-onlydoge123}
+  ONLYDOGE_WAREHOUSE: http://clickhouse:8123?database=${CLICKHOUSE_DB:-onlydoge}
+  ONLYDOGE_WAREHOUSE_USER: ${CLICKHOUSE_USER:-onlydoge}
+  ONLYDOGE_WAREHOUSE_PASSWORD: ${CLICKHOUSE_PASSWORD:-onlydoge}
+  ONLYDOGE_WAREHOUSE_REQUEST_TIMEOUT_MS: ${ONLYDOGE_WAREHOUSE_REQUEST_TIMEOUT_MS:-30000}
+  ONLYDOGE_ANALYTICS_WAREHOUSE_USER: ${CLICKHOUSE_ANALYTICS_USER:-onlydoge_analytics}
+  ONLYDOGE_ANALYTICS_WAREHOUSE_PASSWORD: ${CLICKHOUSE_ANALYTICS_PASSWORD:-onlydoge_analytics}
+  ONLYDOGE_DOGECOIN_RPC_ENDPOINT: ${ONLYDOGE_DOGECOIN_RPC_ENDPOINT:-http://${DOGECOIN_RPC_USER:-onlydoge}:${DOGECOIN_RPC_PASSWORD:-onlydoge}@dogecoin:22555/}
+  ONLYDOGE_DOGECOIN_RPC_RPS: ${ONLYDOGE_DOGECOIN_RPC_RPS:-100}
+  ONLYDOGE_DOGECOIN_RPC_TIMEOUT_MS: ${ONLYDOGE_DOGECOIN_RPC_TIMEOUT_MS:-60000}
+  ONLYDOGE_AUDIT_RETENTION_DAYS: ${ONLYDOGE_AUDIT_RETENTION_DAYS:-365}
+
+x-onlydoge-indexer-env: &onlydoge-indexer-env
+  <<: *onlydoge-env
+  ONLYDOGE_DOGECOIN_ZMQ_BLOCK_ENDPOINT: ${ONLYDOGE_DOGECOIN_ZMQ_BLOCK_ENDPOINT:-tcp://dogecoin:28332}
+  ONLYDOGE_DOGECOIN_ZMQ_TX_ENDPOINT: ${ONLYDOGE_DOGECOIN_ZMQ_TX_ENDPOINT:-tcp://dogecoin:28332}
+  ONLYDOGE_INDEXER_LEASE_HEARTBEAT_INTERVAL_MS: ${ONLYDOGE_INDEXER_LEASE_HEARTBEAT_INTERVAL_MS:-5000}
+  ONLYDOGE_INDEXER_SYNC_WINDOW: ${ONLYDOGE_INDEXER_SYNC_WINDOW:-256}
+  ONLYDOGE_INDEXER_SYNC_BATCH_SIZE: ${ONLYDOGE_INDEXER_SYNC_BATCH_SIZE:-16}
+  ONLYDOGE_INDEXER_SYNC_CONCURRENCY: ${ONLYDOGE_INDEXER_SYNC_CONCURRENCY:-8}
+  ONLYDOGE_INDEXER_SYNC_RETRY_ATTEMPTS: ${ONLYDOGE_INDEXER_SYNC_RETRY_ATTEMPTS:-6}
+  ONLYDOGE_INDEXER_SYNC_RETRY_BASE_DELAY_MS: ${ONLYDOGE_INDEXER_SYNC_RETRY_BASE_DELAY_MS:-500}
+  ONLYDOGE_CORE_BLOCK_TIMEOUT_MS: ${ONLYDOGE_CORE_BLOCK_TIMEOUT_MS:-120000}
+  ONLYDOGE_CORE_DB_STATEMENT_TIMEOUT_MS: ${ONLYDOGE_CORE_DB_STATEMENT_TIMEOUT_MS:-30000}
+  ONLYDOGE_CORE_SYNC_COMPLETE_DISTANCE: ${ONLYDOGE_CORE_SYNC_COMPLETE_DISTANCE:-6}
+  ONLYDOGE_CORE_PROCESS_LOAD_CONCURRENCY: ${ONLYDOGE_CORE_PROCESS_LOAD_CONCURRENCY:-8}
+  ONLYDOGE_CORE_PROCESS_WINDOW: ${ONLYDOGE_CORE_PROCESS_WINDOW:-100}
+  ONLYDOGE_CORE_PROGRESS_WATCHDOG_MS: ${ONLYDOGE_CORE_PROGRESS_WATCHDOG_MS:-180000}
+  ONLYDOGE_CORE_RAW_STORAGE_TIMEOUT_MS: ${ONLYDOGE_CORE_RAW_STORAGE_TIMEOUT_MS:-30000}
+  ONLYDOGE_CORE_REPROCESS_DEPTH: ${ONLYDOGE_CORE_REPROCESS_DEPTH:-10}
+  ONLYDOGE_CORE_ONLINE_TIP_DISTANCE: ${ONLYDOGE_CORE_ONLINE_TIP_DISTANCE:-6}
+  ONLYDOGE_MEMPOOL_SAMPLE_INTERVAL_MS: ${ONLYDOGE_MEMPOOL_SAMPLE_INTERVAL_MS:-15000}
+  ONLYDOGE_MEMPOOL_RETENTION_SECONDS: ${ONLYDOGE_MEMPOOL_RETENTION_SECONDS:-3600}
+
+services:
+  postgres:
+    image: postgres:17-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-onlydoge}
+      POSTGRES_USER: ${POSTGRES_USER:-onlydoge}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-onlydoge}
+    healthcheck:
+      test: ['CMD-SHELL', 'pg_isready -U $$POSTGRES_USER -d $$POSTGRES_DB']
+      interval: 5s
+      timeout: 5s
+      retries: 12
+      start_period: 5s
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+
+  minio:
+    image: minio/minio:RELEASE.2025-09-07T16-13-09Z@sha256:14cea493d9a34af32f524e538b8346cf79f3321eff8e708c1e2960462bd8936e
+    restart: unless-stopped
+    command: ['server', '/data', '--console-address', ':9001']
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:-onlydoge}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:-onlydoge123}
+    volumes:
+      - minio_data:/data
+
+  minio-create-bucket:
+    image: minio/mc:RELEASE.2025-08-13T08-35-41Z@sha256:a7fe349ef4bd8521fb8497f55c6042871b2ae640607cf99d9bede5e9bdf11727
+    depends_on:
+      - minio
+    entrypoint:
+      - /bin/sh
+      - -lc
+      - |
+        until mc alias set local http://minio:9000 "$$MINIO_ROOT_USER" "$$MINIO_ROOT_PASSWORD"; do
+          sleep 1
+        done
+        mc mb --ignore-existing "local/$$MINIO_BUCKET"
+        mc anonymous set none "local/$$MINIO_BUCKET"
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:-onlydoge}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:-onlydoge123}
+      MINIO_BUCKET: ${MINIO_BUCKET:-onlydoge-raw}
+    restart: 'no'
+
+  clickhouse:
+    image: clickhouse/clickhouse-server:26.6.1.1193@sha256:1d1f6508eba2dccce2cee9913907c5f7766327debc57a6b1991f2c9e3176c163
+    restart: unless-stopped
+    environment:
+      CLICKHOUSE_DB: ${CLICKHOUSE_DB:-onlydoge}
+      CLICKHOUSE_USER: ${CLICKHOUSE_USER:-onlydoge}
+      CLICKHOUSE_PASSWORD: ${CLICKHOUSE_PASSWORD:-onlydoge}
+      CLICKHOUSE_ANALYTICS_PASSWORD: ${CLICKHOUSE_ANALYTICS_PASSWORD:-onlydoge_analytics}
+      CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT: 1
+    healthcheck:
+      test:
+        [
+          'CMD-SHELL',
+          'clickhouse-client --user "$$CLICKHOUSE_USER" --password "$$CLICKHOUSE_PASSWORD" --query "SELECT 1" >/dev/null 2>&1',
+        ]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+      start_period: 10s
+    volumes:
+      - clickhouse_data:/var/lib/clickhouse
+      - ./docker/clickhouse/config.d/onlydoge-memory.xml:/etc/clickhouse-server/config.d/onlydoge-memory.xml:ro
+      - ./docker/clickhouse/users.d/onlydoge-memory.xml:/etc/clickhouse-server/users.d/onlydoge-memory.xml:ro
+      - ./docker/clickhouse/users.d/onlydoge-analytics.xml:/etc/clickhouse-server/users.d/onlydoge-analytics.xml:ro
+
+  dogecoin:
+    # Native amd64/arm64 Dogecoin Core built from the official release tarballs
+    # (docker/dogecoin). Flags are driven by DOGECOIN_* env.
+    build:
+      context: docker/dogecoin
+    image: onlydoge/dogecoin-core:1.14.9
+    restart: unless-stopped
+    environment:
+      DOGECOIN_UACOMMENT: ${DOGECOIN_UACOMMENT:-OnlyDoge}
+      DOGECOIN_RPC_USER: ${DOGECOIN_RPC_USER:-onlydoge}
+      DOGECOIN_RPC_PASSWORD: ${DOGECOIN_RPC_PASSWORD:-onlydoge}
+      DOGECOIN_RPC_PORT: 22555
+      DOGECOIN_RPC_THREADS: ${DOGECOIN_RPC_THREADS:-8}
+      DOGECOIN_RPC_WORKQUEUE: ${DOGECOIN_RPC_WORKQUEUE:-256}
+      DOGECOIN_DBCACHE: ${DOGECOIN_DBCACHE:-2048}
+      DOGECOIN_MAX_CONNECTIONS: ${DOGECOIN_MAX_CONNECTIONS:-64}
+      DOGECOIN_ZMQ_PORT: 28332
+      DOGECOIN_EXTRA_ARGS: ${DOGECOIN_EXTRA_ARGS:-}
+    ports:
+      - '${DOGECOIN_P2P_PORT:-22556}:22556'
+    volumes:
+      # Docker-managed volume by default, or an absolute host path (SSD strongly
+      # preferred) for the ~250 GB chain: ONLYDOGE_DATA_DOGECOIN=/path/on/ssd
+      - ${ONLYDOGE_DATA_DOGECOIN:-dogecoin_data}:/data
+    healthcheck:
+      test:
+        [
+          'CMD-SHELL',
+          'dogecoin-cli -datadir=/data -rpcuser="$$DOGECOIN_RPC_USER" -rpcpassword="$$DOGECOIN_RPC_PASSWORD" -rpcport="$$DOGECOIN_RPC_PORT" getblockchaininfo >/dev/null 2>&1',
+        ]
+      interval: 15s
+      timeout: 10s
+      retries: 40
+      start_period: 60s
+
+  onlydoge-api:
+    build:
+      context: .
+      target: production
+    image: onlydoge/onlydoge:local
+    restart: unless-stopped
+    command: ['--mode=http', '--ip=0.0.0.0', '--port=2277']
+    depends_on:
+      postgres:
+        condition: service_healthy
+      minio-create-bucket:
+        condition: service_completed_successfully
+      clickhouse:
+        condition: service_healthy
+    environment:
+      <<: *onlydoge-env
+    ports:
+      - '${ONLYDOGE_HTTP_PORT:-2277}:2277'
+    healthcheck:
+      test:
+        [
+          'CMD',
+          'bun',
+          '-e',
+          "const response = await fetch('http://127.0.0.1:2277/v1/heartbeat'); if (response.status !== 204) process.exit(1);",
+        ]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 15s
+
+  onlydoge-indexer:
+    build:
+      context: .
+      target: production
+    image: onlydoge/onlydoge:local
+    restart: unless-stopped
+    command: ['--mode=indexer']
+    # No dependency on the dogecoin service: the indexer retries with backoff
+    # while the node starts or catches up, and reports it via /v1/status.
+    depends_on:
+      postgres:
+        condition: service_healthy
+      minio-create-bucket:
+        condition: service_completed_successfully
+      clickhouse:
+        condition: service_healthy
+    environment:
+      <<: *onlydoge-indexer-env
+    healthcheck:
+      test: ['CMD', 'bun', 'run', 'scripts/indexer-health.ts']
+      interval: 30s
+      timeout: 15s
+      retries: 3
+      start_period: 60s
+
+volumes:
+  postgres_data:
+  minio_data:
+  clickhouse_data:
+  dogecoin_data:

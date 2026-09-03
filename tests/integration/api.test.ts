@@ -9,7 +9,7 @@ import { createRuntime } from '@onlydoge/platform';
 import { ApiSecret } from '@onlydoge/shared-kernel';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
-import { dogecoinFixture } from '../fixtures/dogecoin';
+import { dogecoinFixture, dogecoinTxid } from '../fixtures/dogecoin';
 import {
   createAuthenticatedTestApp,
   createTestApp,
@@ -48,6 +48,17 @@ describe('api integration', () => {
     const heartbeat = await request(ctx.app, '/v1/heartbeat');
     expect(heartbeat.status).toBe(204);
     expect(heartbeat.headers.get('cache-control')).toBe('no-store');
+
+    const status = await request(ctx.app, '/v1/status');
+    expect(status.status).toBe(200);
+    expect(status.headers.get('cache-control')).toBe('no-store');
+    expect(await status.json()).toMatchObject({
+      chain: 'dogecoin',
+      stage: 'uninitialized',
+      sync: { tail: -1 },
+      process: { tail: -1 },
+      readiness: { currentState: false, history: false, analyticsFacts: false },
+    });
 
     const openapi = await request(ctx.app, '/openapi/json');
     expect(openapi.status).toBe(200);
@@ -731,7 +742,7 @@ describe('api integration', () => {
       );
       expect(utxos.status).toBe(200);
       const [utxo] = readObjectArrayField(await readJsonObject(utxos), 'utxos');
-      expect(requireStringField(utxo ?? {}, 'outputKey')).toBe('doge-tx-2:0');
+      expect(requireStringField(utxo ?? {}, 'outputKey')).toBe(`${dogecoinTxid('doge-tx-2')}:0`);
     } finally {
       await scenario.ctx.cleanup();
     }
@@ -792,13 +803,13 @@ async function expectExplorerSearch({ ctx, headers }: ExplorerScenario): Promise
   const heightMatch = readObjectArrayField(await readJsonObject(searchByHeight), 'matches')[0];
   expect(requireStringField(heightMatch ?? {}, 'type')).toBe('block');
 
-  const searchByTx = await request(ctx.app, '/v1/explorer/search?q=doge-tx-2', {
+  const searchByTx = await request(ctx.app, `/v1/explorer/search?q=${dogecoinTxid('doge-tx-2')}`, {
     headers,
   });
   const txMatch = readObjectArrayField(await readJsonObject(searchByTx), 'matches')[0];
   expect(txMatch).toMatchObject({
     type: 'transaction',
-    txid: 'doge-tx-2',
+    txid: dogecoinTxid('doge-tx-2'),
     blockHeight: 2,
   });
 
@@ -827,7 +838,7 @@ async function expectExplorerBlocks({ ctx, headers }: ExplorerScenario): Promise
   expect(requireNumberField(blockDetailBody, 'returnedCount')).toBe(1);
   expect(requireNumberField(blockDetailBody, 'totalCount')).toBe(1);
   const [blockTx] = readObjectArrayField(blockDetailBody, 'transactions');
-  expect(requireStringField(blockTx ?? {}, 'txid')).toBe('doge-tx-2');
+  expect(requireStringField(blockTx ?? {}, 'txid')).toBe(dogecoinTxid('doge-tx-2'));
 
   const blockDetailByHash = await request(
     ctx.app,
@@ -917,11 +928,15 @@ async function expectExplorerMempool(
 }
 
 async function expectExplorerTransaction({ ctx, headers }: ExplorerScenario): Promise<void> {
-  const transaction = await request(ctx.app, '/v1/explorer/transactions/doge-tx-2', { headers });
+  const transaction = await request(
+    ctx.app,
+    `/v1/explorer/transactions/${dogecoinTxid('doge-tx-2')}`,
+    { headers },
+  );
   expect(transaction.status).toBe(200);
   const body = await readJsonObject(transaction);
   expect(readObjectField(body, 'transaction')).toMatchObject({
-    txid: 'doge-tx-2',
+    txid: dogecoinTxid('doge-tx-2'),
     blockHeight: 2,
     totalInputBase: '4000000000',
     totalOutputBase: '3900000000',
@@ -930,19 +945,19 @@ async function expectExplorerTransaction({ ctx, headers }: ExplorerScenario): Pr
   expect(readObjectArrayField(body, 'inputs')).toEqual([
     expect.objectContaining({
       address: dogecoinFixture.intermediaryAddress,
-      outputKey: 'doge-tx-1:0',
+      outputKey: `${dogecoinTxid('doge-tx-1')}:0`,
       valueBase: '4000000000',
     }),
   ]);
   expect(readObjectArrayField(body, 'outputs')).toEqual([
     expect.objectContaining({
       address: dogecoinFixture.targetAddress,
-      outputKey: 'doge-tx-2:0',
+      outputKey: `${dogecoinTxid('doge-tx-2')}:0`,
       valueBase: '2500000000',
     }),
     expect.objectContaining({
       address: dogecoinFixture.intermediaryAddress,
-      outputKey: 'doge-tx-2:1',
+      outputKey: `${dogecoinTxid('doge-tx-2')}:1`,
       valueBase: '1400000000',
     }),
   ]);
@@ -979,7 +994,7 @@ async function expectExplorerAddressHistoryAndUtxos({
     sentBase: '0',
   });
   expect(readObjectField(historyRow ?? {}, 'transaction')).toMatchObject({
-    txid: 'doge-tx-2',
+    txid: dogecoinTxid('doge-tx-2'),
     blockHeight: 2,
   });
 
@@ -989,7 +1004,7 @@ async function expectExplorerAddressHistoryAndUtxos({
     { headers },
   );
   const [utxo] = readObjectArrayField(await readJsonObject(utxos), 'utxos');
-  expect(requireStringField(utxo ?? {}, 'outputKey')).toBe('doge-tx-2:0');
+  expect(requireStringField(utxo ?? {}, 'outputKey')).toBe(`${dogecoinTxid('doge-tx-2')}:0`);
 }
 
 async function readJsonObject(response: Response): Promise<Record<string, unknown>> {

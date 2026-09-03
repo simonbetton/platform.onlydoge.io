@@ -19,7 +19,7 @@ This rebuild is a destructive singleton Dogecoin reset. Do not run it against sh
 7. Bootstrap a new first admin key with `POST /v1/keys/`.
 8. Run invariant checks across blocks, transactions, outputs, spends, UTXOs, balances, and address summaries.
 9. Run external parity checks against BlockCypher's Dogecoin API and at least one other free Dogecoin explorer where practical, including `D8AXXiGEZeZnMKTKnC9AWB3YUU4jfMAmYU`.
-10. Mark the deployment ready only after internal invariants and external parity checks pass.
+10. Mark the stack ready only after internal invariants and external parity checks pass.
 
 ## Local Verification
 

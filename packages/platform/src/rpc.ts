@@ -6,6 +6,8 @@ import {
   maskRpcEndpointAuth,
 } from '@onlydoge/shared-kernel';
 
+import { decodeDogecoinRawBlock } from './dogecoin-raw-block';
+
 const RPC_RETRY_ATTEMPTS = 4;
 const RPC_RETRY_BASE_DELAY_MS = 100;
 const WORK_QUEUE_EXCEEDED = 'work queue depth exceeded';
@@ -39,40 +41,45 @@ export class HttpBlockchainRpcGateway implements BlockchainRpcPort {
     },
     blockHeight: number,
   ): Promise<Record<string, unknown>> {
-    const hash = await this.callDogecoin<string>(
-      dogecoin.rpcEndpoint,
-      dogecoin.rps,
-      'getblockhash',
-      [blockHeight],
-    );
-    const block = await this.loadDogecoinBlock(dogecoin, hash);
+    const [snapshot] = await this.getBlockSnapshots(dogecoin, [blockHeight]);
+    if (!snapshot) {
+      throw new InfrastructureError(`missing dogecoin block snapshot height=${blockHeight}`);
+    }
 
-    return { block };
+    return snapshot;
   }
 
-  private async loadDogecoinBlock(
+  /**
+   * Fetches raw block snapshots for many heights using two JSON-RPC batches:
+   * one `getblockhash` batch and one `getblock(hash, false)` batch. Blocks are
+   * decoded locally, so sync never touches the node's txindex.
+   */
+  public async getBlockSnapshots(
     dogecoin: {
+      architecture: ChainFamily;
       rpcEndpoint: string;
       rps: number;
     },
-    hash: string,
-  ): Promise<Record<string, unknown>> {
-    // Dogecoin Core only accepts boolean getblock verbosity. Integer verbosity 2
-    // (Bitcoin Core) fails, so request verbose JSON and hydrate txids in one batch.
-    // Genesis coinbase is absent from txindex; getrawtransaction -5 falls back to
-    // decoderawtransaction on the raw block hex.
-    const block = await this.callDogecoin<Record<string, unknown>>(
-      dogecoin.rpcEndpoint,
-      dogecoin.rps,
-      'getblock',
-      [hash, true],
-    );
-
-    if (needsTransactionHydration(block.tx)) {
-      block.tx = await this.hydrateDogecoinTransactions(dogecoin, block.tx, hash);
+    blockHeights: number[],
+  ): Promise<Record<string, unknown>[]> {
+    if (blockHeights.length === 0) {
+      return [];
     }
 
-    return block;
+    const hashes = await this.callDogecoinBatch<string>(
+      dogecoin.rpcEndpoint,
+      dogecoin.rps,
+      blockHeights.map((height) => ({ method: 'getblockhash', params: [height] })),
+    );
+    const rawBlocks = await this.callDogecoinBatch<string>(
+      dogecoin.rpcEndpoint,
+      dogecoin.rps,
+      hashes.map((hash) => ({ method: 'getblock', params: [hash, false] })),
+    );
+
+    return rawBlocks.map((rawBlock, index) =>
+      decodeRawBlockSnapshot(rawBlock, blockHeights[index] ?? -1, hashes[index] ?? ''),
+    );
   }
 
   private async hydrateDogecoinTransactions(
@@ -81,7 +88,6 @@ export class HttpBlockchainRpcGateway implements BlockchainRpcPort {
       rps: number;
     },
     txids: string[],
-    blockHash?: string,
   ): Promise<Record<string, unknown>[]> {
     const transactions: Array<Record<string, unknown> | null> = [];
 
@@ -101,59 +107,7 @@ export class HttpBlockchainRpcGateway implements BlockchainRpcPort {
       return transactions;
     }
 
-    return this.hydrateMissingTransactionsFromRawBlock(dogecoin, txids, transactions, blockHash);
-  }
-
-  private async hydrateMissingTransactionsFromRawBlock(
-    dogecoin: {
-      rpcEndpoint: string;
-      rps: number;
-    },
-    txids: string[],
-    transactions: Array<Record<string, unknown> | null>,
-    blockHash?: string,
-  ): Promise<Record<string, unknown>[]> {
-    if (!blockHash) {
-      throw new InfrastructureError('could not load dogecoin transactions missing from node index');
-    }
-
-    const blockHex = await this.callDogecoin<string>(
-      dogecoin.rpcEndpoint,
-      dogecoin.rps,
-      'getblock',
-      [blockHash, false],
-    );
-    const hexes = extractRawTransactionHexes(blockHex);
-    if (hexes.length !== txids.length) {
-      throw new InfrastructureError('dogecoin raw block transaction count mismatch');
-    }
-
-    const missingIndexes = transactions.flatMap((transaction, index) =>
-      transaction ? [] : [index],
-    );
-    const decoded = await this.callDogecoinBatch<Record<string, unknown>>(
-      dogecoin.rpcEndpoint,
-      dogecoin.rps,
-      missingIndexes.map((index) => ({
-        method: 'decoderawtransaction',
-        params: [hexes[index]],
-      })),
-    );
-
-    let nextDecoded = 0;
-    return transactions.map((transaction) => {
-      if (transaction) {
-        return transaction;
-      }
-
-      const decodedTransaction = decoded[nextDecoded];
-      nextDecoded += 1;
-      if (!isPlainRecord(decodedTransaction)) {
-        throw new InfrastructureError('invalid dogecoin rpc response for decoderawtransaction');
-      }
-
-      return decodedTransaction;
-    });
+    throw new InfrastructureError('could not load dogecoin transactions missing from node index');
   }
 
   public async getMempoolSnapshot(dogecoin: {
@@ -567,10 +521,6 @@ function shouldRateLimit(rps: number): boolean {
   return Number.isFinite(rps) && rps > 0;
 }
 
-function needsTransactionHydration(value: unknown): value is string[] {
-  return Array.isArray(value) && value.every((entry) => typeof entry === 'string');
-}
-
 const rawTransactionBatchSize = 128;
 
 function chunkArray<T>(values: T[], size: number): T[][] {
@@ -648,108 +598,23 @@ function isMissingTransactionRpcError(error: unknown): boolean {
   return isPlainRecord(error) && error.code === -5;
 }
 
-function extractRawTransactionHexes(blockHex: string): string[] {
-  const bytes = hexToBytes(blockHex);
-  const txCount = readCompactSize(bytes, 80);
-  let offset = txCount.nextOffset;
-  const hexes: string[] = [];
-
-  for (let index = 0; index < txCount.value; index += 1) {
-    const start = offset;
-    offset = skipRawTransaction(bytes, offset);
-    hexes.push(bytesToHex(bytes.subarray(start, offset)));
+function decodeRawBlockSnapshot(
+  rawBlock: unknown,
+  blockHeight: number,
+  expectedHash: string,
+): Record<string, unknown> {
+  if (typeof rawBlock !== 'string') {
+    throw new InfrastructureError('invalid dogecoin rpc response for getblock');
   }
 
-  if (offset !== bytes.length) {
-    throw new InfrastructureError('invalid dogecoin raw block payload');
+  const block = decodeDogecoinRawBlock(rawBlock, blockHeight);
+  if (block.hash !== expectedHash) {
+    throw new InfrastructureError(
+      `dogecoin block hash mismatch height=${blockHeight} expected=${expectedHash} decoded=${block.hash}`,
+    );
   }
 
-  return hexes;
-}
-
-function skipRawTransaction(bytes: Uint8Array, offset: number): number {
-  let cursor = offset + 4;
-  const inputs = readCompactSize(bytes, cursor);
-  cursor = inputs.nextOffset;
-
-  for (let index = 0; index < inputs.value; index += 1) {
-    cursor += 36;
-    const script = readCompactSize(bytes, cursor);
-    cursor = script.nextOffset + script.value + 4;
-  }
-
-  const outputs = readCompactSize(bytes, cursor);
-  cursor = outputs.nextOffset;
-
-  for (let index = 0; index < outputs.value; index += 1) {
-    cursor += 8;
-    const script = readCompactSize(bytes, cursor);
-    cursor = script.nextOffset + script.value;
-  }
-
-  return cursor + 4;
-}
-
-function readCompactSize(bytes: Uint8Array, offset: number): { nextOffset: number; value: number } {
-  const first = requireByte(bytes, offset);
-  if (first < 0xfd) {
-    return { nextOffset: offset + 1, value: first };
-  }
-
-  if (first === 0xfd) {
-    return { nextOffset: offset + 3, value: readUint16LE(bytes, offset + 1) };
-  }
-
-  if (first === 0xfe) {
-    return { nextOffset: offset + 5, value: readUint32LE(bytes, offset + 1) };
-  }
-
-  throw new InfrastructureError('invalid dogecoin raw block payload');
-}
-
-function readUint16LE(bytes: Uint8Array, offset: number): number {
-  return requireByte(bytes, offset) | (requireByte(bytes, offset + 1) << 8);
-}
-
-function readUint32LE(bytes: Uint8Array, offset: number): number {
-  return (
-    (requireByte(bytes, offset) |
-      (requireByte(bytes, offset + 1) << 8) |
-      (requireByte(bytes, offset + 2) << 16) |
-      (requireByte(bytes, offset + 3) << 24)) >>>
-    0
-  );
-}
-
-function requireByte(bytes: Uint8Array, offset: number): number {
-  const value = bytes[offset];
-  if (value === undefined) {
-    throw new InfrastructureError('invalid dogecoin raw block payload');
-  }
-
-  return value;
-}
-
-function hexToBytes(hex: string): Uint8Array {
-  if (hex.length % 2 !== 0) {
-    throw new InfrastructureError('invalid dogecoin raw block payload');
-  }
-
-  const bytes = new Uint8Array(hex.length / 2);
-  for (let index = 0; index < bytes.length; index += 1) {
-    const value = Number.parseInt(hex.slice(index * 2, index * 2 + 2), 16);
-    if (!Number.isInteger(value)) {
-      throw new InfrastructureError('invalid dogecoin raw block payload');
-    }
-
-    bytes[index] = value;
-  }
-
-  return bytes;
-}
-
-function bytesToHex(bytes: Uint8Array): string {
-  return Buffer.from(bytes).toString('hex');
+  return { block };
 }
 
 function isBatchResultIndex(value: unknown, expectedCount: number): value is number {

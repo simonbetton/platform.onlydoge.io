@@ -45,7 +45,7 @@ export async function createRuntime(input?: {
   const serviceLoggers = createServiceLoggers();
   const metadata = await RelationalMetadataStore.connect(settings.database);
   const rawBlockStorage = createRawBlockStorage(settings.storage);
-  const rpc = new HttpBlockchainRpcGateway();
+  const rpc = new HttpBlockchainRpcGateway(settings.dogecoin.rpcTimeoutMs);
   const factWarehouse = await createFactWarehouse(
     settings.warehouse,
     metadata,
