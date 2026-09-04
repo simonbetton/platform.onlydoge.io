@@ -16,8 +16,10 @@ const fixturesDir = join(import.meta.dirname, '../fixtures/dogecoin-blocks');
  * plus verbose `getrawtransaction` for every tx). Covers pre-AuxPoW blocks,
  * the first AuxPoW block (371337), genesis (coinbase absent from txindex), and
  * modern multi-tx blocks with P2PKH, P2SH, P2PK and OP_RETURN outputs.
+ * 6348062 carries a segwit-serialized (BIP144) parent-chain coinbase inside its
+ * AuxPoW payload, which stalled the first production sync.
  */
-const vectorHeights = [0, 1, 371337, 371338, 1_000_000, 4_000_000, 6_358_000];
+const vectorHeights = [0, 1, 371337, 371338, 1_000_000, 4_000_000, 6_348_062, 6_358_000];
 
 interface ExpectedBlock {
   auxpow?: { parentblock: string };
@@ -117,6 +119,22 @@ describe('dogecoin raw block decoder', () => {
     const block = decodeDogecoinRawBlock(hex, 371337);
     expect(block.auxpow?.parentBlockHash).toBe(
       '45df41e40aba5b2a03d08bd1202a1c02ef3954d8aa22ea6c5ae62fd00f290ea9',
+    );
+  });
+
+  it('skips a segwit-serialized AuxPoW parent coinbase without misaligning transactions', () => {
+    const hex = readFileSync(join(fixturesDir, '6348062.hex'), 'utf8');
+    const block = decodeDogecoinRawBlock(hex, 6_348_062);
+    expect(block.tx).toHaveLength(99);
+    expect(block.auxpow?.parentBlockHash).toBe(
+      '7ba207a111d24eb9890d9f530463d1ae854f4686338b9e019a906842def167a9',
+    );
+  });
+
+  it('reports the failing transaction index and offset for malformed blocks', () => {
+    const hex = readFileSync(join(fixturesDir, '371338.hex'), 'utf8').trim();
+    expect(() => decodeDogecoinRawBlock(hex.slice(0, -40), 371338)).toThrow(
+      /height=371338 tx_index=\d+ tx_offset=\d+/u,
     );
   });
 

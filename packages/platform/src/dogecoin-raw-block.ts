@@ -98,7 +98,14 @@ export function decodeDogecoinRawBlock(
   const txCount = reader.readCompactSize();
   const tx: DecodedDogecoinTransaction[] = [];
   for (let index = 0; index < txCount; index += 1) {
-    tx.push(readTransaction(reader, prefixes));
+    const offset = reader.offset;
+    try {
+      tx.push(readTransaction(reader, prefixes));
+    } catch (error) {
+      throw invalidPayload(
+        `height=${height} tx_index=${index} tx_offset=${offset}: ${errorMessage(error)}`,
+      );
+    }
   }
   reader.assertConsumed();
 
@@ -163,9 +170,21 @@ function skipHashVector(reader: ByteReader): void {
   reader.skip(count * 32);
 }
 
+/**
+ * Skips the AuxPoW parent-chain coinbase. Parent chains (Litecoin & co.) are
+ * segwit chains, so Dogecoin Core serializes this transaction with the BIP144
+ * extended format when the miner's coinbase carries witness data:
+ * `version | 0x00 marker | 0x01 flag | vin | vout | witness | locktime`.
+ */
 function skipTransaction(reader: ByteReader): void {
   reader.skip(4);
-  const inputs = reader.readCompactSize();
+  let inputs = reader.readCompactSize();
+  let hasWitness = false;
+  if (inputs === 0 && reader.peek(1)[0] === 0x01) {
+    reader.skip(1);
+    hasWitness = true;
+    inputs = reader.readCompactSize();
+  }
   for (let index = 0; index < inputs; index += 1) {
     reader.skip(36);
     reader.skip(reader.readCompactSize());
@@ -176,7 +195,19 @@ function skipTransaction(reader: ByteReader): void {
     reader.skip(8);
     reader.skip(reader.readCompactSize());
   }
+  if (hasWitness) {
+    skipWitnesses(reader, inputs);
+  }
   reader.skip(4);
+}
+
+function skipWitnesses(reader: ByteReader, inputs: number): void {
+  for (let input = 0; input < inputs; input += 1) {
+    const items = reader.readCompactSize();
+    for (let item = 0; item < items; item += 1) {
+      reader.skip(reader.readCompactSize());
+    }
+  }
 }
 
 function readTransaction(
@@ -664,4 +695,9 @@ function hexToBytes(hex: string): Uint8Array {
 
 function bytesToHex(bytes: Uint8Array): string {
   return Buffer.from(bytes).toString('hex');
+}
+
+function errorMessage(error: unknown): string {
+  const message = error instanceof Error ? error.message : String(error);
+  return message.replace(/^invalid dogecoin raw block payload: /u, '');
 }
