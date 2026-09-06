@@ -79,3 +79,49 @@ function sqlPositiveOffsetParam(offset: number): SqlValue[] {
 function sqlNullableOffsetParam(offset: number | undefined): SqlValue[] {
   return offset === undefined ? [] : [offset];
 }
+
+export function metadataInfrastructureMessage(error: unknown): string {
+  const message = describeMetadataError(error);
+  return metadataInfrastructureLabel(
+    metadataMessageClassifiers.find((classifier) => classifier.matches(message)),
+  );
+}
+
+function metadataInfrastructureLabel(
+  classifier: (typeof metadataMessageClassifiers)[number] | undefined,
+): string {
+  if (!classifier) {
+    return 'metadata query failed';
+  }
+
+  return classifier.label;
+}
+
+const metadataMessageClassifiers = [
+  { label: 'metadata database unavailable', matches: isMetadataUnavailableMessage },
+  { label: 'metadata database request timed out', matches: isMetadataTimeoutMessage },
+];
+
+function describeMetadataError(error: unknown): string {
+  if (error instanceof Error) {
+    return error.message;
+  }
+
+  return String(error);
+}
+
+function isMetadataUnavailableMessage(message: string): boolean {
+  return [
+    'ECONNREFUSED',
+    'ECONNRESET',
+    'ETIMEDOUT',
+    'EAI_AGAIN',
+    'Connection terminated unexpectedly',
+    'the database system is starting up',
+    'the database system is shutting down',
+  ].some((needle) => message.includes(needle));
+}
+
+function isMetadataTimeoutMessage(message: string): boolean {
+  return ['timeout expired', 'connect ETIMEDOUT'].some((needle) => message.includes(needle));
+}

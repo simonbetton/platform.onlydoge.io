@@ -3,6 +3,7 @@ import { describe, expect, it } from 'vitest';
 import {
   compileQuery,
   currentAddressSummary,
+  metadataInfrastructureMessage,
   nullableNumber,
   nullableString,
   sqlLimitClause,
@@ -35,6 +36,19 @@ describe('metadata query helpers', () => {
     expect(currentAddressSummary('0', 0)).toBeNull();
     expect(currentAddressSummary('10', 0)).toEqual({ balance: '10', utxoCount: 0 });
     expect(currentAddressSummary('0', 2)).toEqual({ balance: '0', utxoCount: 2 });
+  });
+
+  it('normalizes metadata connection failures', () => {
+    expect(metadataInfrastructureMessage(new Error('connect ECONNREFUSED 127.0.0.1:1'))).toBe(
+      'metadata database unavailable',
+    );
+    expect(metadataInfrastructureMessage(new Error('Connection terminated unexpectedly'))).toBe(
+      'metadata database unavailable',
+    );
+    expect(metadataInfrastructureMessage(new Error('timeout expired'))).toBe(
+      'metadata database request timed out',
+    );
+    expect(metadataInfrastructureMessage(new Error('syntax error'))).toBe('metadata query failed');
   });
 
   it('builds SQL pagination clauses and params in placeholder order', () => {

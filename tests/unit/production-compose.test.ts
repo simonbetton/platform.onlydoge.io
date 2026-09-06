@@ -46,4 +46,10 @@ describe('default Compose Dogecoin runtime', () => {
     const indexer = await serviceBlock('onlydoge-indexer');
     expect(indexer).not.toMatch(/depends_on:[\s\S]*?dogecoin:/u);
   });
+
+  it('does not make the API wait on postgres or clickhouse health so it can serve while they recover', async () => {
+    const api = await serviceBlock('onlydoge-api');
+    expect(api).not.toMatch(/postgres:[\s\S]*?condition: service_healthy/u);
+    expect(api).not.toMatch(/clickhouse:[\s\S]*?condition: service_healthy/u);
+  });
 });

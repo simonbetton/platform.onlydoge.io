@@ -3464,22 +3464,35 @@ export async function createWarehouse(
   settings: WarehouseSettings,
   schemaLock?: SchemaLockPort,
   logger: ServiceLogger = noopServiceLogger(),
+  options?: { boot?: boolean },
 ): Promise<ProjectionWarehousePort & ExplorerWarehousePort & MempoolSampleWarehousePort> {
   if (settings.driver === 'clickhouse') {
     const adapter = new ClickHouseWarehouseAdapter(settings, schemaLock, logger);
-    await adapter.boot();
+    await bootWarehouseAdapter(adapter, options);
     return adapter;
   }
 
   const adapter = new DuckDbWarehouseAdapter(settings.location);
-  await adapter.boot();
+  await bootWarehouseAdapter(adapter, options);
   return adapter;
+}
+
+async function bootWarehouseAdapter(
+  adapter: { boot(): Promise<void> },
+  options?: { boot?: boolean },
+): Promise<void> {
+  if (options?.boot === false) {
+    return;
+  }
+
+  await adapter.boot();
 }
 
 export async function createFactWarehouse(
   settings: WarehouseSettings,
   schemaLock?: SchemaLockPort,
   logger: ServiceLogger = noopServiceLogger(),
+  options?: { boot?: boolean },
 ): Promise<
   AnalyticsWarehousePort &
     MempoolSampleWarehousePort &
@@ -3496,7 +3509,7 @@ export async function createFactWarehouse(
     ProjectionWarehousePort &
     ExplorerWarehousePort
 > {
-  return createWarehouse(settings, schemaLock, logger) as Promise<
+  return createWarehouse(settings, schemaLock, logger, options) as Promise<
     AnalyticsWarehousePort &
       MempoolSampleWarehousePort &
       ProjectionFactWarehousePort &

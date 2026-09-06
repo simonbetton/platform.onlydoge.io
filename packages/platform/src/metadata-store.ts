@@ -29,15 +29,23 @@ import {
 } from '@onlydoge/indexing-pipeline';
 import {
   ConflictError,
+  InfrastructureError,
   nowIsoString,
+  OnlyDogeError,
   type PrimaryId,
   safeJsonParse,
 } from '@onlydoge/shared-kernel';
 import mysql from 'mysql2/promise';
 import { Pool, type PoolClient } from 'pg';
+import { createLogger } from './logger';
 import type { ActiveMempoolWatch } from './mempool-watch-types';
 import { MEMPOOL_WATCH_MAX_CONCURRENT } from './mempool-watch-types';
-import { compileQuery, type SqlValue, toBoolean } from './metadata-query';
+import {
+  compileQuery,
+  metadataInfrastructureMessage,
+  type SqlValue,
+  toBoolean,
+} from './metadata-query';
 import type { SchemaLockPort } from './schema-lock';
 import type { DatabaseSettings } from './settings';
 
@@ -107,13 +115,22 @@ export class RelationalMetadataStore
     SchemaLockPort
 {
   private auditEventsHasLegacyResourceIds = false;
+  private migratePromise: Promise<void> | null = null;
+  private migrating = false;
+  private schemaReady = false;
   private sqliteBootstrapQueue: Promise<void> = Promise.resolve();
   private sqliteSchemaLockQueue: Promise<void> = Promise.resolve();
 
   private constructor(private readonly client: SupportedClient) {}
 
-  public static async connect(settings: DatabaseSettings): Promise<RelationalMetadataStore> {
+  public static async connect(
+    settings: DatabaseSettings,
+    options?: { migrate?: boolean },
+  ): Promise<RelationalMetadataStore> {
     const store = await RelationalMetadataStore.open(settings);
+    if (options?.migrate === false) {
+      return store;
+    }
     try {
       await store.migrate();
       return store;
@@ -146,11 +163,14 @@ export class RelationalMetadataStore
     if (settings.driver === 'postgres') {
       return new RelationalMetadataStore({
         kind: 'postgres',
-        raw: new Pool(postgresPoolOptions(settings)),
+        raw: createPostgresPool(settings),
       });
     }
 
-    return new RelationalMetadataStore({ kind: 'mysql', raw: mysql.createPool(settings.location) });
+    return new RelationalMetadataStore({
+      kind: 'mysql',
+      raw: createMysqlPool(settings.location),
+    });
   }
 
   public async close(): Promise<void> {
@@ -223,7 +243,7 @@ export class RelationalMetadataStore
     if (this.client.kind !== 'postgres') {
       throw new TypeError('expected postgres metadata client');
     }
-    const connection = await this.client.raw.connect();
+    const connection = await this.postgresConnect();
     const key = advisoryLockKey(name);
     try {
       await connection.query('SELECT pg_advisory_lock($1)', [key]);
@@ -348,7 +368,7 @@ export class RelationalMetadataStore
       throw new TypeError('expected postgres metadata client');
     }
 
-    const connection = await this.client.raw.connect();
+    const connection = await this.postgresConnect();
     const executor = { kind: 'postgres' as const, raw: connection };
     try {
       await connection.query('BEGIN');
@@ -674,7 +694,7 @@ export class RelationalMetadataStore
       return work();
     }
 
-    const client = await this.client.raw.connect();
+    const client = await this.postgresConnect();
     try {
       await client.query('BEGIN');
       await client.query('SELECT pg_advisory_xact_lock($1)', [advisoryLockKey(apiKeyId)]);
@@ -963,7 +983,17 @@ export class RelationalMetadataStore
     await this.run(sql, args);
   }
 
-  private async migrate(): Promise<void> {
+  public async migrate(): Promise<void> {
+    this.migrating = true;
+    try {
+      await this.runMetadataMigrations();
+      this.schemaReady = true;
+    } finally {
+      this.migrating = false;
+    }
+  }
+
+  private async runMetadataMigrations(): Promise<void> {
     validateMigrationDefinitions(metadataMigrations);
     await this.withMigrationLock(async (executor) => {
       await this.bootstrapMigrationLedger(executor);
@@ -1029,9 +1059,7 @@ export class RelationalMetadataStore
     }
 
     const connection =
-      this.client.kind === 'postgres'
-        ? await this.client.raw.connect()
-        : await this.client.raw.getConnection();
+      this.client.kind === 'postgres' ? await this.postgresConnect() : await this.mysqlConnect();
     const executor =
       this.client.kind === 'postgres'
         ? ({ kind: 'postgres', raw: connection as PoolClient } as const)
@@ -1879,20 +1907,23 @@ export class RelationalMetadataStore
     args: SqlValue[] = [],
     executor: SupportedExecutor = this.client,
   ): Promise<T[]> {
-    if (executor.kind === 'sqlite') {
-      const result = await executor.raw.execute({ sql, args });
-      return result.rows.map((row) => Object.fromEntries(Object.entries(row)) as T);
-    }
-    if (executor.kind === 'postgres') {
-      const result = await executor.raw.query(compileQuery('postgres', sql), args);
-      return result.rows as T[];
-    }
+    await this.ensureSchema(executor);
+    return this.metadataQuery(async () => {
+      if (executor.kind === 'sqlite') {
+        const result = await executor.raw.execute({ sql, args });
+        return result.rows.map((row) => Object.fromEntries(Object.entries(row)) as T);
+      }
+      if (executor.kind === 'postgres') {
+        const result = await executor.raw.query(compileQuery('postgres', sql), args);
+        return result.rows as T[];
+      }
 
-    const [rows] = await executor.raw.query(
-      compileQuery('mysql', compileMysqlStatement(sql)),
-      args,
-    );
-    return rows as T[];
+      const [rows] = await executor.raw.query(
+        compileQuery('mysql', compileMysqlStatement(sql)),
+        args,
+      );
+      return rows as T[];
+    });
   }
 
   private async run(
@@ -1900,24 +1931,27 @@ export class RelationalMetadataStore
     args: SqlValue[] = [],
     executor: SupportedExecutor = this.client,
   ): Promise<void> {
-    if (executor.kind === 'sqlite') {
-      await executor.raw.execute({ sql, args });
-      return;
-    }
-    if (executor.kind === 'postgres') {
-      await executor.raw.query(compileQuery('postgres', sql), args);
-      return;
-    }
-
-    const mysqlSql = compileMysqlStatement(sql);
-    try {
-      await executor.raw.query(compileQuery('mysql', mysqlSql), args);
-    } catch (error) {
-      if (isDuplicateMysqlIndexError(error) && mysqlSql !== sql) {
+    await this.ensureSchema(executor);
+    await this.metadataQuery(async () => {
+      if (executor.kind === 'sqlite') {
+        await executor.raw.execute({ sql, args });
         return;
       }
-      throw error;
-    }
+      if (executor.kind === 'postgres') {
+        await executor.raw.query(compileQuery('postgres', sql), args);
+        return;
+      }
+
+      const mysqlSql = compileMysqlStatement(sql);
+      try {
+        await executor.raw.query(compileQuery('mysql', mysqlSql), args);
+      } catch (error) {
+        if (isDuplicateMysqlIndexError(error) && mysqlSql !== sql) {
+          return;
+        }
+        throw error;
+      }
+    });
   }
 
   private async mutate(
@@ -1925,17 +1959,67 @@ export class RelationalMetadataStore
     args: SqlValue[] = [],
     executor: SupportedExecutor = this.client,
   ): Promise<number> {
-    if (executor.kind === 'sqlite') {
-      const result = await executor.raw.execute({ sql, args });
-      return result.rowsAffected;
-    }
-    if (executor.kind === 'postgres') {
-      const result = await executor.raw.query(compileQuery('postgres', sql), args);
-      return result.rowCount ?? 0;
+    await this.ensureSchema(executor);
+    return this.metadataQuery(async () => {
+      if (executor.kind === 'sqlite') {
+        const result = await executor.raw.execute({ sql, args });
+        return result.rowsAffected;
+      }
+      if (executor.kind === 'postgres') {
+        const result = await executor.raw.query(compileQuery('postgres', sql), args);
+        return result.rowCount ?? 0;
+      }
+
+      const [result] = await executor.raw.query(compileQuery('mysql', sql), args);
+      return 'affectedRows' in result ? result.affectedRows : 0;
+    });
+  }
+
+  private async ensureSchema(executor: SupportedExecutor): Promise<void> {
+    if (this.schemaReady || this.migrating || executor !== this.client) {
+      return;
     }
 
-    const [result] = await executor.raw.query(compileQuery('mysql', sql), args);
-    return 'affectedRows' in result ? result.affectedRows : 0;
+    this.migratePromise ??= this.migrate().finally(() => {
+      if (!this.schemaReady) {
+        this.migratePromise = null;
+      }
+    });
+    await this.migratePromise;
+  }
+
+  private async postgresConnect(): Promise<PoolClient> {
+    if (this.client.kind !== 'postgres') {
+      throw new TypeError('expected postgres metadata client');
+    }
+
+    const pool = this.client.raw;
+    return this.metadataQuery(() => pool.connect());
+  }
+
+  private async mysqlConnect(): Promise<mysql.PoolConnection> {
+    if (this.client.kind !== 'mysql') {
+      throw new TypeError('expected mysql metadata client');
+    }
+
+    const pool = this.client.raw;
+    return this.metadataQuery(() => pool.getConnection());
+  }
+
+  private async metadataQuery<T>(work: () => Promise<T>): Promise<T> {
+    try {
+      return await work();
+    } catch (error) {
+      throw this.toMetadataInfrastructureError(error);
+    }
+  }
+
+  private toMetadataInfrastructureError(error: unknown): Error {
+    if (error instanceof OnlyDogeError) {
+      return error;
+    }
+
+    return new InfrastructureError(metadataInfrastructureMessage(error), { cause: error });
   }
 
   private booleanCondition(column: string, expected: boolean): string {
@@ -2243,9 +2327,25 @@ function coreBlockParams(record: CoreBlockRecord): SqlValue[] {
   ];
 }
 
+function createPostgresPool(settings: DatabaseSettings): Pool {
+  const pool = new Pool(postgresPoolOptions(settings));
+  pool.on('error', (error) => {
+    createLogger({ component: 'metadata', service: 'onlydoge' }).error(
+      { err: error },
+      'metadata postgres pool error',
+    );
+  });
+  return pool;
+}
+
+function createMysqlPool(location: string): mysql.Pool {
+  return mysql.createPool(location);
+}
+
 function postgresPoolOptions(settings: DatabaseSettings): ConstructorParameters<typeof Pool>[0] {
   return {
     connectionString: settings.location,
+    connectionTimeoutMillis: 5_000,
     ...(settings.ssl ? { ssl: settings.ssl } : {}),
   };
 }

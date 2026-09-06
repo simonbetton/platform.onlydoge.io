@@ -159,13 +159,15 @@ services:
     image: onlydoge/onlydoge:local
     restart: unless-stopped
     command: ['--mode=http', '--ip=0.0.0.0', '--port=2277']
+    # Do not wait for postgres/clickhouse health: the API stays up and returns
+    # infrastructure errors for endpoints that need those services.
     depends_on:
       postgres:
-        condition: service_healthy
+        condition: service_started
       minio-create-bucket:
         condition: service_completed_successfully
       clickhouse:
-        condition: service_healthy
+        condition: service_started
     environment:
       <<: *onlydoge-env
     ports:

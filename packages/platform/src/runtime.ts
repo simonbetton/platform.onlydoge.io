@@ -43,13 +43,14 @@ export async function createRuntime(input?: {
 }): Promise<Runtime> {
   const settings = loadSettings(input);
   const serviceLoggers = createServiceLoggers();
-  const metadata = await RelationalMetadataStore.connect(settings.database);
+  const metadata = await connectMetadataStore(settings);
   const rawBlockStorage = createRawBlockStorage(settings.storage);
   const rpc = new HttpBlockchainRpcGateway(settings.dogecoin.rpcTimeoutMs);
   const factWarehouse = await createFactWarehouse(
     settings.warehouse,
     metadata,
     serviceLoggers.warehouse,
+    { boot: settings.isIndexer },
   );
   const stateStore = new MirroredProjectionStateStore(metadata, factWarehouse);
   const explorerWarehouse = createExplorerWarehouse(
@@ -60,7 +61,7 @@ export async function createRuntime(input?: {
   const coreStateStore = createCoreStateStore(settings, metadata, factWarehouse);
 
   const accessControl = new AccessControlService(metadata);
-  await accessControl.deleteExpiredAuditEvents(settings.auditRetentionDays);
+  await startAccessControlMaintenance(settings, accessControl, serviceLoggers.metadata);
   const dogecoin = new SingletonDogecoinConfig(settings.dogecoin);
   const analyticsQuery = new AnalyticsQueryService(metadata, factWarehouse);
   const explorerQuery = new ExplorerQueryService(
@@ -94,7 +95,7 @@ export async function createRuntime(input?: {
     database: settings.database,
     shareInProcess,
   });
-  await mempoolWatchBus.start();
+  await startMempoolWatchBus(settings, mempoolWatchBus, serviceLoggers.metadata);
 
   const mempoolWatch = new MempoolWatchSessionService(metadata, mempoolWatchBus);
 
@@ -204,9 +205,64 @@ function createZmqRawTxSource(
   return new BridgedZmqRawTxSource(endpoint, logger);
 }
 
+async function connectMetadataStore(settings: AppSettings): Promise<RelationalMetadataStore> {
+  if (settings.isIndexer) {
+    return RelationalMetadataStore.connect(settings.database);
+  }
+
+  return RelationalMetadataStore.connect(settings.database, { migrate: false });
+}
+
+async function startAccessControlMaintenance(
+  settings: AppSettings,
+  accessControl: AccessControlService,
+  logger: ReturnType<typeof asServiceLogger>,
+): Promise<void> {
+  await startOptionalHttpDependency(
+    settings,
+    'audit retention cleanup',
+    () => accessControl.deleteExpiredAuditEvents(settings.auditRetentionDays),
+    logger,
+  );
+}
+
+async function startMempoolWatchBus(
+  settings: AppSettings,
+  mempoolWatchBus: ReturnType<typeof createMempoolWatchBus>,
+  logger: ReturnType<typeof asServiceLogger>,
+): Promise<void> {
+  await startOptionalHttpDependency(
+    settings,
+    'mempool watch bus',
+    () => mempoolWatchBus.start(),
+    logger,
+  );
+}
+
+async function startOptionalHttpDependency(
+  settings: AppSettings,
+  name: string,
+  start: () => Promise<void>,
+  logger: ReturnType<typeof asServiceLogger>,
+): Promise<void> {
+  try {
+    await start();
+  } catch (error) {
+    if (settings.isIndexer) {
+      throw error;
+    }
+
+    logger.error(
+      { err: error },
+      `${name} unavailable; affected endpoints will error until it recovers`,
+    );
+  }
+}
+
 function createServiceLoggers() {
   return {
     coreIndexer: asServiceLogger(createLogger({ component: 'core-indexer', service: 'onlydoge' })),
+    metadata: asServiceLogger(createLogger({ component: 'metadata', service: 'onlydoge' })),
     mempoolAppear: asServiceLogger(
       createLogger({ component: 'mempool-appear', service: 'onlydoge' }),
     ),

@@ -1,6 +1,15 @@
+import { mkdtemp, rm } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+
+import { buildApiApp } from '@onlydoge/api';
 import type { ExplorerWarehousePort } from '@onlydoge/explorer-query';
 import type { ProjectionStateStorePort } from '@onlydoge/indexing-pipeline';
-import { assertMempoolWatchTopology, createExplorerWarehouse } from '@onlydoge/platform';
+import {
+  assertMempoolWatchTopology,
+  createExplorerWarehouse,
+  createRuntime,
+} from '@onlydoge/platform';
 import { describe, expect, it, vi } from 'vitest';
 
 type ExplorerStateStore = Pick<
@@ -126,3 +135,82 @@ describe('runtime mempool watch topology', () => {
     ).not.toThrow();
   });
 });
+
+describe('runtime HTTP availability', () => {
+  it('keeps the HTTP app up when metadata and warehouse are unreachable', async () => {
+    const tempRoot = await mkdtemp(join(tmpdir(), 'onlydoge-http-unavailable-'));
+    const previousEnv = snapshotRuntimeEnv();
+    process.env.ONLYDOGE_DATABASE = 'postgres://onlydoge:onlydoge@127.0.0.1:1/onlydoge';
+    process.env.ONLYDOGE_STORAGE = `file://${tempRoot}/storage`;
+    process.env.ONLYDOGE_WAREHOUSE = 'http://127.0.0.1:1';
+    process.env.ONLYDOGE_WAREHOUSE_REQUEST_TIMEOUT_MS = '250';
+
+    try {
+      const runtime = await createRuntime({ mode: 'http', ip: '127.0.0.1', port: 0 });
+      const app = buildApiApp(runtime);
+
+      const heartbeat = await app.handle(new Request('http://localhost/v1/heartbeat'));
+      expect(heartbeat.status).toBe(204);
+
+      const status = await app.handle(new Request('http://localhost/v1/status'));
+      expect(status.status).toBe(500);
+      expect(await status.json()).toEqual({
+        error: 'metadata database unavailable',
+      });
+
+      const keys = await app.handle(
+        new Request('http://localhost/v1/keys', {
+          method: 'POST',
+          headers: { 'content-type': 'application/json' },
+          body: '{}',
+        }),
+      );
+      expect(keys.status).toBe(500);
+      expect(await keys.json()).toEqual({
+        error: 'metadata database unavailable',
+      });
+
+      await runtime.metadata.close();
+    } finally {
+      restoreRuntimeEnv(previousEnv);
+      await rm(tempRoot, { recursive: true, force: true });
+    }
+  });
+
+  it('still fails indexer startup when metadata is unreachable', async () => {
+    const tempRoot = await mkdtemp(join(tmpdir(), 'onlydoge-indexer-unavailable-'));
+    const previousEnv = snapshotRuntimeEnv();
+    process.env.ONLYDOGE_DATABASE = 'postgres://onlydoge:onlydoge@127.0.0.1:1/onlydoge';
+    process.env.ONLYDOGE_STORAGE = `file://${tempRoot}/storage`;
+    process.env.ONLYDOGE_WAREHOUSE = 'http://127.0.0.1:1';
+    process.env.ONLYDOGE_WAREHOUSE_REQUEST_TIMEOUT_MS = '250';
+
+    try {
+      await expect(createRuntime({ mode: 'indexer' })).rejects.toThrow();
+    } finally {
+      restoreRuntimeEnv(previousEnv);
+      await rm(tempRoot, { recursive: true, force: true });
+    }
+  });
+});
+
+const runtimeEnvKeys = [
+  'ONLYDOGE_DATABASE',
+  'ONLYDOGE_STORAGE',
+  'ONLYDOGE_WAREHOUSE',
+  'ONLYDOGE_WAREHOUSE_REQUEST_TIMEOUT_MS',
+] as const;
+
+function snapshotRuntimeEnv(): Map<string, string | undefined> {
+  return new Map(runtimeEnvKeys.map((key) => [key, process.env[key]]));
+}
+
+function restoreRuntimeEnv(previousEnv: Map<string, string | undefined>): void {
+  for (const [key, value] of previousEnv.entries()) {
+    if (value === undefined) {
+      delete process.env[key];
+    } else {
+      process.env[key] = value;
+    }
+  }
+}
