@@ -219,11 +219,13 @@ The default ClickHouse profile is tuned for stability over peak throughput.
 
 - Address-heavy explorer reads use address-oriented read tables instead of scanning write-optimized facts directly.
 - Current-state UTXO lookups avoid `FINAL` and use bounded `LIMIT 1 BY output_key` reads.
-- The ClickHouse server memory ratio is capped below total RAM to leave headroom for merges, the page cache, and the OS.
+- Address transaction history paginates the address's movements first and only joins transaction facts for that page.
+- The ClickHouse container is capped at `CLICKHOUSE_MEMORY_LIMIT` (default `20g`); the server budgets 70% of that for tracked allocations, leaving headroom for allocator slack, the page cache, and the OS.
+- Per-query memory is capped at 4 GiB and per-user at 10 GiB; caches, background merge concurrency, and concurrent queries are bounded to match.
 - Default query and insert thread counts are capped to reduce memory spikes.
-- External sort and group-by thresholds spill earlier instead of holding large intermediates in RAM.
+- External sort and group-by thresholds spill at 512 MiB, and joins default to `grace_hash` with a 1 GiB in-memory limit, instead of holding large intermediates in RAM.
 
-The app boots ClickHouse with runtime-safe warehouse migrations. Existing deployments automatically create and backfill the address-oriented read tables on startup before serving explorer traffic. The checked-in `docker/clickhouse/init/001_schema.sql` file is retained for reference and local volume bootstrap, but production schema authority lives in the versioned ClickHouse migration ledger.
+The app boots ClickHouse with runtime-safe warehouse migrations. Existing deployments automatically create and backfill the address-oriented read tables on startup before serving explorer traffic. Once a migration is ledgered as completed, later boots only run its cheap metadata check; full data verification runs once, right after the migration applies. Production schema authority lives in the versioned ClickHouse migration ledger (`packages/platform/src/clickhouse-migrations.ts`).
 
 ## Local Docker Workflow
 
@@ -247,20 +249,20 @@ If you change dependency manifests, rerun `bun run docker:local:up`.
 Any other Compose invocation can be run through the same file set with `bun run docker:local -- <compose args>`.
 If you change ClickHouse credentials, run `bun run docker:local:reset` before bringing the stack up again so the ClickHouse volume is recreated with the new user setup.
 
-The default Compose stack mounts the checked-in ClickHouse schema and memory tuning files:
+The default Compose stack mounts the checked-in ClickHouse memory and system-log tuning files:
 
-- `docker/clickhouse/init/001_schema.sql`
 - `docker/clickhouse/config.d/onlydoge-memory.xml`
-- `docker/clickhouse/users.d/onlydoge-memory.xml`
-
-The repository also includes ClickHouse host log-retention files for self-hosted ClickHouse operations:
-
 - `docker/clickhouse/config.d/onlydoge-log-retention.xml`
+- `docker/clickhouse/users.d/onlydoge-memory.xml`
+- `docker/clickhouse/users.d/onlydoge-analytics.xml`
+
+The repository also includes host-level retention files for self-hosted ClickHouse operations:
+
 - `docker/clickhouse/logrotate.d/clickhouse-server`
 - `docker/clickhouse/logrotate.d/rsyslog`
 - `docker/clickhouse/journald.conf.d/onlydoge-retention.conf`
 
-Those files codify the current memory and 3-day log-retention profile used for heavy Dogecoin backfills. The retention files are installed on the ClickHouse host with the commands in the production runbook; they are not mounted by `docker-compose.yml`.
+Those files codify the current memory and 3-day log-retention profile used for heavy Dogecoin backfills. The host-level files are installed on the ClickHouse host with the commands in the production runbook; they are not mounted by `docker-compose.yml`.
 
 ## How Sync Works
 
@@ -417,6 +419,6 @@ GitHub Actions mirrors these gates:
 - The current ClickHouse schema supports Dogecoin current-state reads and core-backed history without a separate full transfer graph.
 - The Compose stack assumes the warehouse database name is `onlydoge`.
 - Raw block storage is written to S3-compatible object storage in Dockerized environments.
-- The checked-in ClickHouse memory profile assumes a warehouse node in roughly the `16 GB RAM` class. If you run a materially smaller box, lower the profile values before deployment.
+- The checked-in ClickHouse memory profile targets a 20 GiB container limit (`CLICKHOUSE_MEMORY_LIMIT`). The server ratio adapts to whatever limit you set, but the per-query (4 GiB) and per-user (10 GiB) caps in `docker/clickhouse/users.d/onlydoge-memory.xml` are absolute; lower them if you run a materially smaller box.
 - ClickHouse log-retention files cap system logs, host syslog, ClickHouse file logs, and journald at 3 days.
 - The current checked-in indexer defaults are intentionally conservative for production backfill: `ONLYDOGE_CORE_BLOCK_TIMEOUT_MS=120000`, `ONLYDOGE_CORE_DB_STATEMENT_TIMEOUT_MS=30000`, `ONLYDOGE_CORE_SYNC_COMPLETE_DISTANCE=6`, `ONLYDOGE_CORE_PROCESS_LOAD_CONCURRENCY=8`, `ONLYDOGE_CORE_PROCESS_WINDOW=100`, `ONLYDOGE_CORE_PROGRESS_WATCHDOG_MS=180000`, `ONLYDOGE_CORE_RAW_STORAGE_TIMEOUT_MS=30000`, `ONLYDOGE_CORE_REPROCESS_DEPTH=10`, `ONLYDOGE_CORE_ONLINE_TIP_DISTANCE=6`, `ONLYDOGE_INDEXER_SYNC_WINDOW=256`, `ONLYDOGE_INDEXER_SYNC_BATCH_SIZE=16`, `ONLYDOGE_INDEXER_SYNC_CONCURRENCY=8`, and `ONLYDOGE_WAREHOUSE_REQUEST_TIMEOUT_MS=30000`.

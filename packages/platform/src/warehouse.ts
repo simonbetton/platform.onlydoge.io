@@ -177,6 +177,19 @@ const explorerClickHouseSettings: ClickHouseCommandSettings = {
   result_overflow_mode: 'throw',
   timeout_before_checking_execution_speed: 0,
 };
+/**
+ * Memory ceiling for the heavy INSERT ... SELECT joins (current-state
+ * materialization, analytics backfill). The anti-joins there only run with
+ * `hash` or `grace_hash`; `grace_hash` re-buckets to disk once the in-memory
+ * hash table passes `max_bytes_in_join` instead of growing without bound.
+ * Aggregation and sort spill at 512 MiB for the same reason.
+ */
+const boundedJoinClickHouseSettings: ClickHouseCommandSettings = {
+  join_algorithm: 'grace_hash',
+  max_bytes_in_join: '1073741824',
+  max_bytes_before_external_group_by: '536870912',
+  max_bytes_before_external_sort: '536870912',
+};
 const addressMovementsTable = 'dogecoin_address_movements_v1';
 const addressMovementsByAddressTable = 'dogecoin_address_movements_by_address_v1';
 const appliedBlocksTable = clickHouseCoreDogecoinTables.appliedBlocks;
@@ -2308,6 +2321,22 @@ export class ClickHouseWarehouseAdapter
       txid: string;
     }>({
       query: `
+          WITH page AS (
+            SELECT
+              block_height,
+              block_hash,
+              block_time,
+              txid,
+              tx_index,
+              sumIf(amount_base_i256, direction = 'credit') AS receivedBase,
+              sumIf(amount_base_i256, direction = 'debit') AS sentBase
+            FROM ${addressMovementsByAddressTable}
+            WHERE address = {address:String} AND asset_address = ''
+            GROUP BY block_height, block_hash, block_time, txid, tx_index
+            ORDER BY block_height DESC, tx_index DESC, txid DESC
+            ${pagination.limitClause}
+            ${pagination.offsetClause}
+          )
           SELECT
             movements.block_height AS "blockHeight",
             movements.block_hash AS "blockHash",
@@ -2322,19 +2351,7 @@ export class ClickHouseWarehouseAdapter
             facts.total_input_base AS "totalInputBase",
             facts.gross_output_base AS "totalOutputBase",
             facts.fee_base AS "feeBase"
-          FROM (
-            SELECT
-              block_height,
-              block_hash,
-              block_time,
-              txid,
-              tx_index,
-              sumIf(amount_base_i256, direction = 'credit') AS receivedBase,
-              sumIf(amount_base_i256, direction = 'debit') AS sentBase
-            FROM ${addressMovementsByAddressTable}
-            WHERE address = {address:String} AND asset_address = ''
-            GROUP BY block_height, block_hash, block_time, txid, tx_index
-          ) AS movements
+          FROM page AS movements
           LEFT JOIN (
             SELECT
               block_height,
@@ -2347,14 +2364,13 @@ export class ClickHouseWarehouseAdapter
               argMax(gross_output_base, version) AS gross_output_base,
               argMax(fee_base, version) AS fee_base
             FROM ${analyticsTransactionsTable}
+            WHERE (block_time, txid) IN (SELECT block_time, txid FROM page)
             GROUP BY block_height, block_hash, txid
           ) AS facts
             ON movements.block_height = facts.block_height
            AND movements.block_hash = facts.block_hash
            AND movements.txid = facts.txid
           ORDER BY movements.block_height DESC, movements.tx_index DESC, movements.txid DESC
-          ${pagination.limitClause}
-          ${pagination.offsetClause}
         `,
       query_params: {
         address,
@@ -3250,8 +3266,7 @@ export class ClickHouseWarehouseAdapter
       query_params: input,
       clickhouse_settings: {
         max_execution_time: 300,
-        max_bytes_before_external_group_by: '1073741824',
-        max_bytes_before_external_sort: '1073741824',
+        ...boundedJoinClickHouseSettings,
       },
     });
 
@@ -4770,8 +4785,7 @@ function clickHouseCoreMaterializationSettings(
   return {
     max_execution_time: toClickHouseMaxExecutionTimeSeconds(timeoutMs),
     max_block_size: '65536',
-    max_bytes_before_external_group_by: '1073741824',
-    max_bytes_before_external_sort: '1073741824',
+    ...boundedJoinClickHouseSettings,
     max_insert_block_size: '65536',
     min_insert_block_size_bytes: '0',
     min_insert_block_size_rows: '0',

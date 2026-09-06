@@ -12,10 +12,17 @@ const schemaLockName = 'clickhouse-schema';
 type ClickHouseClient = ReturnType<typeof createClient>;
 
 export interface ClickHouseMigration {
+  /**
+   * Cheap re-check run on every boot for migrations the ledger already marks
+   * completed. Must stay O(metadata) — it runs from every API and indexer
+   * process start. Defaults to `verify` when omitted.
+   */
+  check?(context: ClickHouseMigrationContext): Promise<void>;
   checksum: string;
   name: string;
   source: string;
   up(context: ClickHouseMigrationContext): Promise<void>;
+  /** Full verification, run once right after `up` succeeds. May scan data. */
   verify(context: ClickHouseMigrationContext): Promise<void>;
   version: number;
 }
@@ -60,6 +67,7 @@ export function clickHouseMigrations(): ClickHouseMigration[] {
       addressReadModelBackfillSource,
       backfillReadModels,
       verifyReadModels,
+      checkReadModelsPopulated,
     ),
     migration(
       3,
@@ -110,7 +118,7 @@ export async function runClickHouseMigrations(
           (record) => record.version === item.version,
         );
         if (current?.state === 'completed') {
-          await item.verify(migrationContext(client, item.version, options));
+          await (item.check ?? item.verify)(migrationContext(client, item.version, options));
           continue;
         }
         await writeLedger(client, item, 'started');
@@ -149,6 +157,7 @@ function migration(
   source: string,
   up: ClickHouseMigration['up'],
   verify: ClickHouseMigration['verify'],
+  check?: ClickHouseMigration['check'],
 ): ClickHouseMigration {
   return {
     version,
@@ -157,6 +166,7 @@ function migration(
     checksum: createHash('sha256').update(source).digest('hex'),
     up,
     verify,
+    ...(check ? { check } : {}),
   };
 }
 
@@ -314,28 +324,81 @@ async function verifyCanonicalSchema({ client }: ClickHouseMigrationContext): Pr
   }
 }
 
+/**
+ * `LEFT ANTI JOIN` only runs with the `hash` / `grace_hash` algorithms, and a
+ * plain hash join loads the whole right table into RAM. `grace_hash` spills
+ * buckets to disk once the in-memory table passes `max_bytes_in_join`, which
+ * keeps the full-table read-model joins bounded regardless of table size.
+ */
+const boundedAntiJoinSettings = {
+  join_algorithm: 'grace_hash',
+  max_bytes_in_join: '1073741824',
+  max_bytes_before_external_group_by: '536870912',
+  max_bytes_before_external_sort: '536870912',
+} as const;
+
+const readModelPairs = [
+  {
+    source: 'dogecoin_utxo_outputs_current_v1',
+    target: 'dogecoin_utxo_outputs_current_by_address_v1',
+    keys: ['output_key', 'version'],
+  },
+  {
+    source: 'dogecoin_address_movements_v1',
+    target: 'dogecoin_address_movements_by_address_v1',
+    keys: ['movement_id'],
+  },
+] as const;
+
 async function backfillReadModels({ client, step }: ClickHouseMigrationContext): Promise<void> {
   await step('backfill-current-utxos-by-address', () =>
-    client.command({ query: currentUtxoBackfill }).then(noop),
+    client
+      .command({ query: currentUtxoBackfill, clickhouse_settings: boundedAntiJoinSettings })
+      .then(noop),
   );
   await step('backfill-movements-by-address', () =>
-    client.command({ query: movementBackfill }).then(noop),
+    client
+      .command({ query: movementBackfill, clickhouse_settings: boundedAntiJoinSettings })
+      .then(noop),
   );
 }
 
 async function verifyReadModels({ client }: ClickHouseMigrationContext): Promise<void> {
-  await verifyKeyCoverage(
-    client,
-    'dogecoin_utxo_outputs_current_v1',
-    'dogecoin_utxo_outputs_current_by_address_v1',
-    ['output_key', 'version'],
-  );
-  await verifyKeyCoverage(
-    client,
-    'dogecoin_address_movements_v1',
-    'dogecoin_address_movements_by_address_v1',
-    ['movement_id'],
-  );
+  for (const pair of readModelPairs) {
+    await verifyKeyCoverage(client, pair.source, pair.target, [...pair.keys]);
+  }
+}
+
+/**
+ * Steady-state boot check. The full anti-join in `verifyReadModels` reads both
+ * tables end to end (hundreds of GB on a synced Dogecoin warehouse) and was the
+ * single largest memory consumer on the server, re-run from every API and
+ * indexer start. Once the backfill is ledgered, the materialized views keep the
+ * read models in lock-step with their sources, so a boot only needs to catch
+ * the failure mode the backfill exists for: a populated source with an empty
+ * read model. `count()` on MergeTree is answered from part metadata.
+ */
+async function checkReadModelsPopulated({ client }: ClickHouseMigrationContext): Promise<void> {
+  for (const pair of readModelPairs) {
+    const result = await client.query({
+      query: `
+        SELECT
+          (SELECT count() FROM ${pair.source}) AS sourceRows,
+          (SELECT count() FROM ${pair.target}) AS targetRows
+      `,
+      format: 'JSONEachRow',
+    });
+    const rows = (await result.json<{
+      sourceRows: number | string;
+      targetRows: number | string;
+    }>()) as Array<{ sourceRows: number | string; targetRows: number | string }>;
+    const [row] = rows;
+    if (Number(row?.sourceRows ?? 0) > 0 && Number(row?.targetRows ?? 0) === 0) {
+      throw new Error(
+        `ClickHouse read model ${pair.target} is empty while ${pair.source} has rows`,
+      );
+    }
+  }
 }
 
 async function verifyKeyCoverage(
@@ -352,6 +415,7 @@ async function verifyKeyCoverage(
       LEFT ANTI JOIN ${target} AS target ON ${predicate}
     `,
     format: 'JSONEachRow',
+    clickhouse_settings: boundedAntiJoinSettings,
   });
   const rows = (await result.json<{ missing: number | string }>()) as Array<{
     missing: number | string;

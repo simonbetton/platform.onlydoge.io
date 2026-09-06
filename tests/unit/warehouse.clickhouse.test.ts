@@ -769,6 +769,14 @@ describe('clickhouse warehouse adapter', () => {
     expect(statements.some((statement) => statement.includes('analytics_transactions_v1'))).toBe(
       true,
     );
+    // Facts must be scoped to the paginated movement page, never aggregated over
+    // the whole analytics table (that was a full scan + hash build per request).
+    const history = statements.find((statement) => statement.includes('analytics_transactions_v1'));
+    expect(history).toContain('WITH page AS (');
+    expect(history).toContain('(block_time, txid) IN (SELECT block_time, txid FROM page)');
+    expect(history?.indexOf('LIMIT {limit:UInt64}')).toBeLessThan(
+      history?.indexOf('analytics_transactions_v1') ?? -1,
+    );
   });
 
   it('appends core Dogecoin create, spend, and processed-block rows by window', async () => {
