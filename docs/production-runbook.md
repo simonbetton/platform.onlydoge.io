@@ -163,6 +163,12 @@ ssh root@clickhouse.example.com 'systemctl restart clickhouse-server'
 ssh root@clickhouse.example.com 'systemctl restart systemd-journald && journalctl --vacuum-time=3d --vacuum-size=512M'
 ```
 
+The memory profile budgets 70% of the memory ClickHouse sees as "total" for tracked allocations.
+In Compose that is the container's `CLICKHOUSE_MEMORY_LIMIT` (default `20g`). On a bare host it is
+physical RAM, so to hold a shared host under a fixed budget add a systemd
+`MemoryMax=` drop-in for `clickhouse-server` (ClickHouse reads the cgroup limit) rather than
+editing the ratio.
+
 Check disk and pending mutations:
 
 ```bash

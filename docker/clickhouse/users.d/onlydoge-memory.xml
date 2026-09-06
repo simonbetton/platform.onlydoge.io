@@ -1,12 +1,38 @@
+<!--
+  Per-query / per-user limits for the application user. The `default` profile
+  is the base of every other profile (including onlydoge_analytics, which then
+  tightens further).
+
+  Sized against a 14 GiB tracked server budget (see config.d/onlydoge-memory.xml):
+    one query        <= 4 GiB
+    one user total   <= 10 GiB   (API + indexer share the onlydoge user)
+  so two runaway queries cannot exhaust the server on their own, and the
+  OvercommitTracker still has room to pick a victim before the hard limit.
+-->
 <clickhouse>
   <profiles>
     <default>
-      <max_memory_usage>10737418240</max_memory_usage>
-      <max_memory_usage_for_user>13958643712</max_memory_usage_for_user>
-      <max_bytes_before_external_group_by>1073741824</max_bytes_before_external_group_by>
+      <max_memory_usage>4294967296</max_memory_usage>
+      <max_memory_usage_for_user>10737418240</max_memory_usage_for_user>
+
+      <!-- Spill aggregation / sort state to disk early instead of holding it in RAM. -->
+      <max_bytes_before_external_group_by>536870912</max_bytes_before_external_group_by>
       <max_bytes_before_external_sort>536870912</max_bytes_before_external_sort>
+
+      <!--
+        Joins: grace_hash re-buckets the right side to disk once the in-memory
+        hash table passes max_bytes_in_join. hash is the fallback for join
+        kinds grace_hash does not implement (ASOF/SEMI); there the same limit
+        fails the query instead of the server.
+      -->
+      <join_algorithm>grace_hash,hash</join_algorithm>
+      <max_bytes_in_join>1073741824</max_bytes_in_join>
+
       <max_threads>4</max_threads>
       <max_insert_threads>1</max_insert_threads>
+
+      <!-- Per-processor profiling writes ~20M rows/day to system.processors_profile_log; not used. -->
+      <log_processors_profiles>0</log_processors_profiles>
     </default>
   </profiles>
 </clickhouse>

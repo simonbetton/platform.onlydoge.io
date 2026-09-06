@@ -95,6 +95,11 @@ services:
   clickhouse:
     image: clickhouse/clickhouse-server:26.6.1.1193@sha256:1d1f6508eba2dccce2cee9913907c5f7766327debc57a6b1991f2c9e3176c163
     restart: unless-stopped
+    # Hard cgroup ceiling. ClickHouse derives max_server_memory_usage from this
+    # limit (see docker/clickhouse/config.d/onlydoge-memory.xml); keep the two
+    # in step if you change it. memswap_limit == mem_limit disables swap.
+    mem_limit: ${CLICKHOUSE_MEMORY_LIMIT:-20g}
+    memswap_limit: ${CLICKHOUSE_MEMORY_LIMIT:-20g}
     environment:
       CLICKHOUSE_DB: ${CLICKHOUSE_DB:-onlydoge}
       CLICKHOUSE_USER: ${CLICKHOUSE_USER:-onlydoge}
@@ -114,6 +119,7 @@ services:
     volumes:
       - clickhouse_data:/var/lib/clickhouse
       - ./docker/clickhouse/config.d/onlydoge-memory.xml:/etc/clickhouse-server/config.d/onlydoge-memory.xml:ro
+      - ./docker/clickhouse/config.d/onlydoge-log-retention.xml:/etc/clickhouse-server/config.d/onlydoge-log-retention.xml:ro
       - ./docker/clickhouse/users.d/onlydoge-memory.xml:/etc/clickhouse-server/users.d/onlydoge-memory.xml:ro
       - ./docker/clickhouse/users.d/onlydoge-analytics.xml:/etc/clickhouse-server/users.d/onlydoge-analytics.xml:ro
 

@@ -1,3 +1,11 @@
+<!--
+  System log retention. Mounted by docker-compose.yml and installed on
+  self-hosted ClickHouse hosts by the production runbook.
+
+  Besides the 3-day TTLs, this caps system.text_log at warning level: the stock
+  image writes it at trace, which on a busy indexer produced ~25M rows/day and
+  kept a merge running against a 70 GiB log table.
+-->
 <clickhouse>
   <query_log>
     <ttl>event_date + INTERVAL 3 DAY DELETE</ttl>
@@ -18,6 +26,7 @@
     <ttl>event_date + INTERVAL 3 DAY DELETE</ttl>
   </background_schedule_pool_log>
   <text_log>
+    <level>warning</level>
     <ttl>event_date + INTERVAL 3 DAY DELETE</ttl>
   </text_log>
   <metric_log>

@@ -99,6 +99,7 @@ export function startClickHouse(image: string = adapterImages.clickhouse): Promi
     readiness: (service) => clickHouseQuery(service, 'SELECT 1').then((response) => response.ok),
     volumes: [
       `${resolve(root, 'docker/clickhouse/config.d/onlydoge-memory.xml')}:/etc/clickhouse-server/config.d/onlydoge-memory.xml:ro`,
+      `${resolve(root, 'docker/clickhouse/config.d/onlydoge-log-retention.xml')}:/etc/clickhouse-server/config.d/onlydoge-log-retention.xml:ro`,
       `${resolve(root, 'docker/clickhouse/users.d/onlydoge-memory.xml')}:/etc/clickhouse-server/users.d/onlydoge-memory.xml:ro`,
       `${resolve(root, 'docker/clickhouse/users.d/onlydoge-analytics.xml')}:/etc/clickhouse-server/users.d/onlydoge-analytics.xml:ro`,
     ],
