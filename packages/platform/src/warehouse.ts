@@ -1410,7 +1410,8 @@ export class ClickHouseWarehouseAdapter
   ): Promise<void> {
     const settings = {
       ...clickHouseCoreMaterializationSettings(context),
-      mutations_sync: '2',
+      enable_lightweight_delete: 1,
+      lightweight_deletes_sync: '2',
     };
     const deletes = [
       {
@@ -1448,8 +1449,17 @@ export class ClickHouseWarehouseAdapter
     ];
 
     for (const deletion of deletes) {
+      const present = await this.queryRows<{ core_tail_height: string }>({
+        query: `SELECT ${deletion.heightColumn} AS core_tail_height FROM ${deletion.table} WHERE ${deletion.heightColumn} >= {fromBlockHeight:UInt64} LIMIT 1`,
+        query_params: { fromBlockHeight },
+        format: 'JSONEachRow',
+      });
+      if (!Array.isArray(present) || present.length === 0) {
+        continue;
+      }
+
       await this.executeCommand({
-        query: `ALTER TABLE ${deletion.table} DELETE WHERE ${deletion.heightColumn} >= {fromBlockHeight:UInt64}`,
+        query: `DELETE FROM ${deletion.table} WHERE ${deletion.heightColumn} >= {fromBlockHeight:UInt64}`,
         query_params: { fromBlockHeight },
         clickhouse_settings: settings,
       });

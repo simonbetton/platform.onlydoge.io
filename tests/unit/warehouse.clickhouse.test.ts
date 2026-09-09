@@ -972,6 +972,9 @@ describe('clickhouse warehouse adapter', () => {
     });
     let recoveredCurrentState = false;
     const query = vi.fn(async ({ query: statement }: { query: string }) => {
+      if (statement.includes('AS core_tail_height')) {
+        return { json: async () => [{ core_tail_height: 2 }] };
+      }
       if (statement.includes('FROM dogecoin_core_processed_blocks_v1')) {
         return { json: async () => [] };
       }
@@ -1062,7 +1065,7 @@ describe('clickhouse warehouse adapter', () => {
     expect(command).toHaveBeenCalledWith(
       expect.objectContaining({
         query:
-          'ALTER TABLE dogecoin_core_utxo_creates_v1 DELETE WHERE block_height >= {fromBlockHeight:UInt64}',
+          'DELETE FROM dogecoin_core_utxo_creates_v1 WHERE block_height >= {fromBlockHeight:UInt64}',
         query_params: { fromBlockHeight: 2 },
       }),
     );
@@ -1203,12 +1206,12 @@ describe('clickhouse warehouse adapter', () => {
     const commandStatements = command.mock.calls.map(([parameters]) => parameters.query);
     expect(commandStatements).toEqual(
       expect.arrayContaining([
-        'ALTER TABLE dogecoin_core_utxo_creates_v1 DELETE WHERE block_height >= {fromBlockHeight:UInt64}',
-        'ALTER TABLE dogecoin_core_utxo_spends_v1 DELETE WHERE spent_in_block >= {fromBlockHeight:UInt64}',
-        'ALTER TABLE dogecoin_core_processed_blocks_v1 DELETE WHERE block_height >= {fromBlockHeight:UInt64}',
-        'ALTER TABLE dogecoin_address_movements_v1 DELETE WHERE block_height >= {fromBlockHeight:UInt64}',
-        'ALTER TABLE dogecoin_address_movements_by_address_v1 DELETE WHERE block_height >= {fromBlockHeight:UInt64}',
-        'ALTER TABLE analytics_transactions_v1 DELETE WHERE block_height >= {fromBlockHeight:UInt64}',
+        'DELETE FROM dogecoin_core_utxo_creates_v1 WHERE block_height >= {fromBlockHeight:UInt64}',
+        'DELETE FROM dogecoin_core_utxo_spends_v1 WHERE spent_in_block >= {fromBlockHeight:UInt64}',
+        'DELETE FROM dogecoin_core_processed_blocks_v1 WHERE block_height >= {fromBlockHeight:UInt64}',
+        'DELETE FROM dogecoin_address_movements_v1 WHERE block_height >= {fromBlockHeight:UInt64}',
+        'DELETE FROM dogecoin_address_movements_by_address_v1 WHERE block_height >= {fromBlockHeight:UInt64}',
+        'DELETE FROM analytics_transactions_v1 WHERE block_height >= {fromBlockHeight:UInt64}',
       ]),
     );
     expect(
@@ -1218,7 +1221,7 @@ describe('clickhouse warehouse adapter', () => {
         .every(
           (parameters) =>
             parameters.query_params?.fromBlockHeight === 2 &&
-            parameters.clickhouse_settings?.mutations_sync === '2',
+            parameters.clickhouse_settings?.lightweight_deletes_sync === '2',
         ),
     ).toBe(true);
     expect(insert).toHaveBeenCalledWith(
@@ -1232,6 +1235,59 @@ describe('clickhouse warehouse adapter', () => {
         ],
       }),
     );
+  });
+
+  it('skips core window recovery deletes when the tail has no rows', async () => {
+    const { adapter, command } = installEmptyClickHouseClient();
+
+    await adapter.recoverCoreDogecoinWindow(5009500);
+
+    expect(command).not.toHaveBeenCalled();
+  });
+
+  it('skips core window recovery deletes when ClickHouse JSON has an empty data payload', async () => {
+    const adapter = new ClickHouseWarehouseAdapter({
+      driver: 'clickhouse',
+      location: 'http://clickhouse:8123',
+    });
+    const query = vi.fn(async () => ({
+      json: async () => ({ data: [], rows: 0 }),
+    }));
+    const { command } = installClickHouseClient(adapter, query);
+
+    await adapter.recoverCoreDogecoinWindow(5009500);
+
+    expect(command).not.toHaveBeenCalled();
+  });
+
+  it('recovers a pending core window with lightweight deletes', async () => {
+    const adapter = new ClickHouseWarehouseAdapter({
+      driver: 'clickhouse',
+      location: 'http://clickhouse:8123',
+    });
+    const query = vi.fn(async () => jsonRows([{ core_tail_height: 5009500 }]));
+    const { command } = installClickHouseClient(adapter, query);
+
+    await adapter.recoverCoreDogecoinWindow(5009500);
+
+    expect(command.mock.calls.map(([parameters]) => parameters.query)).toEqual([
+      'DELETE FROM dogecoin_core_utxo_creates_v1 WHERE block_height >= {fromBlockHeight:UInt64}',
+      'DELETE FROM dogecoin_core_utxo_spends_v1 WHERE spent_in_block >= {fromBlockHeight:UInt64}',
+      'DELETE FROM dogecoin_core_processed_blocks_v1 WHERE block_height >= {fromBlockHeight:UInt64}',
+      'DELETE FROM dogecoin_address_movements_v1 WHERE block_height >= {fromBlockHeight:UInt64}',
+      'DELETE FROM dogecoin_address_movements_by_address_v1 WHERE block_height >= {fromBlockHeight:UInt64}',
+      'DELETE FROM dogecoin_applied_blocks_v1 WHERE block_height >= {fromBlockHeight:UInt64}',
+      'DELETE FROM analytics_transactions_v1 WHERE block_height >= {fromBlockHeight:UInt64}',
+      'DELETE FROM dogecoin_transaction_refs_v1 WHERE block_height >= {fromBlockHeight:UInt64}',
+    ]);
+    expect(
+      command.mock.calls.every(
+        ([parameters]) =>
+          parameters.query_params?.fromBlockHeight === 5009500 &&
+          parameters.clickhouse_settings?.lightweight_deletes_sync === '2' &&
+          parameters.clickhouse_settings?.mutations_sync === undefined,
+      ),
+    ).toBe(true);
   });
 
   it('materializes core Dogecoin current state in bounded output-key ranges', async () => {
@@ -1436,9 +1492,12 @@ function installCoreProcessedBlocksClient(input: {
     driver: 'clickhouse',
     location: 'http://clickhouse:8123',
   });
-  const query = vi.fn(async (parameters: { query: string }) => {
-    const params = (parameters as { query_params?: Record<string, unknown> }).query_params;
-    if (parameters.query.includes('FROM dogecoin_core_processed_blocks_v1')) {
+    const query = vi.fn(async (parameters: { query: string }) => {
+      const params = (parameters as { query_params?: Record<string, unknown> }).query_params;
+      if (parameters.query.includes('AS core_tail_height')) {
+        return jsonRows([{ core_tail_height: 2 }]);
+      }
+      if (parameters.query.includes('FROM dogecoin_core_processed_blocks_v1')) {
       if (parameters.query.includes('block_height = {blockHeight:UInt64}')) {
         const blockHeight = Number(params?.blockHeight);
         const blockHash = input.blockHashByHeight[blockHeight];
