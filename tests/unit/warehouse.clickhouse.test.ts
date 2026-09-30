@@ -1492,12 +1492,12 @@ function installCoreProcessedBlocksClient(input: {
     driver: 'clickhouse',
     location: 'http://clickhouse:8123',
   });
-    const query = vi.fn(async (parameters: { query: string }) => {
-      const params = (parameters as { query_params?: Record<string, unknown> }).query_params;
-      if (parameters.query.includes('AS core_tail_height')) {
-        return jsonRows([{ core_tail_height: 2 }]);
-      }
-      if (parameters.query.includes('FROM dogecoin_core_processed_blocks_v1')) {
+  const query = vi.fn(async (parameters: { query: string }) => {
+    const params = (parameters as { query_params?: Record<string, unknown> }).query_params;
+    if (parameters.query.includes('AS core_tail_height')) {
+      return jsonRows([{ core_tail_height: 2 }]);
+    }
+    if (parameters.query.includes('FROM dogecoin_core_processed_blocks_v1')) {
       if (parameters.query.includes('block_height = {blockHeight:UInt64}')) {
         const blockHeight = Number(params?.blockHeight);
         const blockHash = input.blockHashByHeight[blockHeight];

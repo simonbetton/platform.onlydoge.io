@@ -1410,7 +1410,7 @@ export class ClickHouseWarehouseAdapter
   ): Promise<void> {
     const settings = {
       ...clickHouseCoreMaterializationSettings(context),
-      enable_lightweight_delete: 1,
+      enable_lightweight_delete: 1 as const,
       lightweight_deletes_sync: '2',
     };
     const deletes = [
