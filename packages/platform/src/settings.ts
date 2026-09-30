@@ -6,6 +6,7 @@ import { expandHomePath, type Mode, parseMode } from '@onlydoge/shared-kernel';
 export interface DatabaseSettings {
   driver: 'sqlite' | 'postgres' | 'mysql';
   location: string;
+  poolMax?: number;
   ssl?: {
     ca?: string;
     rejectUnauthorized?: boolean;
@@ -313,14 +314,16 @@ function isPostgresLocation(location: string): boolean {
 }
 
 function postgresDatabaseSettings(location: string, env: NodeJS.ProcessEnv): DatabaseSettings {
+  const poolMax = parsePositiveInteger(env.ONLYDOGE_DATABASE_POOL_MAX, 10);
   const ssl = parseDatabaseSslSettings(env);
   if (!ssl) {
-    return { driver: 'postgres', location };
+    return { driver: 'postgres', location, poolMax };
   }
 
   return {
     driver: 'postgres',
     location: stripPostgresSslQueryParams(location),
+    poolMax,
     ssl,
   };
 }

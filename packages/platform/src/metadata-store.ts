@@ -2346,6 +2346,7 @@ function postgresPoolOptions(settings: DatabaseSettings): ConstructorParameters<
   return {
     connectionString: settings.location,
     connectionTimeoutMillis: 5_000,
+    max: settings.poolMax ?? 10,
     ...(settings.ssl ? { ssl: settings.ssl } : {}),
   };
 }

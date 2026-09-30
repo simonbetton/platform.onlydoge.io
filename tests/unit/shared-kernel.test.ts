@@ -134,6 +134,36 @@ describe('shared kernel', () => {
     });
   });
 
+  it('loads the PostgreSQL pool limit from env', () => {
+    const settings = loadSettings({
+      env: {
+        ONLYDOGE_DATABASE: 'postgres://onlydoge:onlydoge@localhost:5432/onlydoge',
+        ONLYDOGE_DATABASE_POOL_MAX: '64',
+        ONLYDOGE_STORAGE: 'http://localhost:9000/onlydoge-raw/storage',
+        ONLYDOGE_WAREHOUSE: 'http://clickhouse:8123?database=onlydoge',
+      },
+      mode: parseMode('indexer'),
+    });
+
+    expect(settings.database).toMatchObject({
+      driver: 'postgres',
+      poolMax: 64,
+    });
+  });
+
+  it('defaults the PostgreSQL pool limit when env is unset', () => {
+    const settings = loadSettings({
+      env: {
+        ONLYDOGE_DATABASE: 'postgres://onlydoge:onlydoge@localhost:5432/onlydoge',
+        ONLYDOGE_STORAGE: 'http://localhost:9000/onlydoge-raw/storage',
+        ONLYDOGE_WAREHOUSE: 'http://clickhouse:8123?database=onlydoge',
+      },
+      mode: parseMode('indexer'),
+    });
+
+    expect(settings.database.poolMax).toBe(10);
+  });
+
   it('builds a postgres connection string from granular database env vars', () => {
     const settings = loadSettings({
       env: {
