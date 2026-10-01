@@ -7,7 +7,7 @@ if (existsSync('node_modules/typescript')) {
   throw new Error('Production image must exclude the TypeScript compiler');
 }
 
-const runtime = await createRuntime({ mode: 'http', ip: '127.0.0.1', port: 2277 });
+const runtime = await createRuntime({ mode: 'both', ip: '127.0.0.1', port: 2277 });
 const app = buildApiApp(runtime);
 const response = await app.handle(new Request('http://localhost/openapi/json'));
 if (response.status !== 200) {
