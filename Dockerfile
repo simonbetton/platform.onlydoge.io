@@ -31,6 +31,10 @@ CMD ["bun", "run", "--watch", "apps/onlydoge/src/index.ts", "--mode=both", "--ip
 
 FROM deps AS prod-deps
 RUN rm -rf node_modules && bun install --frozen-lockfile --production
+# OpenAPI declares TypeScript as a peer, so Bun installs it even in production.
+# Our schemas use runtime TypeBox definitions, not the TypeScript generator.
+RUN rm -rf node_modules/typescript node_modules/.bin/tsc \
+    node_modules/.bun/typescript@* node_modules/.bun/@typescript+typescript-*
 RUN find node_modules -name bun.lock -delete
 
 FROM base AS production
