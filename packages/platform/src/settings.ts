@@ -1,6 +1,9 @@
 import { URL } from 'node:url';
 
-import type { CoreDogecoinIndexerSettings } from '@onlydoge/indexing-pipeline';
+import type {
+  CoreBackfillBlockSource,
+  CoreDogecoinIndexerSettings,
+} from '@onlydoge/indexing-pipeline';
 import { expandHomePath, type Mode, parseMode } from '@onlydoge/shared-kernel';
 
 export interface DatabaseSettings {
@@ -476,6 +479,9 @@ function applyClickHouseCredential(
 
 function parseIndexerSettings(env: NodeJS.ProcessEnv): IndexerSettings {
   return {
+    coreBackfillBlockSource: parseBackfillBlockSource(env.ONLYDOGE_CORE_BACKFILL_BLOCK_SOURCE),
+    coreBackfillWindowBlocks: parsePositiveInteger(env.ONLYDOGE_CORE_BACKFILL_WINDOW_BLOCKS, 2_000),
+    coreBackfillWindowRows: parsePositiveInteger(env.ONLYDOGE_CORE_BACKFILL_WINDOW_ROWS, 200_000),
     coreBlockTimeoutMs: parsePositiveInteger(env.ONLYDOGE_CORE_BLOCK_TIMEOUT_MS, 120_000),
     coreDbStatementTimeoutMs: parsePositiveInteger(
       env.ONLYDOGE_CORE_DB_STATEMENT_TIMEOUT_MS,
@@ -498,6 +504,21 @@ function parseIndexerSettings(env: NodeJS.ProcessEnv): IndexerSettings {
     syncRetryBaseDelayMs: parsePositiveInteger(env.ONLYDOGE_INDEXER_SYNC_RETRY_BASE_DELAY_MS, 500),
     syncWindow: parsePositiveInteger(env.ONLYDOGE_INDEXER_SYNC_WINDOW, 256),
   };
+}
+
+const backfillBlockSources: readonly CoreBackfillBlockSource[] = ['auto', 'node', 'storage'];
+
+function parseBackfillBlockSource(value: string | undefined): CoreBackfillBlockSource {
+  if (!value) {
+    return 'auto';
+  }
+
+  const source = backfillBlockSources.find((candidate) => candidate === value);
+  if (!source) {
+    throw new Error(`Invalid backfill block source: ${value}`);
+  }
+
+  return source;
 }
 
 function parsePositiveInteger(value: string | undefined, fallback: number): number {
