@@ -116,6 +116,7 @@ export class RelationalMetadataStore
     SchemaLockPort
 {
   private auditEventsHasLegacyResourceIds = false;
+  private automaticMigrations = true;
   private migratePromise: Promise<void> | null = null;
   private migrating = false;
   private schemaReady = false;
@@ -145,6 +146,8 @@ export class RelationalMetadataStore
     settings: DatabaseSettings,
   ): Promise<MetadataMigrationStatus> {
     const store = await RelationalMetadataStore.open(settings);
+    // Status inspection must report pending migrations and drift without writing.
+    store.automaticMigrations = false;
     try {
       return await store.readMigrationStatus();
     } finally {
@@ -2020,7 +2023,12 @@ export class RelationalMetadataStore
   }
 
   private async ensureSchema(executor: SupportedExecutor): Promise<void> {
-    if (this.schemaReady || this.migrating || executor !== this.client) {
+    if (
+      !this.automaticMigrations ||
+      this.schemaReady ||
+      this.migrating ||
+      executor !== this.client
+    ) {
       return;
     }
 
