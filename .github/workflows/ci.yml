@@ -60,8 +60,18 @@ jobs:
           cache-to: type=gha,mode=max
           context: .
           platforms: linux/amd64
+          load: true
           push: false
+          tags: onlydoge-ci:${{ github.sha }}
           target: production
+
+      - name: Smoke-test production API and OpenAPI
+        run: |
+          docker run --rm --entrypoint bun \
+            -e ONLYDOGE_DATABASE=sqlite:///tmp/onlydoge-smoke.sqlite \
+            -e ONLYDOGE_STORAGE=file:///tmp/onlydoge-storage \
+            -e ONLYDOGE_WAREHOUSE=/tmp/onlydoge-warehouse.json \
+            onlydoge-ci:${{ github.sha }} scripts/verify-production-image.ts
 
   production-adapters:
     name: Production Adapters
