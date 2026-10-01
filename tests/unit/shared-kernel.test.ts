@@ -30,6 +30,9 @@ describe('shared kernel', () => {
     expect(settings.mode).toBe('both');
     expect(settings.database.driver).toBe('sqlite');
     expect(settings.indexer).toMatchObject({
+      coreBackfillBlockSource: 'auto',
+      coreBackfillWindowBlocks: 2000,
+      coreBackfillWindowRows: 200000,
       coreBlockTimeoutMs: 120000,
       coreDbStatementTimeoutMs: 30000,
       coreOnlineTipDistance: 6,
@@ -82,6 +85,35 @@ describe('shared kernel', () => {
       syncConcurrency: 6,
       syncWindow: 16,
     });
+  });
+
+  it('loads backfill window settings from env and rejects unknown block sources', () => {
+    const env = {
+      ONLYDOGE_DATABASE: 'sqlite:///tmp/onlydoge.sqlite.db',
+      ONLYDOGE_STORAGE: 'file:///tmp/storage',
+      ONLYDOGE_WAREHOUSE: '/tmp/warehouse.json',
+    };
+    const settings = loadSettings({
+      env: {
+        ...env,
+        ONLYDOGE_CORE_BACKFILL_BLOCK_SOURCE: 'storage',
+        ONLYDOGE_CORE_BACKFILL_WINDOW_BLOCKS: '500',
+        ONLYDOGE_CORE_BACKFILL_WINDOW_ROWS: '50000',
+      },
+      mode: parseMode('indexer'),
+    });
+
+    expect(settings.indexer).toMatchObject({
+      coreBackfillBlockSource: 'storage',
+      coreBackfillWindowBlocks: 500,
+      coreBackfillWindowRows: 50000,
+    });
+    expect(() =>
+      loadSettings({
+        env: { ...env, ONLYDOGE_CORE_BACKFILL_BLOCK_SOURCE: 'minio' },
+        mode: parseMode('indexer'),
+      }),
+    ).toThrow('Invalid backfill block source: minio');
   });
 
   it('requires explicit database, storage, and warehouse env in production', () => {

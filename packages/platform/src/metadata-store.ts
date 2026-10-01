@@ -17,6 +17,7 @@ import type {
 } from '@onlydoge/access-control';
 import {
   type BlockProjectionBatch,
+  type CoordinatorConfigEntry,
   type CoordinatorConfigPort,
   type CoreBlockRecord,
   type CoreIndexerStage,
@@ -717,10 +718,17 @@ export class RelationalMetadataStore
     return rows.map((row) => this.mapAuditEvent(row));
   }
 
+  /**
+   * Deletes a key only if it still holds `expectedValue`. The delete skips the
+   * synchronous WAL flush where the database supports it: the one caller is
+   * the indexer clearing its write-ahead recovery marker after a window is
+   * fully applied, and a marker that reappears after a database crash only
+   * makes the next start rewind and replay that window.
+   */
   public async compareAndDeleteJsonValue<T>(key: string, expectedValue: T): Promise<boolean> {
     const expectedJson = JSON.stringify(expectedValue);
     return (
-      (await this.mutate('DELETE FROM app_config WHERE key = ? AND value_json = ?', [
+      (await this.executeRelaxed('DELETE FROM app_config WHERE key = ? AND value_json = ?', [
         key,
         expectedJson,
       ])) === 1
@@ -803,6 +811,29 @@ export class RelationalMetadataStore
     );
   }
 
+  /**
+   * Writes several config keys in one statement. Used for indexer progress,
+   * which is republished every window, so the write skips the synchronous WAL
+   * flush where the database supports it (see `executeRelaxed`).
+   */
+  public async setJsonValues(entries: readonly CoordinatorConfigEntry[]): Promise<void> {
+    const values = new Map(entries.map(([key, value]) => [key, JSON.stringify(value)]));
+    if (values.size === 0) {
+      return;
+    }
+
+    const now = nowIsoString();
+    const args = [...values].flatMap(([key, json]): SqlValue[] => [key, json, now]);
+    await this.executeRelaxed(
+      `
+        INSERT INTO app_config (key, value_json, updated_at)
+        VALUES ${valueTuples(values.size, 3)}
+        ${this.upsertClause('key', ['value_json', 'updated_at'])}
+      `,
+      args,
+    );
+  }
+
   public async canReadDogecoinHistory(): Promise<boolean> {
     return (await this.getJsonValue<boolean>(configKeyDogecoinHistoryReady())) === true;
   }
@@ -826,39 +857,22 @@ export class RelationalMetadataStore
       updatedAt: now,
     };
 
-    if (this.client.kind === 'mysql') {
-      await this.execute(
-        `
-          INSERT INTO core_indexer_state (
-            id, stage, sync_tail, process_tail, online_tip, last_error, updated_at
-          )
-          VALUES (1, ?, ?, ?, ?, ?, ?)
-          ON DUPLICATE KEY UPDATE
-            stage = VALUES(stage),
-            sync_tail = VALUES(sync_tail),
-            process_tail = VALUES(process_tail),
-            online_tip = VALUES(online_tip),
-            last_error = VALUES(last_error),
-            updated_at = VALUES(updated_at)
-        `,
-        [next.stage, next.syncTail, next.processTail, next.onlineTip, next.lastError, now],
-      );
-      return next;
-    }
-
-    await this.execute(
+    // The singleton state row is a checkpoint: losing the latest write only
+    // replays idempotent work, so it does not wait for a WAL flush.
+    await this.executeRelaxed(
       `
         INSERT INTO core_indexer_state (
           id, stage, sync_tail, process_tail, online_tip, last_error, updated_at
         )
         VALUES (1, ?, ?, ?, ?, ?, ?)
-        ON CONFLICT(id) DO UPDATE SET
-          stage = excluded.stage,
-          sync_tail = excluded.sync_tail,
-          process_tail = excluded.process_tail,
-          online_tip = excluded.online_tip,
-          last_error = excluded.last_error,
-          updated_at = excluded.updated_at
+        ${this.upsertClause('id', [
+          'stage',
+          'sync_tail',
+          'process_tail',
+          'online_tip',
+          'last_error',
+          'updated_at',
+        ])}
       `,
       [next.stage, next.syncTail, next.processTail, next.onlineTip, next.lastError, now],
     );
@@ -874,45 +888,38 @@ export class RelationalMetadataStore
   }
 
   public async upsertCoreBlock(record: CoreBlockRecord): Promise<void> {
-    if (this.client.kind === 'mysql') {
-      await this.execute(
-        `
-          INSERT INTO core_blocks (
-            block_height, block_hash, previous_block_hash, block_time, tx_count,
-            raw_storage_key, fetched_at, processed_at
-          )
-          VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-          ON DUPLICATE KEY UPDATE
-            block_hash = VALUES(block_hash),
-            previous_block_hash = VALUES(previous_block_hash),
-            block_time = VALUES(block_time),
-            tx_count = VALUES(tx_count),
-            raw_storage_key = VALUES(raw_storage_key),
-            fetched_at = VALUES(fetched_at),
-            processed_at = VALUES(processed_at)
-        `,
-        coreBlockParams(record),
-      );
+    await this.upsertCoreBlocks([record]);
+  }
+
+  /**
+   * One statement per raw sync batch. Rows behind the sync tail are rewritten
+   * by the next sync attempt if they are lost, so this also skips the
+   * synchronous WAL flush where the database supports it.
+   */
+  public async upsertCoreBlocks(records: CoreBlockRecord[]): Promise<void> {
+    const byHeight = new Map(records.map((record) => [record.blockHeight, record]));
+    if (byHeight.size === 0) {
       return;
     }
 
-    await this.execute(
+    await this.executeRelaxed(
       `
         INSERT INTO core_blocks (
           block_height, block_hash, previous_block_hash, block_time, tx_count,
           raw_storage_key, fetched_at, processed_at
         )
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-        ON CONFLICT(block_height) DO UPDATE SET
-          block_hash = excluded.block_hash,
-          previous_block_hash = excluded.previous_block_hash,
-          block_time = excluded.block_time,
-          tx_count = excluded.tx_count,
-          raw_storage_key = excluded.raw_storage_key,
-          fetched_at = excluded.fetched_at,
-          processed_at = excluded.processed_at
+        VALUES ${valueTuples(byHeight.size, 8)}
+        ${this.upsertClause('block_height', [
+          'block_hash',
+          'previous_block_hash',
+          'block_time',
+          'tx_count',
+          'raw_storage_key',
+          'fetched_at',
+          'processed_at',
+        ])}
       `,
-      coreBlockParams(record),
+      [...byHeight.values()].flatMap(coreBlockParams),
     );
   }
 
@@ -1970,9 +1977,46 @@ export class RelationalMetadataStore
         return result.rowCount ?? 0;
       }
 
-      const [result] = await executor.raw.query(compileQuery('mysql', sql), args);
+      const [result] = await executor.raw.query(
+        compileQuery('mysql', compileMysqlStatement(sql)),
+        args,
+      );
       return 'affectedRows' in result ? result.affectedRows : 0;
     });
+  }
+
+  /**
+   * Executes a write whose loss is harmless: progress telemetry and
+   * checkpoints that the indexer republishes or re-derives. PostgreSQL commits
+   * these asynchronously (`synchronous_commit = off` for the one transaction),
+   * which removes a WAL flush per write; on slow disks that flush dominated
+   * indexer loop time. Commit order is preserved, so a crash can only lose the
+   * newest writes, never reorder them. Other databases execute normally.
+   */
+  private async executeRelaxed(sql: string, args: SqlValue[]): Promise<number> {
+    if (this.client.kind !== 'postgres') {
+      return this.mutate(sql, args);
+    }
+
+    await this.ensureSchema(this.client);
+    const connection = await this.postgresConnect();
+    try {
+      return await this.metadataQuery(() =>
+        runPostgresRelaxedStatement(connection, compileQuery('postgres', sql), args),
+      );
+    } finally {
+      connection.release();
+    }
+  }
+
+  private upsertClause(conflictColumn: string, columns: string[]): string {
+    if (this.client.kind === 'mysql') {
+      const assignments = columns.map((column) => `${column} = VALUES(${column})`).join(', ');
+      return `ON DUPLICATE KEY UPDATE ${assignments}`;
+    }
+
+    const assignments = columns.map((column) => `${column} = excluded.${column}`).join(', ');
+    return `ON CONFLICT(${conflictColumn}) DO UPDATE SET ${assignments}`;
   }
 
   private async ensureSchema(executor: SupportedExecutor): Promise<void> {
@@ -2349,6 +2393,29 @@ function postgresPoolOptions(settings: DatabaseSettings): ConstructorParameters<
     max: settings.poolMax ?? 10,
     ...(settings.ssl ? { ssl: settings.ssl } : {}),
   };
+}
+
+/** Runs one statement in a transaction that commits asynchronously; returns affected rows. */
+async function runPostgresRelaxedStatement(
+  connection: PoolClient,
+  sql: string,
+  args: SqlValue[],
+): Promise<number> {
+  await connection.query('BEGIN');
+  try {
+    await connection.query('SET LOCAL synchronous_commit TO OFF');
+    const result = await connection.query(sql, args);
+    await connection.query('COMMIT');
+    return result.rowCount ?? 0;
+  } catch (error) {
+    await connection.query('ROLLBACK').catch(() => undefined);
+    throw error;
+  }
+}
+
+function valueTuples(rows: number, columns: number): string {
+  const tuple = `(${placeholders(columns)})`;
+  return Array.from({ length: rows }, () => tuple).join(', ');
 }
 
 function placeholders(count: number): string {

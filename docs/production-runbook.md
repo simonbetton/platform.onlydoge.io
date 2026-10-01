@@ -149,6 +149,11 @@ replay-safe and verification determines completion. If verification cannot pass,
 pre-migration backup before starting application writers, then deploy a new corrective migration.
 Do not manually mark ledger rows completed or run automatic down migrations.
 
+Migration 4 (`zstd_column_codecs`) only changes column codec metadata: parts written after it
+(inserts and merges) use ZSTD for the hash-heavy columns, existing parts are left as they are and
+converted as they merge. It does not rewrite data and can be undone per column with
+`ALTER TABLE ... MODIFY COLUMN ... CODEC(LZ4)` in a follow-up migration.
+
 For self-hosted ClickHouse, install the checked-in tuning and retention files:
 
 ```bash

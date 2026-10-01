@@ -205,7 +205,10 @@ Current Dogecoin indexer tuning:
 - `ONLYDOGE_CORE_DB_STATEMENT_TIMEOUT_MS`
 - `ONLYDOGE_CORE_SYNC_COMPLETE_DISTANCE`
 - `ONLYDOGE_CORE_PROCESS_LOAD_CONCURRENCY`
-- `ONLYDOGE_CORE_PROCESS_WINDOW`
+- `ONLYDOGE_CORE_PROCESS_WINDOW` (blocks per window once online)
+- `ONLYDOGE_CORE_BACKFILL_BLOCK_SOURCE` (`auto` | `node` | `storage`; where backfill windows read blocks from, default `auto`)
+- `ONLYDOGE_CORE_BACKFILL_WINDOW_BLOCKS` (max blocks per backfill window, default 2000)
+- `ONLYDOGE_CORE_BACKFILL_WINDOW_ROWS` (target inputs + outputs per backfill window, default 200000)
 - `ONLYDOGE_CORE_PROGRESS_WATCHDOG_MS`
 - `ONLYDOGE_CORE_RAW_STORAGE_TIMEOUT_MS`
 - `ONLYDOGE_CORE_REPROCESS_DEPTH`
@@ -278,12 +281,26 @@ stages, all resumable:
    height and is checkpointed after every round of batches, so a crash or a slow node never loses
    completed work. Parallel batches adapt (AIMD): a failed batch halves concurrency, sustained
    success ramps it back.
-2. `process_backfill`: read snapshots in windows of `ONLYDOGE_CORE_PROCESS_WINDOW`, derive UTXO
-   creates/spends, and append them to ClickHouse behind a write-ahead marker that is rewound on
-   crash. When processing catches the tip, current UTXO/balance state is materialized once and the
-   stage becomes `online`.
+2. `process_backfill`: derive UTXO creates/spends window by window and append them to ClickHouse
+   behind a write-ahead marker that is rewound on crash. Windows are sized by work, not block
+   count: one closes at `ONLYDOGE_CORE_BACKFILL_WINDOW_ROWS` inputs + outputs or
+   `ONLYDOGE_CORE_BACKFILL_WINDOW_BLOCKS` blocks, and the row target halves itself whenever a
+   window's warehouse apply uses more than half of `ONLYDOGE_CORE_DB_STATEMENT_TIMEOUT_MS`. Blocks
+   are read ahead while the previous window is applied. With
+   `ONLYDOGE_CORE_BACKFILL_BLOCK_SOURCE=auto` (the default) finalized heights are re-read from
+   Dogecoin Core, which serves consecutive blocks from its block files far faster than an object
+   store serves one object per block; heights inside the reorg window, and everything while the node
+   is failing, come from the stored snapshots. A window's four fact tables are inserted
+   concurrently. When processing catches the tip, current UTXO/balance state is materialized once
+   and the stage becomes `online`.
 3. `online`: incremental sync + process per new block, re-applying the last
    `ONLYDOGE_CORE_REPROCESS_DEPTH` blocks to absorb reorgs.
+
+Indexer progress is a dozen metadata keys rewritten every window. They are written in one
+statement, and on PostgreSQL that statement (like the indexer state row and raw-sync block rows)
+commits without waiting for a WAL flush: losing the newest of those writes in a database crash only
+replays idempotent work. The write-ahead recovery marker and the leader lease still commit
+synchronously.
 
 Failure model: RPC timeouts and node overload are retried with backoff and reduced concurrency;
 they surface in `/v1/status` as `lastError` and in `scripts/indexer-health.ts` rather than by
@@ -421,4 +438,5 @@ GitHub Actions mirrors these gates:
 - Raw block storage is written to S3-compatible object storage in Dockerized environments.
 - The checked-in ClickHouse memory profile targets a 20 GiB container limit (`CLICKHOUSE_MEMORY_LIMIT`). The server ratio adapts to whatever limit you set, but the per-query (4 GiB) and per-user (10 GiB) caps in `docker/clickhouse/users.d/onlydoge-memory.xml` are absolute; lower them if you run a materially smaller box.
 - ClickHouse log-retention files cap system logs, host syslog, ClickHouse file logs, and journald at 3 days.
-- The current checked-in indexer defaults are intentionally conservative for production backfill: `ONLYDOGE_CORE_BLOCK_TIMEOUT_MS=120000`, `ONLYDOGE_CORE_DB_STATEMENT_TIMEOUT_MS=30000`, `ONLYDOGE_CORE_SYNC_COMPLETE_DISTANCE=6`, `ONLYDOGE_CORE_PROCESS_LOAD_CONCURRENCY=8`, `ONLYDOGE_CORE_PROCESS_WINDOW=100`, `ONLYDOGE_CORE_PROGRESS_WATCHDOG_MS=180000`, `ONLYDOGE_CORE_RAW_STORAGE_TIMEOUT_MS=30000`, `ONLYDOGE_CORE_REPROCESS_DEPTH=10`, `ONLYDOGE_CORE_ONLINE_TIP_DISTANCE=6`, `ONLYDOGE_INDEXER_SYNC_WINDOW=256`, `ONLYDOGE_INDEXER_SYNC_BATCH_SIZE=16`, `ONLYDOGE_INDEXER_SYNC_CONCURRENCY=8`, and `ONLYDOGE_WAREHOUSE_REQUEST_TIMEOUT_MS=30000`.
+- The current checked-in indexer defaults are intentionally conservative for production backfill: `ONLYDOGE_CORE_BLOCK_TIMEOUT_MS=120000`, `ONLYDOGE_CORE_DB_STATEMENT_TIMEOUT_MS=30000`, `ONLYDOGE_CORE_SYNC_COMPLETE_DISTANCE=6`, `ONLYDOGE_CORE_PROCESS_LOAD_CONCURRENCY=8`, `ONLYDOGE_CORE_PROCESS_WINDOW=100`, `ONLYDOGE_CORE_BACKFILL_BLOCK_SOURCE=auto`, `ONLYDOGE_CORE_BACKFILL_WINDOW_BLOCKS=2000`, `ONLYDOGE_CORE_BACKFILL_WINDOW_ROWS=200000`, `ONLYDOGE_CORE_PROGRESS_WATCHDOG_MS=180000`, `ONLYDOGE_CORE_RAW_STORAGE_TIMEOUT_MS=30000`, `ONLYDOGE_CORE_REPROCESS_DEPTH=10`, `ONLYDOGE_CORE_ONLINE_TIP_DISTANCE=6`, `ONLYDOGE_INDEXER_SYNC_WINDOW=256`, `ONLYDOGE_INDEXER_SYNC_BATCH_SIZE=16`, `ONLYDOGE_INDEXER_SYNC_CONCURRENCY=8`, and `ONLYDOGE_WAREHOUSE_REQUEST_TIMEOUT_MS=30000`.
+- Backfill speed is bound by the disk under ClickHouse, then by how fast the node serves blocks. Core tables store hash-like text with ZSTD (about half the bytes of the ClickHouse default), MinIO's background scanner is slowed to `slowest`, and ClickHouse's sampled metric/trace logs are off, because on a slow or shared disk each of those was competing with the indexer for the same I/O. If Postgres, ClickHouse, and MinIO share a spinning disk, also raise the timeouts listed under "Slow or shared disks" in `.env.example`: a single warehouse write can stall for tens of seconds behind a merge there.

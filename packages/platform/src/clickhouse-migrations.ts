@@ -80,6 +80,19 @@ export function clickHouseMigrations(): ClickHouseMigration[] {
       },
       verifyTransactionRefsTable,
     ),
+    migration(
+      4,
+      'zstd_column_codecs',
+      zstdColumnCodecsSource,
+      async ({ client, step }) => {
+        for (const [index, statement] of splitSqlStatements(zstdColumnCodecsSource).entries()) {
+          await step(`statement-${index + 1}`, () =>
+            client.command({ query: statement }).then(noop),
+          );
+        }
+      },
+      verifyZstdColumnCodecs,
+    ),
   ]);
 }
 
@@ -376,15 +389,21 @@ async function verifyReadModels({ client }: ClickHouseMigrationContext): Promise
  * indexer start. Once the backfill is ledgered, the materialized views keep the
  * read models in lock-step with their sources, so a boot only needs to catch
  * the failure mode the backfill exists for: a populated source with an empty
- * read model. `count()` on MergeTree is answered from part metadata.
+ * read model.
+ *
+ * Each side is probed for one row rather than counted. `count()` is only
+ * answered from part metadata while a table has no lightweight-deleted rows;
+ * one window rewind later it reads the whole table (265M rows on a half-synced
+ * warehouse), which on a cold disk outlasted the request timeout and failed
+ * the boot.
  */
 async function checkReadModelsPopulated({ client }: ClickHouseMigrationContext): Promise<void> {
   for (const pair of readModelPairs) {
     const result = await client.query({
       query: `
         SELECT
-          (SELECT count() FROM ${pair.source}) AS sourceRows,
-          (SELECT count() FROM ${pair.target}) AS targetRows
+          (SELECT count() FROM (SELECT 1 FROM ${pair.source} LIMIT 1)) AS sourceRows,
+          (SELECT count() FROM (SELECT 1 FROM ${pair.target} LIMIT 1)) AS targetRows
       `,
       format: 'JSONEachRow',
     });
@@ -550,6 +569,170 @@ ENGINE = ReplacingMergeTree(version)
 ORDER BY txid
 SETTINGS old_parts_lifetime = 0;
 `;
+
+/**
+ * Hash-like text (txids, block hashes, output keys, movement ids) is most of
+ * every core table, and hex is incompressible for LZ4 but halves under ZSTD's
+ * entropy coding. Measured on Dogecoin core tables: 245 -> 126 bytes/row for
+ * address movements, 118 -> 63 for creates, 105 -> 51 for spends. Backfill on
+ * a disk-bound host is limited by warehouse write and merge bandwidth, so
+ * halving the bytes is the cheapest speedup there is (about 1.5x measured) and
+ * it halves the final footprint.
+ *
+ * `MODIFY COLUMN ... CODEC` only changes table metadata: new parts and merges
+ * write ZSTD, existing parts are rewritten lazily as they merge.
+ */
+const zstdColumnCodecsSource = `
+ALTER TABLE dogecoin_core_utxo_creates_v1
+  MODIFY COLUMN block_height CODEC(ZSTD(1)),
+  MODIFY COLUMN block_hash CODEC(ZSTD(1)),
+  MODIFY COLUMN block_time CODEC(ZSTD(1)),
+  MODIFY COLUMN txid CODEC(ZSTD(1)),
+  MODIFY COLUMN tx_index CODEC(ZSTD(1)),
+  MODIFY COLUMN vout CODEC(ZSTD(1)),
+  MODIFY COLUMN output_key CODEC(ZSTD(1)),
+  MODIFY COLUMN address CODEC(ZSTD(1)),
+  MODIFY COLUMN script_type CODEC(ZSTD(1)),
+  MODIFY COLUMN value_base CODEC(ZSTD(1)),
+  MODIFY COLUMN version CODEC(ZSTD(1));
+
+ALTER TABLE dogecoin_core_utxo_spends_v1
+  MODIFY COLUMN spent_output_key CODEC(ZSTD(1)),
+  MODIFY COLUMN spent_by_txid CODEC(ZSTD(1)),
+  MODIFY COLUMN spent_in_block CODEC(ZSTD(1)),
+  MODIFY COLUMN spent_input_index CODEC(ZSTD(1)),
+  MODIFY COLUMN version CODEC(ZSTD(1));
+
+ALTER TABLE dogecoin_address_movements_v1
+  MODIFY COLUMN movement_id CODEC(ZSTD(1)),
+  MODIFY COLUMN block_height CODEC(ZSTD(1)),
+  MODIFY COLUMN block_hash CODEC(ZSTD(1)),
+  MODIFY COLUMN block_time CODEC(ZSTD(1)),
+  MODIFY COLUMN txid CODEC(ZSTD(1)),
+  MODIFY COLUMN tx_index CODEC(ZSTD(1)),
+  MODIFY COLUMN entry_index CODEC(ZSTD(1)),
+  MODIFY COLUMN address CODEC(ZSTD(1)),
+  MODIFY COLUMN amount_base CODEC(ZSTD(1)),
+  MODIFY COLUMN output_key CODEC(ZSTD(1));
+
+ALTER TABLE dogecoin_address_movements_by_address_v1
+  MODIFY COLUMN movement_id CODEC(ZSTD(1)),
+  MODIFY COLUMN block_height CODEC(ZSTD(1)),
+  MODIFY COLUMN block_hash CODEC(ZSTD(1)),
+  MODIFY COLUMN block_time CODEC(ZSTD(1)),
+  MODIFY COLUMN txid CODEC(ZSTD(1)),
+  MODIFY COLUMN tx_index CODEC(ZSTD(1)),
+  MODIFY COLUMN entry_index CODEC(ZSTD(1)),
+  MODIFY COLUMN address CODEC(ZSTD(1)),
+  MODIFY COLUMN amount_base CODEC(ZSTD(1)),
+  MODIFY COLUMN amount_base_i256 CODEC(ZSTD(1)),
+  MODIFY COLUMN output_key CODEC(ZSTD(1));
+
+ALTER TABLE analytics_transactions_v1
+  MODIFY COLUMN block_height CODEC(ZSTD(1)),
+  MODIFY COLUMN block_hash CODEC(ZSTD(1)),
+  MODIFY COLUMN block_time CODEC(ZSTD(1)),
+  MODIFY COLUMN txid CODEC(ZSTD(1)),
+  MODIFY COLUMN tx_index CODEC(ZSTD(1)),
+  MODIFY COLUMN input_count CODEC(ZSTD(1)),
+  MODIFY COLUMN output_count CODEC(ZSTD(1)),
+  MODIFY COLUMN total_input_base CODEC(ZSTD(1)),
+  MODIFY COLUMN gross_output_base CODEC(ZSTD(1)),
+  MODIFY COLUMN fee_base CODEC(ZSTD(1)),
+  MODIFY COLUMN total_input_base_i256 CODEC(ZSTD(1)),
+  MODIFY COLUMN gross_output_base_i256 CODEC(ZSTD(1)),
+  MODIFY COLUMN fee_base_i256 CODEC(ZSTD(1)),
+  MODIFY COLUMN version CODEC(ZSTD(1));
+
+ALTER TABLE dogecoin_transaction_refs_v1
+  MODIFY COLUMN txid CODEC(ZSTD(1)),
+  MODIFY COLUMN block_height CODEC(ZSTD(1)),
+  MODIFY COLUMN block_hash CODEC(ZSTD(1)),
+  MODIFY COLUMN block_time CODEC(ZSTD(1)),
+  MODIFY COLUMN tx_index CODEC(ZSTD(1)),
+  MODIFY COLUMN version CODEC(ZSTD(1));
+
+ALTER TABLE dogecoin_utxo_outputs_current_v1
+  MODIFY COLUMN block_height CODEC(ZSTD(1)),
+  MODIFY COLUMN block_hash CODEC(ZSTD(1)),
+  MODIFY COLUMN block_time CODEC(ZSTD(1)),
+  MODIFY COLUMN txid CODEC(ZSTD(1)),
+  MODIFY COLUMN tx_index CODEC(ZSTD(1)),
+  MODIFY COLUMN vout CODEC(ZSTD(1)),
+  MODIFY COLUMN output_key CODEC(ZSTD(1)),
+  MODIFY COLUMN address CODEC(ZSTD(1)),
+  MODIFY COLUMN script_type CODEC(ZSTD(1)),
+  MODIFY COLUMN value_base CODEC(ZSTD(1)),
+  MODIFY COLUMN spent_by_txid CODEC(ZSTD(1)),
+  MODIFY COLUMN spent_in_block CODEC(ZSTD(1)),
+  MODIFY COLUMN spent_input_index CODEC(ZSTD(1)),
+  MODIFY COLUMN version CODEC(ZSTD(1));
+
+ALTER TABLE dogecoin_utxo_outputs_current_by_address_v1
+  MODIFY COLUMN block_height CODEC(ZSTD(1)),
+  MODIFY COLUMN block_hash CODEC(ZSTD(1)),
+  MODIFY COLUMN block_time CODEC(ZSTD(1)),
+  MODIFY COLUMN txid CODEC(ZSTD(1)),
+  MODIFY COLUMN tx_index CODEC(ZSTD(1)),
+  MODIFY COLUMN vout CODEC(ZSTD(1)),
+  MODIFY COLUMN output_key CODEC(ZSTD(1)),
+  MODIFY COLUMN address CODEC(ZSTD(1)),
+  MODIFY COLUMN script_type CODEC(ZSTD(1)),
+  MODIFY COLUMN value_base CODEC(ZSTD(1)),
+  MODIFY COLUMN spent_by_txid CODEC(ZSTD(1)),
+  MODIFY COLUMN spent_in_block CODEC(ZSTD(1)),
+  MODIFY COLUMN spent_input_index CODEC(ZSTD(1)),
+  MODIFY COLUMN version CODEC(ZSTD(1));
+
+ALTER TABLE dogecoin_balances_current_v1
+  MODIFY COLUMN address CODEC(ZSTD(1)),
+  MODIFY COLUMN balance CODEC(ZSTD(1)),
+  MODIFY COLUMN as_of_block_height CODEC(ZSTD(1)),
+  MODIFY COLUMN version CODEC(ZSTD(1));
+
+ALTER TABLE analytics_balances_current_v1
+  MODIFY COLUMN address CODEC(ZSTD(1)),
+  MODIFY COLUMN balance CODEC(ZSTD(1)),
+  MODIFY COLUMN balance_i256 CODEC(ZSTD(1)),
+  MODIFY COLUMN as_of_block_height CODEC(ZSTD(1)),
+  MODIFY COLUMN version CODEC(ZSTD(1));
+
+ALTER TABLE dogecoin_core_processed_blocks_v1
+  MODIFY COLUMN block_hash CODEC(ZSTD(1));
+
+ALTER TABLE dogecoin_applied_blocks_v1
+  MODIFY COLUMN block_hash CODEC(ZSTD(1));
+`;
+
+/** `table.column` for every column the codec migration touches, read from its SQL. */
+function zstdCodecColumns(): string[] {
+  return splitSqlStatements(zstdColumnCodecsSource).flatMap((statement) => {
+    const table = /ALTER TABLE (\w+)/u.exec(statement)?.[1] ?? '';
+    return [...statement.matchAll(/MODIFY COLUMN (\w+) CODEC\(ZSTD\(1\)\)/gu)].map(
+      (match) => `${table}.${match[1]}`,
+    );
+  });
+}
+
+async function verifyZstdColumnCodecs({ client }: ClickHouseMigrationContext): Promise<void> {
+  const result = await client.query({
+    query: `
+      SELECT concat(table, '.', name) AS column, compression_codec AS codec
+      FROM system.columns
+      WHERE database = currentDatabase()
+    `,
+    format: 'JSONEachRow',
+  });
+  const rows = (await result.json<{ codec: string; column: string }>()) as Array<{
+    codec: string;
+    column: string;
+  }>;
+  const codecs = new Map(rows.map((row) => [row.column, row.codec]));
+  const missing = zstdCodecColumns().find((column) => !codecs.get(column)?.includes('ZSTD(1)'));
+  if (missing) {
+    throw new Error(`ClickHouse schema verification failed for ${missing} codec`);
+  }
+}
 
 async function verifyTransactionRefsTable({ client }: ClickHouseMigrationContext): Promise<void> {
   const result = await client.query({

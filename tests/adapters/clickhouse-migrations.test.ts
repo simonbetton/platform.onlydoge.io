@@ -47,6 +47,7 @@ describe.skipIf(process.env.ONLYDOGE_RUN_ADAPTER_TESTS !== '1')(
             { state: 'completed', version: 1 },
             { state: 'completed', version: 2 },
             { state: 'completed', version: 3 },
+            { state: 'completed', version: 4 },
           ]);
           expect(records.every((record) => record.checksum.length === 64)).toBe(true);
           await expectSchemaMetadata();
@@ -176,9 +177,50 @@ describe.skipIf(process.env.ONLYDOGE_RUN_ADAPTER_TESTS !== '1')(
           });
 
           const records = await runClickHouseMigrations(warehouseSettings(), store);
-          expect(records).toHaveLength(3);
+          expect(records).toHaveLength(4);
           await expectCounts(client, 'dogecoin_utxo_outputs_current_by_address_v1', 2);
           await expectCounts(client, 'dogecoin_address_movements_by_address_v1', 2);
+        } finally {
+          await client.close();
+          await store.close();
+        }
+      },
+      adapterTimeoutMs,
+    );
+
+    it(
+      'boot-checks read models with a row probe that survives lightweight deletes',
+      async () => {
+        await resetClickHouse();
+        const store = await openMetadata('boot-check');
+        const client = clickHouseClient();
+        try {
+          await runClickHouseMigrations(warehouseSettings(), store);
+          await seedPopulatedSources(client);
+          // A window rewind leaves lightweight-deleted rows in the source.
+          await client.command({
+            query: 'DELETE FROM dogecoin_address_movements_v1 WHERE block_height >= 2',
+            clickhouse_settings: { enable_lightweight_delete: 1, lightweight_deletes_sync: '2' },
+          });
+          await expect(runClickHouseMigrations(warehouseSettings(), store)).resolves.toHaveLength(
+            4,
+          );
+
+          await client.command({
+            query: 'TRUNCATE TABLE dogecoin_address_movements_by_address_v1',
+          });
+          await expect(runClickHouseMigrations(warehouseSettings(), store)).rejects.toThrow(
+            'ClickHouse read model dogecoin_address_movements_by_address_v1 is empty while dogecoin_address_movements_v1 has rows',
+          );
+
+          // With every source row deleted, an empty read model is consistent again.
+          await client.command({
+            query: 'DELETE FROM dogecoin_address_movements_v1 WHERE 1 = 1',
+            clickhouse_settings: { enable_lightweight_delete: 1, lightweight_deletes_sync: '2' },
+          });
+          await expect(runClickHouseMigrations(warehouseSettings(), store)).resolves.toHaveLength(
+            4,
+          );
         } finally {
           await client.close();
           await store.close();
@@ -268,6 +310,28 @@ async function expectSchemaMetadata(): Promise<void> {
       count: number | string;
     }>;
     expect(Number(rows[0]?.count)).toBe(3);
+
+    const codecs = await client.query({
+      query: `
+        SELECT concat(table, '.', name) AS column, compression_codec AS codec
+        FROM system.columns
+        WHERE database = currentDatabase()
+          AND (table, name) IN (
+            ('dogecoin_core_utxo_creates_v1', 'output_key'),
+            ('dogecoin_core_utxo_spends_v1', 'spent_by_txid'),
+            ('dogecoin_address_movements_by_address_v1', 'amount_base_i256'),
+            ('dogecoin_utxo_outputs_current_v1', 'spent_by_txid')
+          )
+        ORDER BY column
+      `,
+      format: 'JSONEachRow',
+    });
+    const codecRows = (await codecs.json<{ codec: string; column: string }>()) as Array<{
+      codec: string;
+      column: string;
+    }>;
+    expect(codecRows).toHaveLength(4);
+    expect(codecRows.every((row) => row.codec === 'CODEC(ZSTD(1))')).toBe(true);
   } finally {
     await client.close();
   }
