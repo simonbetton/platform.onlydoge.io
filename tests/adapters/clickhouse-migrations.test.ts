@@ -48,6 +48,8 @@ describe.skipIf(process.env.ONLYDOGE_RUN_ADAPTER_TESTS !== '1')(
             { state: 'completed', version: 2 },
             { state: 'completed', version: 3 },
             { state: 'completed', version: 4 },
+
+            { state: 'completed', version: 5 },
           ]);
           expect(records.every((record) => record.checksum.length === 64)).toBe(true);
           await expectSchemaMetadata();
@@ -177,7 +179,7 @@ describe.skipIf(process.env.ONLYDOGE_RUN_ADAPTER_TESTS !== '1')(
           });
 
           const records = await runClickHouseMigrations(warehouseSettings(), store);
-          expect(records).toHaveLength(4);
+          expect(records).toHaveLength(clickHouseMigrations().length);
           await expectCounts(client, 'dogecoin_utxo_outputs_current_by_address_v1', 2);
           await expectCounts(client, 'dogecoin_address_movements_by_address_v1', 2);
         } finally {
@@ -332,6 +334,29 @@ async function expectSchemaMetadata(): Promise<void> {
     }>;
     expect(codecRows).toHaveLength(4);
     expect(codecRows.every((row) => row.codec === 'CODEC(ZSTD(1))')).toBe(true);
+
+    const lifetimes = await client.query({
+      query: `
+        SELECT name, engine_full AS engineFull
+        FROM system.tables
+        WHERE database = currentDatabase()
+          AND name IN (
+            'analytics_balances_current_v1',
+            'analytics_transactions_v1',
+            'dogecoin_transaction_refs_v1',
+            'dogecoin_utxo_outputs_current_by_address_v1',
+            'dogecoin_utxo_outputs_current_v1'
+          )
+        ORDER BY name
+      `,
+      format: 'JSONEachRow',
+    });
+    const lifetimeRows = (await lifetimes.json<{ engineFull: string; name: string }>()) as Array<{
+      engineFull: string;
+      name: string;
+    }>;
+    expect(lifetimeRows).toHaveLength(5);
+    expect(lifetimeRows.every((row) => !row.engineFull.includes('old_parts_lifetime'))).toBe(true);
   } finally {
     await client.close();
   }

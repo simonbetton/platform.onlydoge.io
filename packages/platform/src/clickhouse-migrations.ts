@@ -93,6 +93,21 @@ export function clickHouseMigrations(): ClickHouseMigration[] {
       },
       verifyZstdColumnCodecs,
     ),
+    migration(
+      5,
+      'old_parts_lifetime_default',
+      oldPartsLifetimeDefaultSource,
+      async ({ client, step }) => {
+        for (const [index, statement] of splitSqlStatements(
+          oldPartsLifetimeDefaultSource,
+        ).entries()) {
+          await step(`statement-${index + 1}`, () =>
+            client.command({ query: statement }).then(noop),
+          );
+        }
+      },
+      verifyOldPartsLifetimeDefault,
+    ),
   ]);
 }
 
@@ -756,6 +771,72 @@ async function verifyTransactionRefsTable({ client }: ClickHouseMigrationContext
   const [row] = rows;
   if (row?.engine !== 'ReplacingMergeTree' || normalizeExpression(row.sortingKey) !== 'txid') {
     throw new Error('ClickHouse schema verification failed for dogecoin_transaction_refs_v1');
+  }
+}
+
+/**
+ * Migrations 1 and 3 create the five current-state tables below with
+ * `old_parts_lifetime = 0`. The override dates from the first schema (commit
+ * 4dfc060) and nothing records why; it sits on the large ReplacingMergeTree
+ * tables whose rows are rewritten on every spend or balance change, so the
+ * likely motive was reclaiming the disk held by merged-away parts at once
+ * during heavy merging.
+ *
+ * ClickHouse keeps merged-away (inactive) parts for `old_parts_lifetime`
+ * seconds precisely because merged parts are not fsynced: after a hard stop
+ * of the server or host the new part can be incomplete while, with a lifetime
+ * of 0, its source parts are already deleted. With the default (480 s) the
+ * startup check restores the sources and merges them again; with 0 the broken
+ * part is detached and the table has a hole that no tail reconciliation can
+ * see. The disk this costs is the parts replaced in the last eight minutes,
+ * bounded by merge throughput, which is small next to the tables themselves.
+ *
+ * `RESET SETTING` drops the table-level override so these tables follow the
+ * server default like every other MergeTree table in the schema (480 s unless
+ * `config.d` sets `<merge_tree><old_parts_lifetime>`). It rewrites table
+ * metadata only; no part is read or written.
+ */
+const oldPartsLifetimeDefaultSource = `
+ALTER TABLE dogecoin_utxo_outputs_current_v1 RESET SETTING old_parts_lifetime;
+ALTER TABLE dogecoin_utxo_outputs_current_by_address_v1 RESET SETTING old_parts_lifetime;
+ALTER TABLE analytics_transactions_v1 RESET SETTING old_parts_lifetime;
+ALTER TABLE analytics_balances_current_v1 RESET SETTING old_parts_lifetime;
+ALTER TABLE dogecoin_transaction_refs_v1 RESET SETTING old_parts_lifetime;
+`;
+
+/** The tables the lifetime migration resets, read from its SQL. */
+function oldPartsLifetimeTables(): string[] {
+  return splitSqlStatements(oldPartsLifetimeDefaultSource).map((statement) => {
+    const table = /^ALTER TABLE (\w+) RESET SETTING old_parts_lifetime$/u.exec(statement)?.[1];
+    if (!table) {
+      throw new Error(`unexpected statement in old_parts_lifetime migration: ${statement}`);
+    }
+    return table;
+  });
+}
+
+async function verifyOldPartsLifetimeDefault({
+  client,
+}: ClickHouseMigrationContext): Promise<void> {
+  const tables = oldPartsLifetimeTables();
+  const result = await client.query({
+    query: `
+      SELECT name, engine_full AS engineFull
+      FROM system.tables
+      WHERE database = currentDatabase() AND name IN ({names:Array(String)})
+    `,
+    query_params: { names: tables },
+    format: 'JSONEachRow',
+  });
+  const rows = (await result.json<{ engineFull: string; name: string }>()) as Array<{
+    engineFull: string;
+    name: string;
+  }>;
+  for (const table of tables) {
+    const row = rows.find((candidate) => candidate.name === table);
+    if (!row || row.engineFull.includes('old_parts_lifetime')) {
+      throw new Error(`ClickHouse schema verification failed for ${table} old_parts_lifetime`);
+    }
   }
 }
 
