@@ -205,7 +205,7 @@ describe.skipIf(process.env.ONLYDOGE_RUN_ADAPTER_TESTS !== '1')(
             clickhouse_settings: { enable_lightweight_delete: 1, lightweight_deletes_sync: '2' },
           });
           await expect(runClickHouseMigrations(warehouseSettings(), store)).resolves.toHaveLength(
-            4,
+            clickHouseMigrations().length,
           );
 
           await client.command({
@@ -221,7 +221,7 @@ describe.skipIf(process.env.ONLYDOGE_RUN_ADAPTER_TESTS !== '1')(
             clickhouse_settings: { enable_lightweight_delete: 1, lightweight_deletes_sync: '2' },
           });
           await expect(runClickHouseMigrations(warehouseSettings(), store)).resolves.toHaveLength(
-            4,
+            clickHouseMigrations().length,
           );
         } finally {
           await client.close();
