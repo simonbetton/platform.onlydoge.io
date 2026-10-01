@@ -62,6 +62,16 @@ export function configKeyDogecoinCurrentStateMaterialization(): string {
   return 'dogecoin_current_state_materialization';
 }
 
+/** Checkpoint of a running history finalization; absent when none is in progress. */
+export function configKeyDogecoinHistoryFinalization(): string {
+  return 'dogecoin_history_finalization';
+}
+
+/** Height through which backfilled history was finalized; absent until it ran once. */
+export function configKeyDogecoinHistoryFinalizedTail(): string {
+  return 'dogecoin_history_finalized_tail';
+}
+
 export function configKeyProjectionBootstrapTail(): string {
   return 'projection_bootstrap_tail';
 }
