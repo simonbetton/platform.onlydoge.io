@@ -149,6 +149,29 @@ replay-safe and verification determines completion. If verification cannot pass,
 pre-migration backup before starting application writers, then deploy a new corrective migration.
 Do not manually mark ledger rows completed or run automatic down migrations.
 
+Migration 4 (`zstd_column_codecs`) only changes column codec metadata: parts written after it
+(inserts and merges) use ZSTD for the hash-heavy columns, existing parts are left as they are and
+converted as they merge. It does not rewrite data and can be undone per column with
+`ALTER TABLE ... MODIFY COLUMN ... CODEC(LZ4)` in a follow-up migration.
+
+Migration 5 (`old_parts_lifetime_default`) only changes table metadata and completes instantly: it
+drops the `old_parts_lifetime = 0` override that the first schema put on the five current-state
+tables (`dogecoin_utxo_outputs_current_v1`, `dogecoin_utxo_outputs_current_by_address_v1`,
+`dogecoin_transaction_refs_v1`, `analytics_transactions_v1`, `analytics_balances_current_v1`),
+so they keep merged-away parts for the server default (480 s) like every other table. Merged parts
+are not fsynced, and those retained source parts are what lets ClickHouse rebuild a merge that a
+hard stop of the server or host truncated; with the override, the truncated part was detached as
+`broken_` and the table kept a hole that the indexer's tail reconciliation cannot see. The cost is
+the disk held by parts replaced in the last eight minutes, bounded by merge throughput. Tune the
+lifetime fleet-wide with `<merge_tree><old_parts_lifetime>` in `config.d` rather than per table; the
+migration's boot check fails if a table-level override comes back. To confirm on a host, this query
+must return no rows:
+
+```sql
+SELECT name, engine_full FROM system.tables
+WHERE database = currentDatabase() AND engine_full LIKE '%old_parts_lifetime%'
+```
+
 For self-hosted ClickHouse, install the checked-in tuning and retention files:
 
 ```bash

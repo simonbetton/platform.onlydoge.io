@@ -22,7 +22,7 @@
     "metadata:migrations:status": "bun run scripts/metadata-migrations-status.ts",
     "backfill:analytics-transactions": "bun run scripts/backfill-analytics-transaction-facts.ts",
     "test": "vitest run --exclude 'tests/adapters/**'",
-    "test:adapters": "env ONLYDOGE_RUN_ADAPTER_TESTS=1 ONLYDOGE_RUN_CLICKHOUSE_SMOKE=1 vitest run tests/adapters tests/integration/clickhouse-analytics-smoke.test.ts --testTimeout=180000",
+    "test:adapters": "docker build -f tests/adapters/minio.Dockerfile -t onlydoge-adapter-minio:01ce918d8279 . && env ONLYDOGE_RUN_ADAPTER_TESTS=1 ONLYDOGE_RUN_CLICKHOUSE_SMOKE=1 vitest run tests/adapters tests/integration/clickhouse-analytics-smoke.test.ts --testTimeout=180000",
     "test:clickhouse-smoke": "env ONLYDOGE_RUN_CLICKHOUSE_SMOKE=1 vitest run tests/integration/clickhouse-analytics-smoke.test.ts --testTimeout=180000",
     "test:watch": "vitest",
     "lint": "biome check .",

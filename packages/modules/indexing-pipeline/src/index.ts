@@ -1,4 +1,5 @@
 export * from './application/concurrency';
+export * from './application/core-block-prefetcher';
 export * from './application/core-dogecoin-indexer-service';
 export * from './application/core-dogecoin-indexer-settings';
 export * from './application/raw-block-sync';

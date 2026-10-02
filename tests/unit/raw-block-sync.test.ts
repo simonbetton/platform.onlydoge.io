@@ -101,6 +101,46 @@ describe('raw block syncer', () => {
     expect(result).toMatchObject({ blocks: 5, failedAttempts: 0, frontier: 14 });
   });
 
+  it('writes block metadata once per batch when the sink supports batches', async () => {
+    const events: string[] = [];
+    const syncer = new RawBlockSyncer(
+      { getBlockSnapshots: async (_dogecoin, heights) => heights.map(snapshot) },
+      {
+        async putPart(height) {
+          events.push(`put:${height}`);
+        },
+      },
+      {
+        async upsertCoreBlock() {
+          throw new Error('per-block upsert should not run when batches are supported');
+        },
+        async upsertCoreBlocks(records) {
+          events.push(`blocks:${records.map((record) => record.blockHeight).join(',')}`);
+        },
+        async upsertTransactionRefs(input) {
+          events.push(`refs:${input.map((ref) => ref.blockHeight).join(',')}`);
+        },
+      },
+      parse,
+      settings({ syncBatchSize: 3, syncConcurrency: 1 }),
+      { sleep: async () => {} },
+    );
+
+    await syncer.sync(dogecoin, [4, 5, 6, 7]);
+
+    // Metadata for a batch is only written after all of its snapshots are stored.
+    expect(events).toEqual([
+      'put:4',
+      'put:5',
+      'put:6',
+      'blocks:4,5,6',
+      'refs:4,5,6',
+      'put:7',
+      'blocks:7',
+      'refs:7',
+    ]);
+  });
+
   it('retries failed batches with backoff and reduces concurrency under pressure', async () => {
     let failures = 2;
     const { syncer } = createSyncer(async (heights) => {
