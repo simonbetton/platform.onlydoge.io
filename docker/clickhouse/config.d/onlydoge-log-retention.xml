@@ -1,59 +1,60 @@
+<!--
+  System log profile. Mounted by docker-compose.yml and installed on
+  self-hosted ClickHouse hosts by the production runbook.
+
+  Every enabled system log is its own MergeTree table that the server flushes
+  every 7.5 s by default. With the stock set that is five or more tiny parts a
+  second, merged forever, on a node whose disk the indexer needs: on an idle
+  warehouse they were the largest steady writer, and the stock trace-level
+  text_log once reached 70 GiB with a merge permanently running against it.
+
+  Kept (with a 3-day TTL and a slower flush): the logs operators actually read
+  when something is wrong: queries, parts and merges, warnings, errors.
+
+  Removed: sampled metrics and profiler traces. They are only useful with a
+  metrics UI reading them, cost the most writes, and the same numbers are
+  available live from system.metrics / system.asynchronous_metrics / system.events.
+-->
 <clickhouse>
   <query_log>
     <ttl>event_date + INTERVAL 3 DAY DELETE</ttl>
+    <flush_interval_milliseconds>30000</flush_interval_milliseconds>
   </query_log>
-  <trace_log>
-    <ttl>event_date + INTERVAL 3 DAY DELETE</ttl>
-  </trace_log>
-  <query_thread_log>
-    <ttl>event_date + INTERVAL 3 DAY DELETE</ttl>
-  </query_thread_log>
-  <query_views_log>
-    <ttl>event_date + INTERVAL 3 DAY DELETE</ttl>
-  </query_views_log>
   <part_log>
     <ttl>event_date + INTERVAL 3 DAY DELETE</ttl>
+    <flush_interval_milliseconds>30000</flush_interval_milliseconds>
   </part_log>
-  <background_schedule_pool_log>
-    <ttl>event_date + INTERVAL 3 DAY DELETE</ttl>
-  </background_schedule_pool_log>
   <text_log>
+    <level>warning</level>
     <ttl>event_date + INTERVAL 3 DAY DELETE</ttl>
+    <flush_interval_milliseconds>30000</flush_interval_milliseconds>
   </text_log>
-  <metric_log>
-    <ttl>event_date + INTERVAL 3 DAY DELETE</ttl>
-  </metric_log>
   <error_log>
     <ttl>event_date + INTERVAL 3 DAY DELETE</ttl>
+    <flush_interval_milliseconds>30000</flush_interval_milliseconds>
   </error_log>
-  <instrumentation_trace_log>
+  <query_views_log>
     <ttl>event_date + INTERVAL 3 DAY DELETE</ttl>
-  </instrumentation_trace_log>
-  <query_metric_log>
-    <ttl>event_date + INTERVAL 3 DAY DELETE</ttl>
-  </query_metric_log>
-  <asynchronous_metric_log>
-    <ttl>event_date + INTERVAL 3 DAY DELETE</ttl>
-  </asynchronous_metric_log>
+    <flush_interval_milliseconds>30000</flush_interval_milliseconds>
+  </query_views_log>
   <asynchronous_insert_log>
     <ttl>event_date + INTERVAL 3 DAY DELETE</ttl>
+    <flush_interval_milliseconds>30000</flush_interval_milliseconds>
   </asynchronous_insert_log>
-  <processors_profile_log>
-    <ttl>event_date + INTERVAL 3 DAY DELETE</ttl>
-  </processors_profile_log>
   <backup_log>
     <ttl>event_date + INTERVAL 3 DAY DELETE</ttl>
   </backup_log>
-  <s3queue_log>
-    <ttl>event_date + INTERVAL 3 DAY DELETE</ttl>
-  </s3queue_log>
-  <blob_storage_log>
-    <ttl>event_date + INTERVAL 3 DAY DELETE</ttl>
-  </blob_storage_log>
-  <aggregated_zookeeper_log>
-    <ttl>event_date + INTERVAL 3 DAY DELETE</ttl>
-  </aggregated_zookeeper_log>
-  <zookeeper_connection_log>
-    <ttl>event_date + INTERVAL 3 DAY DELETE</ttl>
-  </zookeeper_connection_log>
+
+  <metric_log remove="1" />
+  <asynchronous_metric_log remove="1" />
+  <query_metric_log remove="1" />
+  <trace_log remove="1" />
+  <instrumentation_trace_log remove="1" />
+  <query_thread_log remove="1" />
+  <processors_profile_log remove="1" />
+  <background_schedule_pool_log remove="1" />
+  <s3queue_log remove="1" />
+  <blob_storage_log remove="1" />
+  <aggregated_zookeeper_log remove="1" />
+  <zookeeper_connection_log remove="1" />
 </clickhouse>

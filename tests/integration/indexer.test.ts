@@ -21,7 +21,7 @@ import {
 } from '@onlydoge/indexing-pipeline';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
-import { dogecoinFixture } from '../fixtures/dogecoin';
+import { dogecoinFixture, dogecoinTxid } from '../fixtures/dogecoin';
 import {
   createTestApp,
   installRpcMock,
@@ -82,7 +82,7 @@ describe('core dogecoin indexer integration', () => {
       utxos: [
         expect.objectContaining({
           address: dogecoinFixture.targetAddress,
-          outputKey: 'doge-tx-2:0',
+          outputKey: `${dogecoinTxid('doge-tx-2')}:0`,
           valueBase: '2500000000',
         }),
       ],
@@ -686,6 +686,9 @@ describe('core dogecoin indexer integration', () => {
         async getBlockSnapshot() {
           return {};
         },
+        async getBlockSnapshots(_dogecoin, heights) {
+          return heights.map(() => ({}));
+        },
       },
       {
         async applyCoreDogecoinBlock() {
@@ -761,6 +764,9 @@ describe('core dogecoin indexer integration', () => {
         async getBlockSnapshot() {
           return {};
         },
+        async getBlockSnapshots(_dogecoin, heights) {
+          return heights.map(() => ({}));
+        },
       },
       {
         async applyCoreDogecoinBlock() {
@@ -827,7 +833,10 @@ function testIndexerSettings(
     coreReprocessDepth: 10,
     coreSyncCompleteDistance: 6,
     leaseHeartbeatIntervalMs: 5_000,
+    syncBatchSize: 16,
     syncConcurrency: 4,
+    syncRetryAttempts: 1,
+    syncRetryBaseDelayMs: 1,
     syncWindow: 32,
     ...overrides,
   };
@@ -1079,6 +1088,12 @@ function dogecoinTipReader(
     async getBlockSnapshot(_dogecoin, blockHeight) {
       onBlockSnapshot?.(blockHeight);
       return testDogecoinBlockSnapshot(blockHeight);
+    },
+    async getBlockSnapshots(_dogecoin, blockHeights) {
+      return blockHeights.map((blockHeight) => {
+        onBlockSnapshot?.(blockHeight);
+        return testDogecoinBlockSnapshot(blockHeight);
+      });
     },
   };
 }

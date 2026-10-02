@@ -7,7 +7,12 @@ import { configKeyIndexerProcessTail } from '@onlydoge/indexing-pipeline';
 import { createRuntime } from '@onlydoge/platform';
 import { vi } from 'vitest';
 
-import { dogecoinBlocksByHash, dogecoinFixture, dogecoinHashesByHeight } from './fixtures/dogecoin';
+import {
+  dogecoinBlocksByHash,
+  dogecoinFixture,
+  dogecoinHashesByHeight,
+  dogecoinRawBlocksByHash,
+} from './fixtures/dogecoin';
 
 type EnvKey = 'ONLYDOGE_DATABASE' | 'ONLYDOGE_STORAGE' | 'ONLYDOGE_WAREHOUSE' | 'ONLYDOGE_MODE';
 type RpcRequestBody = { method?: string; params?: unknown[] };
@@ -181,9 +186,24 @@ export function installRpcMock() {
   return vi
     .spyOn(globalThis, 'fetch')
     .mockImplementation(async (_input: RequestInfo | URL, init?: RequestInit) => {
-      const body = parseRpcRequestBody(String(init?.body ?? '{}'));
-      return (rpcMockHandlers[body.method ?? ''] ?? defaultRpcMockHandler)(body);
+      const parsed = JSON.parse(String(init?.body ?? '{}'));
+      if (Array.isArray(parsed)) {
+        return Response.json(
+          await Promise.all(
+            parsed.map(async (entry, index) => ({
+              ...(await handleRpcMock(entry).json()),
+              id: entry?.id ?? index,
+            })),
+          ),
+        );
+      }
+      return handleRpcMock(parsed);
     });
+}
+
+function handleRpcMock(parsed: unknown): Response {
+  const body = parseRpcRequestBody(parsed);
+  return (rpcMockHandlers[body.method ?? ''] ?? defaultRpcMockHandler)(body);
 }
 
 const rpcMockHandlers: Record<string, RpcMockHandler> = {
@@ -193,11 +213,16 @@ const rpcMockHandlers: Record<string, RpcMockHandler> = {
       result: dogecoinHashesByHeight.get(Number(body.params?.[0] ?? -1)) ?? null,
       error: null,
     }),
-  getblock: (body) =>
-    Response.json({
-      result: dogecoinBlocksByHash.get(String(body.params?.[0] ?? '')) ?? null,
+  getblock: (body) => {
+    const hash = String(body.params?.[0] ?? '');
+    const verbose = body.params?.[1] !== false;
+    return Response.json({
+      result: verbose
+        ? (dogecoinBlocksByHash.get(hash) ?? null)
+        : (dogecoinRawBlocksByHash.get(hash) ?? null),
       error: null,
-    }),
+    });
+  },
   getmempoolinfo: () => Response.json({ result: dogecoinFixture.mempoolInfo, error: null }),
   getrawmempool: () => Response.json({ result: dogecoinFixture.mempoolEntries, error: null }),
 };
@@ -206,14 +231,14 @@ function defaultRpcMockHandler(): Response {
   return Response.json({ result: 1, error: null });
 }
 
-function parseRpcRequestBody(value: string): RpcRequestBody {
-  const parsed = JSON.parse(value);
+function parseRpcRequestBody(parsed: unknown): RpcRequestBody {
   if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
     return {};
   }
 
-  const method = typeof parsed.method === 'string' ? parsed.method : undefined;
-  const params = Array.isArray(parsed.params) ? [...parsed.params] : undefined;
+  const record: Record<string, unknown> = Object.fromEntries(Object.entries(parsed));
+  const method = typeof record.method === 'string' ? record.method : undefined;
+  const params = Array.isArray(record.params) ? [...record.params] : undefined;
 
   return {
     ...(method ? { method } : {}),

@@ -6,6 +6,8 @@ import {
   maskRpcEndpointAuth,
 } from '@onlydoge/shared-kernel';
 
+import { decodeDogecoinRawBlock } from './dogecoin-raw-block';
+
 const RPC_RETRY_ATTEMPTS = 4;
 const RPC_RETRY_BASE_DELAY_MS = 100;
 const WORK_QUEUE_EXCEEDED = 'work queue depth exceeded';
@@ -39,38 +41,45 @@ export class HttpBlockchainRpcGateway implements BlockchainRpcPort {
     },
     blockHeight: number,
   ): Promise<Record<string, unknown>> {
-    const hash = await this.callDogecoin<string>(
-      dogecoin.rpcEndpoint,
-      dogecoin.rps,
-      'getblockhash',
-      [blockHeight],
-    );
-    const block = await this.loadDogecoinBlock(dogecoin, hash);
+    const [snapshot] = await this.getBlockSnapshots(dogecoin, [blockHeight]);
+    if (!snapshot) {
+      throw new InfrastructureError(`missing dogecoin block snapshot height=${blockHeight}`);
+    }
 
-    return { block };
+    return snapshot;
   }
 
-  private async loadDogecoinBlock(
+  /**
+   * Fetches raw block snapshots for many heights using two JSON-RPC batches:
+   * one `getblockhash` batch and one `getblock(hash, false)` batch. Blocks are
+   * decoded locally, so sync never touches the node's txindex.
+   */
+  public async getBlockSnapshots(
     dogecoin: {
+      architecture: ChainFamily;
       rpcEndpoint: string;
       rps: number;
     },
-    hash: string,
-  ): Promise<Record<string, unknown>> {
-    // Dogecoin Core only accepts boolean getblock verbosity. Integer verbosity 2
-    // (Bitcoin Core) fails, so request verbose JSON and hydrate txids in one batch.
-    const block = await this.callDogecoin<Record<string, unknown>>(
-      dogecoin.rpcEndpoint,
-      dogecoin.rps,
-      'getblock',
-      [hash, true],
-    );
-
-    if (needsTransactionHydration(block.tx)) {
-      block.tx = await this.hydrateDogecoinTransactions(dogecoin, block.tx);
+    blockHeights: number[],
+  ): Promise<Record<string, unknown>[]> {
+    if (blockHeights.length === 0) {
+      return [];
     }
 
-    return block;
+    const hashes = await this.callDogecoinBatch<string>(
+      dogecoin.rpcEndpoint,
+      dogecoin.rps,
+      blockHeights.map((height) => ({ method: 'getblockhash', params: [height] })),
+    );
+    const rawBlocks = await this.callDogecoinBatch<string>(
+      dogecoin.rpcEndpoint,
+      dogecoin.rps,
+      hashes.map((hash) => ({ method: 'getblock', params: [hash, false] })),
+    );
+
+    return rawBlocks.map((rawBlock, index) =>
+      decodeRawBlockSnapshot(rawBlock, blockHeights[index] ?? -1, hashes[index] ?? ''),
+    );
   }
 
   private async hydrateDogecoinTransactions(
@@ -80,10 +89,10 @@ export class HttpBlockchainRpcGateway implements BlockchainRpcPort {
     },
     txids: string[],
   ): Promise<Record<string, unknown>[]> {
-    const transactions: Record<string, unknown>[] = [];
+    const transactions: Array<Record<string, unknown> | null> = [];
 
     for (const chunk of chunkArray(txids, rawTransactionBatchSize)) {
-      const decoded = await this.callDogecoinBatch<Record<string, unknown>>(
+      const decoded = await this.callDogecoinBatchAllowingMissing<Record<string, unknown>>(
         dogecoin.rpcEndpoint,
         dogecoin.rps,
         chunk.map((txid) => ({
@@ -94,7 +103,11 @@ export class HttpBlockchainRpcGateway implements BlockchainRpcPort {
       transactions.push(...decoded);
     }
 
-    return transactions;
+    if (transactions.every(isPlainRecord)) {
+      return transactions;
+    }
+
+    throw new InfrastructureError('could not load dogecoin transactions missing from node index');
   }
 
   public async getMempoolSnapshot(dogecoin: {
@@ -200,6 +213,19 @@ export class HttpBlockchainRpcGateway implements BlockchainRpcPort {
     return this.callJsonRpcBatch(rpcEndpoint, rps, calls, timeoutMs);
   }
 
+  private async callDogecoinBatchAllowingMissing<T>(
+    rpcEndpoint: string,
+    rps: number,
+    calls: Array<{ method: string; params: unknown[] }>,
+    timeoutMs = this.timeoutMs,
+  ): Promise<Array<T | null>> {
+    if (calls.length === 0) {
+      return [];
+    }
+
+    return this.callJsonRpcBatchAllowingMissing(rpcEndpoint, rps, calls, timeoutMs);
+  }
+
   private async callJsonRpc<T>(
     rpcEndpoint: string,
     rps: number,
@@ -236,27 +262,59 @@ export class HttpBlockchainRpcGateway implements BlockchainRpcPort {
     timeoutMs: number,
   ): Promise<T[]> {
     return this.withRpcRetry(rpcEndpoint, async () => {
-      const request = this.toRpcRequest(rpcEndpoint);
-      await this.waitForRateLimit(request.url, rps);
-      const response = await fetch(request.url, {
-        method: 'POST',
-        headers: request.headers,
-        signal: AbortSignal.timeout(timeoutMs),
-        body: JSON.stringify(
-          calls.map((call, index) => ({
-            jsonrpc: '1.0',
-            id: index,
-            method: call.method,
-            params: call.params,
-          })),
-        ),
-      });
-      const body = await readResponseBody(response);
-      assertNotWorkQueueExceeded(body, rpcEndpoint);
-      const payload = parseRpcJsonBody<Array<{ error?: unknown; id?: unknown; result?: T }>>(body);
-
-      return readRpcBatchResults(response, payload, rpcEndpoint, calls.length);
+      const batch = await this.fetchJsonRpcBatch<T>(rpcEndpoint, rps, calls, timeoutMs);
+      return readRpcBatchResults(batch.response, batch.payload, rpcEndpoint, calls.length);
     });
+  }
+
+  private async callJsonRpcBatchAllowingMissing<T>(
+    rpcEndpoint: string,
+    rps: number,
+    calls: Array<{ method: string; params: unknown[] }>,
+    timeoutMs: number,
+  ): Promise<Array<T | null>> {
+    return this.withRpcRetry(rpcEndpoint, async () => {
+      const batch = await this.fetchJsonRpcBatch<T>(rpcEndpoint, rps, calls, timeoutMs);
+      return readRpcBatchResultsAllowingMissing(
+        batch.response,
+        batch.payload,
+        rpcEndpoint,
+        calls.length,
+      );
+    });
+  }
+
+  private async fetchJsonRpcBatch<T>(
+    rpcEndpoint: string,
+    rps: number,
+    calls: Array<{ method: string; params: unknown[] }>,
+    timeoutMs: number,
+  ): Promise<{
+    payload: Array<{ error?: unknown; id?: unknown; result?: T }> | null;
+    response: Response;
+  }> {
+    const request = this.toRpcRequest(rpcEndpoint);
+    await this.waitForRateLimit(request.url, rps);
+    const response = await fetch(request.url, {
+      method: 'POST',
+      headers: request.headers,
+      signal: AbortSignal.timeout(timeoutMs),
+      body: JSON.stringify(
+        calls.map((call, index) => ({
+          jsonrpc: '1.0',
+          id: index,
+          method: call.method,
+          params: call.params,
+        })),
+      ),
+    });
+    const body = await readResponseBody(response);
+    assertNotWorkQueueExceeded(body, rpcEndpoint);
+
+    return {
+      payload: parseRpcJsonBody<Array<{ error?: unknown; id?: unknown; result?: T }>>(body),
+      response,
+    };
   }
 
   private async withRpcRetry<T>(rpcEndpoint: string, operation: () => Promise<T>): Promise<T> {
@@ -463,10 +521,6 @@ function shouldRateLimit(rps: number): boolean {
   return Number.isFinite(rps) && rps > 0;
 }
 
-function needsTransactionHydration(value: unknown): value is string[] {
-  return Array.isArray(value) && value.every((entry) => typeof entry === 'string');
-}
-
 const rawTransactionBatchSize = 128;
 
 function chunkArray<T>(values: T[], size: number): T[][] {
@@ -501,6 +555,66 @@ function readRpcBatchResults<T>(
   }
 
   return results as T[];
+}
+
+function readRpcBatchResultsAllowingMissing<T>(
+  response: Response,
+  payload: Array<{ error?: unknown; id?: unknown; result?: T }> | null,
+  rpcEndpoint: string,
+  expectedCount: number,
+): Array<T | null> {
+  if (!response.ok || !Array.isArray(payload) || payload.length !== expectedCount) {
+    throw new InfrastructureError(rpcConnectionErrorMessage(rpcEndpoint));
+  }
+
+  const results = new Array<T | null>(expectedCount).fill(null);
+  const seen = new Array<boolean>(expectedCount).fill(false);
+  for (const entry of payload) {
+    if (!isBatchResultIndex(entry.id, expectedCount)) {
+      throw new InfrastructureError(rpcConnectionErrorMessage(rpcEndpoint));
+    }
+
+    if (isMissingTransactionRpcError(entry.error)) {
+      seen[entry.id] = true;
+      continue;
+    }
+
+    if (isInvalidRpcPayload(entry)) {
+      throw new InfrastructureError(rpcConnectionErrorMessage(rpcEndpoint));
+    }
+
+    results[entry.id] = entry.result as T;
+    seen[entry.id] = true;
+  }
+
+  if (seen.some((value) => !value)) {
+    throw new InfrastructureError(rpcConnectionErrorMessage(rpcEndpoint));
+  }
+
+  return results;
+}
+
+function isMissingTransactionRpcError(error: unknown): boolean {
+  return isPlainRecord(error) && error.code === -5;
+}
+
+function decodeRawBlockSnapshot(
+  rawBlock: unknown,
+  blockHeight: number,
+  expectedHash: string,
+): Record<string, unknown> {
+  if (typeof rawBlock !== 'string') {
+    throw new InfrastructureError('invalid dogecoin rpc response for getblock');
+  }
+
+  const block = decodeDogecoinRawBlock(rawBlock, blockHeight);
+  if (block.hash !== expectedHash) {
+    throw new InfrastructureError(
+      `dogecoin block hash mismatch height=${blockHeight} expected=${expectedHash} decoded=${block.hash}`,
+    );
+  }
+
+  return { block };
 }
 
 function isBatchResultIndex(value: unknown, expectedCount: number): value is number {

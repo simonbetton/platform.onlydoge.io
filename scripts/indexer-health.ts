@@ -1,6 +1,12 @@
 #!/usr/bin/env bun
 
-import { loadSettings, RelationalMetadataStore } from '@onlydoge/platform';
+import {
+  formatIndexerStatusLine,
+  loadSettings,
+  RelationalMetadataStore,
+  readIndexerStatus,
+  redactStatusError,
+} from '@onlydoge/platform';
 
 export interface CoreIndexerHealthState {
   lastError: string | null;
@@ -36,7 +42,7 @@ async function main(): Promise<void> {
   if (unhealthy) {
     throw new Error(`unhealthy core indexer: ${unhealthy}`);
   }
-  console.log('ok');
+  console.log(`ok ${formatIndexerStatusLine(await readIndexerStatus(metadata))}`);
 }
 
 const backfillStages = new Set(['sync_backfill', 'process_backfill']);
@@ -81,10 +87,7 @@ function healthDetails(
 }
 
 function redactHealthError(error: string): string {
-  return error
-    .replace(/:\/\/[^/@\s]+:[^/@\s]+@/gu, '://***:***@')
-    .replace(/(password|token|secret)=\S+/giu, '$1=***')
-    .slice(0, 500);
+  return redactStatusError(error);
 }
 
 if (import.meta.main) {
