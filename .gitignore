@@ -2,5 +2,10 @@ node_modules
 coverage
 .DS_Store
 .env.*
+!.env.example
 !.env.*.example
 .fallow/
+.claude/
+.agents/
+*.crt
+*.key

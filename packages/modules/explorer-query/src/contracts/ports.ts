@@ -76,8 +76,14 @@ export interface ExplorerWarehousePort {
       blockHash: string;
       blockHeight: number;
       blockTime: number;
+      feeBase: string | null;
+      inputCount: number;
+      isCoinbase: boolean;
+      outputCount: number;
       receivedBase: string;
       sentBase: string;
+      totalInputBase: string;
+      totalOutputBase: string;
       txIndex: number;
       txid: string;
     }>
@@ -96,4 +102,33 @@ export interface ExplorerWarehousePort {
       blockHeight: number;
     }>
   >;
+}
+
+export type ExplorerMempoolWatchSseEvent =
+  | {
+      event: 'mempool.watch.appeared';
+      data: {
+        address: string;
+        detectedAt: string;
+        outputs: Array<{ valueBase: string; vout: number }>;
+        source: 'catchup' | 'live';
+        txid: string;
+      };
+    }
+  | {
+      event: 'mempool.watch.timeout';
+      data: { address: string; expiresAt: string };
+    }
+  | {
+      event: 'comment';
+      data: string;
+    };
+
+export interface ExplorerMempoolWatchPort {
+  openSession(input: {
+    address: string;
+    apiKeyId: string;
+    minValueBase?: string | null;
+    signal?: AbortSignal;
+  }): AsyncGenerator<ExplorerMempoolWatchSseEvent>;
 }

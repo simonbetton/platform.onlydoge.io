@@ -16,7 +16,7 @@ export class ValidationError extends OnlyDogeError {
 
 export class ConflictError extends OnlyDogeError {
   public constructor(message: string) {
-    super(message, 400);
+    super(message, 409);
   }
 }
 

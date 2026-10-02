@@ -1,0 +1,13 @@
+/entrypoint.sh: create new user 'onlydoge' instead 'default'
+
+/entrypoint.sh: create database 'onlydoge'
+Processing configuration file '/etc/clickhouse-server/config.xml'.
+Merging configuration file '/etc/clickhouse-server/config.d/docker_related_config.xml'.
+Merging configuration file '/etc/clickhouse-server/config.d/onlydoge-memory.xml'.
+Logging trace to /var/log/clickhouse-server/clickhouse-server.log
+Logging errors to /var/log/clickhouse-server/clickhouse-server.err.log
+Processing configuration file '/etc/clickhouse-server/config.xml'.
+Merging configuration file '/etc/clickhouse-server/config.d/docker_related_config.xml'.
+Merging configuration file '/etc/clickhouse-server/config.d/onlydoge-memory.xml'.
+Logging trace to /var/log/clickhouse-server/clickhouse-server.log
+Logging errors to /var/log/clickhouse-server/clickhouse-server.err.log

@@ -98,14 +98,34 @@ function createCliRuntimeContext(): CliRuntimeContext {
   const bind = resolveBindSettings(options);
   const abortController = new AbortController();
 
-  for (const event of ['SIGINT', 'SIGTERM']) {
+  for (const event of ['SIGINT', 'SIGTERM'] as const) {
     process.on(event, () => {
       abortController.abort();
     });
   }
 
+  installFatalProcessHandlers();
+
   return { abortController, bind, options };
 }
+
+function installFatalProcessHandlers(): void {
+  if (fatalProcessHandlersInstalled) {
+    return;
+  }
+
+  fatalProcessHandlersInstalled = true;
+  process.on('uncaughtException', (error) => {
+    console.error(`[onlydoge] uncaught exception: ${errorMessage(error)}`);
+    process.exit(1);
+  });
+  process.on('unhandledRejection', (error) => {
+    console.error(`[onlydoge] unhandled rejection: ${errorMessage(error)}`);
+    process.exit(1);
+  });
+}
+
+let fatalProcessHandlersInstalled = false;
 
 async function startDegradedHealthServer(
   bind: BindSettings,
@@ -245,7 +265,11 @@ async function stopHttpRuntimeOnAbort(
   }
 
   await waitForAbort(signal);
-  await server.stop();
+  try {
+    await server.stop();
+  } catch (error) {
+    console.error(`[onlydoge] http runtime stop failed: ${errorMessage(error)}`);
+  }
 }
 
 void main().catch((error) => {

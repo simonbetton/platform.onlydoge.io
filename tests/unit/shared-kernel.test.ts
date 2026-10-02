@@ -30,6 +30,9 @@ describe('shared kernel', () => {
     expect(settings.mode).toBe('both');
     expect(settings.database.driver).toBe('sqlite');
     expect(settings.indexer).toMatchObject({
+      coreBackfillBlockSource: 'auto',
+      coreBackfillWindowBlocks: 2000,
+      coreBackfillWindowRows: 200000,
       coreBlockTimeoutMs: 120000,
       coreDbStatementTimeoutMs: 30000,
       coreOnlineTipDistance: 6,
@@ -38,8 +41,11 @@ describe('shared kernel', () => {
       coreProgressWatchdogMs: 180000,
       coreRawStorageTimeoutMs: 30000,
       coreSyncCompleteDistance: 6,
-      syncConcurrency: 4,
-      syncWindow: 32,
+      syncBatchSize: 16,
+      syncConcurrency: 8,
+      syncRetryAttempts: 6,
+      syncRetryBaseDelayMs: 500,
+      syncWindow: 256,
     });
     expect(settings.storage.driver).toBe('file');
     expect(settings.warehouse.driver).toBe('duckdb');
@@ -79,6 +85,35 @@ describe('shared kernel', () => {
       syncConcurrency: 6,
       syncWindow: 16,
     });
+  });
+
+  it('loads backfill window settings from env and rejects unknown block sources', () => {
+    const env = {
+      ONLYDOGE_DATABASE: 'sqlite:///tmp/onlydoge.sqlite.db',
+      ONLYDOGE_STORAGE: 'file:///tmp/storage',
+      ONLYDOGE_WAREHOUSE: '/tmp/warehouse.json',
+    };
+    const settings = loadSettings({
+      env: {
+        ...env,
+        ONLYDOGE_CORE_BACKFILL_BLOCK_SOURCE: 'storage',
+        ONLYDOGE_CORE_BACKFILL_WINDOW_BLOCKS: '500',
+        ONLYDOGE_CORE_BACKFILL_WINDOW_ROWS: '50000',
+      },
+      mode: parseMode('indexer'),
+    });
+
+    expect(settings.indexer).toMatchObject({
+      coreBackfillBlockSource: 'storage',
+      coreBackfillWindowBlocks: 500,
+      coreBackfillWindowRows: 50000,
+    });
+    expect(() =>
+      loadSettings({
+        env: { ...env, ONLYDOGE_CORE_BACKFILL_BLOCK_SOURCE: 'minio' },
+        mode: parseMode('indexer'),
+      }),
+    ).toThrow('Invalid backfill block source: minio');
   });
 
   it('requires explicit database, storage, and warehouse env in production', () => {
@@ -129,6 +164,36 @@ describe('shared kernel', () => {
       driver: 'clickhouse',
       requestTimeoutMs: 45000,
     });
+  });
+
+  it('loads the PostgreSQL pool limit from env', () => {
+    const settings = loadSettings({
+      env: {
+        ONLYDOGE_DATABASE: 'postgres://onlydoge:onlydoge@localhost:5432/onlydoge',
+        ONLYDOGE_DATABASE_POOL_MAX: '64',
+        ONLYDOGE_STORAGE: 'http://localhost:9000/onlydoge-raw/storage',
+        ONLYDOGE_WAREHOUSE: 'http://clickhouse:8123?database=onlydoge',
+      },
+      mode: parseMode('indexer'),
+    });
+
+    expect(settings.database).toMatchObject({
+      driver: 'postgres',
+      poolMax: 64,
+    });
+  });
+
+  it('defaults the PostgreSQL pool limit when env is unset', () => {
+    const settings = loadSettings({
+      env: {
+        ONLYDOGE_DATABASE: 'postgres://onlydoge:onlydoge@localhost:5432/onlydoge',
+        ONLYDOGE_STORAGE: 'http://localhost:9000/onlydoge-raw/storage',
+        ONLYDOGE_WAREHOUSE: 'http://clickhouse:8123?database=onlydoge',
+      },
+      mode: parseMode('indexer'),
+    });
+
+    expect(settings.database.poolMax).toBe(10);
   });
 
   it('builds a postgres connection string from granular database env vars', () => {

@@ -1,6 +1,6 @@
 {
   "$schema": "https://raw.githubusercontent.com/fallow-rs/fallow/main/schema.json",
-  "entry": ["apps/*/src/index.ts", "scripts/*.ts", "drizzle.config.ts", "vitest.config.ts"],
+  "entry": ["apps/*/src/index.ts", "scripts/*.ts", "vitest.config.ts"],
   "ignorePatterns": [
     ".agents/**",
     ".cursor/**",
@@ -129,7 +129,7 @@
       }
     },
     {
-      "files": ["scripts/**", "drizzle.config.ts", "vitest.config.ts"],
+      "files": ["scripts/**", "vitest.config.ts"],
       "rules": {
         "unused-exports": "off"
       }

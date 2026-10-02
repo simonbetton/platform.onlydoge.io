@@ -1,9 +1,12 @@
 import type { PrimaryId } from '@onlydoge/shared-kernel';
 import type { ApiKeyRecord } from '../domain/api-key';
 
+export type BootstrapApiKeyResult = { created: true; record: ApiKeyRecord } | { created: false };
+
 export interface ApiKeyRepository {
   countActiveAdminApiKeys(): Promise<number>;
   countApiKeys(): Promise<number>;
+  createBootstrapApiKey(record: ApiKeyRecord): Promise<BootstrapApiKeyResult>;
   createApiKey(record: ApiKeyRecord): Promise<ApiKeyRecord>;
   getApiKeyByHash(secretKeyHash: string): Promise<ApiKeyRecord | null>;
   getApiKeyById(id: string): Promise<ApiKeyRecord | null>;

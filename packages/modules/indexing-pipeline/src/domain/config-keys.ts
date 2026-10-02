@@ -62,6 +62,16 @@ export function configKeyDogecoinCurrentStateMaterialization(): string {
   return 'dogecoin_current_state_materialization';
 }
 
+/** Checkpoint of a running history finalization; absent when none is in progress. */
+export function configKeyDogecoinHistoryFinalization(): string {
+  return 'dogecoin_history_finalization';
+}
+
+/** Height through which backfilled history was finalized; absent until it ran once. */
+export function configKeyDogecoinHistoryFinalizedTail(): string {
+  return 'dogecoin_history_finalized_tail';
+}
+
 export function configKeyProjectionBootstrapTail(): string {
   return 'projection_bootstrap_tail';
 }
@@ -84,4 +94,36 @@ export function configKeyProjectionBootstrapCursorBalance(): string {
 
 export function configKeyProjectionBootstrapStartedAt(): string {
   return 'projection_bootstrap_started_at';
+}
+
+export function configKeyCoreApplyRecovery(): string {
+  return 'dogecoin_core_apply_recovery';
+}
+
+export function configKeyDogecoinTransactionRefsReady(): string {
+  return 'dogecoin_transaction_refs_ready';
+}
+
+export function configKeyDogecoinTransactionRefsBackfillTail(): string {
+  return 'dogecoin_transaction_refs_backfill_tail';
+}
+
+export function configKeyIndexerSyncBlocksPerSecond(): string {
+  return 'indexer_sync_blocks_per_second';
+}
+
+export function configKeyIndexerSyncEtaSeconds(): string {
+  return 'indexer_sync_eta_seconds';
+}
+
+export function configKeyIndexerProcessBlocksPerSecond(): string {
+  return 'indexer_process_blocks_per_second';
+}
+
+export function configKeyIndexerProcessEtaSeconds(): string {
+  return 'indexer_process_eta_seconds';
+}
+
+export function configKeyIndexerLastActivityAt(): string {
+  return 'indexer_last_activity_at';
 }

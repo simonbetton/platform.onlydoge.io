@@ -1,9 +1,13 @@
 import {
   ApiSecret,
+  defaultPageLimit,
   ExternalId,
   ForbiddenError,
+  maxPageLimit,
+  maxPageOffset,
   NotFoundError,
   type PrimaryId,
+  parseBoundedNonNegativeInteger,
   UnauthorizedError,
   ValidationError,
 } from '@onlydoge/shared-kernel';
@@ -53,6 +57,10 @@ export class AccessControlService {
     input: CreateApiKeyInput,
     actor?: AuthenticatedApiKey,
   ): Promise<ApiKeyResponse> {
+    if (!actor) {
+      return this.createBootstrapKey(input);
+    }
+
     const hasConfiguredKeys = await this.hasConfiguredKeys();
     this.assertCanCreateKey(hasConfiguredKeys, actor);
     await this.assertApiKeyIdAvailable(input.id);
@@ -66,6 +74,17 @@ export class AccessControlService {
     return apiKeyToResponse(created, { apiToken: entity.apiToken });
   }
 
+  private async createBootstrapKey(input: CreateApiKeyInput): Promise<ApiKeyResponse> {
+    await this.assertApiKeyIdAvailable(input.id);
+    const entity = ApiKey.create({ ...input, role: 'admin' });
+    const result = await this.apiKeys.createBootstrapApiKey(entity.record);
+    if (!result.created) {
+      throw new UnauthorizedError();
+    }
+
+    return apiKeyToResponse(result.record, { apiToken: entity.apiToken });
+  }
+
   public async listKeys(
     actor: AuthenticatedApiKey,
     offset?: number,
@@ -74,9 +93,12 @@ export class AccessControlService {
     keys: ApiKeyResponse[];
   }> {
     requireAdminApiKey(actor);
+    const page = boundedPage(offset, limit);
 
     return {
-      keys: (await this.apiKeys.listApiKeys(offset, limit)).map((key) => apiKeyToResponse(key)),
+      keys: (await this.apiKeys.listApiKeys(page.offset, page.limit)).map((key) =>
+        apiKeyToResponse(key),
+      ),
     };
   }
 
@@ -142,8 +164,12 @@ export class AccessControlService {
     actor: AuthenticatedApiKey,
     filters: AuditEventFilters,
   ): Promise<{ events: AuditEventResponse[] }> {
+    const page = boundedPage(filters.offset, filters.limit);
+    const boundedFilters = { ...filters, ...page };
     const scopedFilters =
-      actor.role === 'admin' ? filters : { ...filters, actorApiKeyId: actor.apiKeyId };
+      actor.role === 'admin'
+        ? boundedFilters
+        : { ...boundedFilters, actorApiKeyId: actor.apiKeyId };
 
     return {
       events: (await this.apiKeys.listAuditEvents(scopedFilters)).map(auditEventToResponse),
@@ -220,6 +246,26 @@ export class AccessControlService {
       await this.apiKeys.updateApiKey(updated);
     }
   }
+}
+
+function boundedPage(
+  offset: number | undefined,
+  limit: number | undefined,
+): { limit: number; offset: number } {
+  return {
+    offset:
+      parseBoundedNonNegativeInteger(offset, {
+        defaultValue: 0,
+        field: 'offset',
+        maximum: maxPageOffset,
+      }) ?? 0,
+    limit:
+      parseBoundedNonNegativeInteger(limit, {
+        defaultValue: defaultPageLimit,
+        field: 'limit',
+        maximum: maxPageLimit,
+      }) ?? defaultPageLimit,
+  };
 }
 
 function applyApiKeyUpdate(

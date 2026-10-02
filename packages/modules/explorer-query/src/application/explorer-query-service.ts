@@ -1,4 +1,5 @@
 import {
+  configKeyDogecoinTransactionRefsReady,
   configKeyIndexerProcessTail,
   configKeyIndexerSyncTail,
   type DogecoinTransaction,
@@ -12,7 +13,15 @@ import {
   type ProjectionUtxoOutput,
   parseAmountBase,
 } from '@onlydoge/indexing-pipeline';
-import { NotFoundError, TooEarlyError, ValidationError } from '@onlydoge/shared-kernel';
+import {
+  defaultPageLimit,
+  maxPageLimit,
+  maxPageOffset,
+  NotFoundError,
+  parseBoundedNonNegativeInteger,
+  TooEarlyError,
+  ValidationError,
+} from '@onlydoge/shared-kernel';
 
 import type {
   ExplorerConfigPort,
@@ -58,8 +67,6 @@ type MempoolCacheEntry = {
   promise: Promise<CachedMempoolSnapshot>;
 };
 
-const defaultMempoolLimit = 100;
-const maxMempoolLimit = 500;
 const rawTransactionRefLookupLimit = 1_000;
 const mempoolCacheTtlMs = 1_000;
 
@@ -88,28 +95,33 @@ export class ExplorerQueryService {
     const txMatch = await this.searchTransaction(q);
     const blockMatch = await this.searchBlockHash(q);
     const addressMatch = await this.searchAddress(q);
-    return { matches: [txMatch, blockMatch, addressMatch].filter(isExplorerSearchResult) };
+    return {
+      matches: [txMatch, blockMatch, addressMatch].filter(isExplorerSearchResult),
+    };
   }
 
   public async listBlocks(
     offset?: number,
     limit?: number,
   ): Promise<{ blocks: ExplorerBlockSummary[] }> {
+    const page = explorerPage(offset, limit);
     await this.resolveDogecoin();
     const syncTail = await this.configNumberOrDefault(configKeyIndexerSyncTail(), -1);
     if (syncTail < 0) {
-      return this.listAppliedBlocks(offset, limit);
+      return this.listAppliedBlocks(page.offset, page.limit);
     }
 
-    const heights = descendingBlockHeights(syncTail, offset ?? 0, limit ?? 20);
+    const heights = descendingBlockHeights(syncTail, page.offset, page.limit);
     const blocks = await Promise.all(heights.map(async (height) => this.getBlockByHeight(height)));
 
-    return { blocks: blocks.filter((block): block is ExplorerBlockSummary => Boolean(block)) };
+    return {
+      blocks: blocks.filter((block): block is ExplorerBlockSummary => Boolean(block)),
+    };
   }
 
   public async listMempool(offset?: number, limit?: number): Promise<ExplorerMempoolResponse> {
+    const page = explorerPage(offset, limit);
     const dogecoin = await this.resolveDogecoin();
-    const page = mempoolPage(offset, limit);
     const snapshot = await this.getCachedMempoolSnapshot(dogecoin);
     const transactions = snapshot.transactions.slice(page.offset, page.offset + page.limit);
 
@@ -124,16 +136,31 @@ export class ExplorerQueryService {
 
   public async getBlock(
     ref: string,
-  ): Promise<{ block: ExplorerBlockSummary; transactions: ExplorerTransactionSummary[] }> {
+    offset?: number,
+    limit?: number,
+  ): Promise<{
+    block: ExplorerBlockSummary;
+    limit: number;
+    offset: number;
+    returnedCount: number;
+    totalCount: number;
+    transactions: ExplorerTransactionSummary[];
+  }> {
+    const page = explorerPage(offset, limit);
     await this.resolveDogecoin();
     await this.assertHistoryReady();
     const parsed = await this.resolveBlockSnapshot(ref);
-    const inputMap = await this.loadResolvedInputs(parsed.tx);
+    const transactions = parsed.tx.slice(page.offset, page.offset + page.limit);
+    const inputMap = await this.loadResolvedInputs(transactions);
 
     return {
       block: this.serializeBlock(parsed),
-      transactions: parsed.tx.map((transaction, txIndex) =>
-        this.serializeTransactionSummary(parsed, transaction, txIndex, inputMap),
+      offset: page.offset,
+      limit: page.limit,
+      returnedCount: transactions.length,
+      totalCount: parsed.tx.length,
+      transactions: transactions.map((transaction, txIndex) =>
+        this.serializeTransactionSummary(parsed, transaction, page.offset + txIndex, inputMap),
       ),
     };
   }
@@ -182,21 +209,19 @@ export class ExplorerQueryService {
     offset?: number,
     limit?: number,
   ): Promise<{ transactions: ExplorerAddressTransactionSummary[] }> {
+    const page = explorerPage(offset, limit);
     const normalizedAddress = requireExplorerAddress(address);
     await this.resolveDogecoin();
     await this.assertHistoryReady();
     const rows = await this.warehouse.listAddressTransactions(
       normalizedAddress,
-      offset,
-      defaultAddressPageLimit(limit),
+      page.offset,
+      page.limit,
     );
-    const snapshotsByHeight = await this.loadSnapshotsByHeight([
-      ...new Set(rows.map((row) => row.blockHeight)),
-    ]);
 
     return {
       transactions: rows
-        .flatMap((row) => this.addressTransactionSummary(row, snapshotsByHeight))
+        .map((row) => this.addressTransactionSummaryFromFacts(row))
         .sort(compareAddressTransactionSummaries),
     };
   }
@@ -206,13 +231,10 @@ export class ExplorerQueryService {
     offset?: number,
     limit?: number,
   ): Promise<{ utxos: ExplorerAddressUtxo[] }> {
+    const page = explorerPage(offset, limit);
     const normalizedAddress = requireExplorerAddress(address);
     await this.resolveDogecoin();
-    const utxos = await this.warehouse.listAddressUtxos(
-      normalizedAddress,
-      offset,
-      defaultAddressPageLimit(limit),
-    );
+    const utxos = await this.warehouse.listAddressUtxos(normalizedAddress, page.offset, page.limit);
 
     return {
       utxos: utxos.map((utxo) => ({
@@ -265,7 +287,9 @@ export class ExplorerQueryService {
       refs.map(async (ref) => this.getBlockByHeight(ref.blockHeight)),
     );
 
-    return { blocks: blocks.filter((block): block is ExplorerBlockSummary => Boolean(block)) };
+    return {
+      blocks: blocks.filter((block): block is ExplorerBlockSummary => Boolean(block)),
+    };
   }
 
   private async searchTransaction(q: string): Promise<ExplorerSearchResult | null> {
@@ -395,7 +419,27 @@ export class ExplorerQueryService {
   }
 
   private async getTransactionRef(txid: string) {
-    return (await this.warehouse.getTransactionRef(txid)) ?? this.findRawTransactionRef(txid);
+    const warehouseRef = await this.warehouse.getTransactionRef(txid);
+    if (!warehouseRef) {
+      if (await this.transactionRefsReady()) {
+        return null;
+      }
+
+      return this.findRawTransactionRef(txid);
+    }
+
+    const canonical = await this.coreBlocks.getCoreBlockByHash(warehouseRef.blockHash);
+    if (!canonical || canonical.blockHeight !== warehouseRef.blockHeight) {
+      return null;
+    }
+
+    return warehouseRef;
+  }
+
+  private async transactionRefsReady(): Promise<boolean> {
+    return (
+      (await this.configs.getJsonValue<boolean>(configKeyDogecoinTransactionRefsReady())) === true
+    );
   }
 
   private async findRawTransactionRef(txid: string) {
@@ -513,36 +557,38 @@ export class ExplorerQueryService {
     };
   }
 
-  private addressTransactionSummary(
-    row: {
-      blockHeight: number;
-      receivedBase: string;
-      sentBase: string;
-      txid: string;
-    },
-    snapshotsByHeight: Map<number, ParsedDogecoinBlock>,
-  ): ExplorerAddressTransactionSummary[] {
-    const block = snapshotsByHeight.get(row.blockHeight);
-    if (!block) {
-      return [];
-    }
-
-    const txIndex = block.tx.findIndex((candidate) => this.readString(candidate.txid) === row.txid);
-    if (txIndex < 0) {
-      return [];
-    }
-
-    return [
-      {
-        transaction: this.serializeTransactionSummary(
-          block,
-          requireDogecoinTransactionAt(block, txIndex),
-          txIndex,
-        ),
-        receivedBase: row.receivedBase,
-        sentBase: row.sentBase,
+  private addressTransactionSummaryFromFacts(row: {
+    blockHash: string;
+    blockHeight: number;
+    blockTime: number;
+    feeBase: string | null;
+    inputCount: number;
+    isCoinbase: boolean;
+    outputCount: number;
+    receivedBase: string;
+    sentBase: string;
+    totalInputBase: string;
+    totalOutputBase: string;
+    txIndex: number;
+    txid: string;
+  }): ExplorerAddressTransactionSummary {
+    return {
+      transaction: {
+        txid: row.txid,
+        txIndex: row.txIndex,
+        blockHeight: row.blockHeight,
+        blockHash: row.blockHash,
+        blockTime: row.blockTime,
+        isCoinbase: row.isCoinbase,
+        inputCount: row.inputCount,
+        outputCount: row.outputCount,
+        totalInputBase: row.totalInputBase,
+        totalOutputBase: row.totalOutputBase,
+        feeBase: row.feeBase,
       },
-    ];
+      receivedBase: row.receivedBase,
+      sentBase: row.sentBase,
+    };
   }
 
   private async resolveBlockSnapshot(ref: string): Promise<ParsedDogecoinBlock> {
@@ -577,23 +623,6 @@ export class ExplorerQueryService {
     }
 
     return this.parseBlock(snapshot);
-  }
-
-  private async loadSnapshotsByHeight(
-    heights: number[],
-  ): Promise<Map<number, ParsedDogecoinBlock>> {
-    const snapshots = await Promise.all(
-      heights.map(
-        async (height) =>
-          [height, await this.rawBlocks.getPart<Record<string, unknown>>(height, 'block')] as const,
-      ),
-    );
-
-    return new Map(
-      snapshots
-        .filter((entry): entry is readonly [number, Record<string, unknown>] => Boolean(entry[1]))
-        .map(([height, snapshot]) => [height, this.parseBlock(snapshot)]),
-    );
   }
 
   private serializeBlock(block: ParsedDogecoinBlock): ExplorerBlockSummary {
@@ -784,18 +813,24 @@ function blockSearchResult(block: ExplorerBlockSummary): ExplorerSearchResult {
   };
 }
 
-function mempoolPage(
+function explorerPage(
   offset: number | undefined,
   limit: number | undefined,
 ): { limit: number; offset: number } {
   return {
-    offset: offset ?? 0,
-    limit: Math.min(limit ?? defaultMempoolLimit, maxMempoolLimit),
+    offset:
+      parseBoundedNonNegativeInteger(offset, {
+        defaultValue: 0,
+        field: 'offset',
+        maximum: maxPageOffset,
+      }) ?? 0,
+    limit:
+      parseBoundedNonNegativeInteger(limit, {
+        defaultValue: defaultPageLimit,
+        field: 'limit',
+        maximum: maxPageLimit,
+      }) ?? defaultPageLimit,
   };
-}
-
-function defaultAddressPageLimit(limit: number | undefined): number {
-  return limit ?? 50;
 }
 
 function requireExplorerAddress(address: string): string {
@@ -844,18 +879,6 @@ function compareAddressTransactionSummaries(
 
 function firstNonZero(values: number[]): number {
   return values.find((value) => value !== 0) ?? 0;
-}
-
-function requireDogecoinTransactionAt(
-  block: ParsedDogecoinBlock,
-  txIndex: number,
-): DogecoinTransaction {
-  const transaction = block.tx[txIndex];
-  if (!transaction) {
-    throw new NotFoundError('transaction not found');
-  }
-
-  return transaction;
 }
 
 function assertAddressExists(summary: unknown): void {

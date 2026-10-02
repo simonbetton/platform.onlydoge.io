@@ -43,6 +43,22 @@ describe('warehouse query helpers', () => {
       username: 'doge',
       password: 'secret',
     });
+    expect(
+      clickHouseClientOptions(
+        {
+          driver: 'clickhouse',
+          location: 'http://clickhouse:8123',
+          database: 'onlydoge',
+          user: 'primary',
+          password: 'primary-secret',
+        },
+        1234,
+        { user: 'analytics', password: 'analytics-secret' },
+      ),
+    ).toMatchObject({
+      username: 'analytics',
+      password: 'analytics-secret',
+    });
     expect(clickHouseOutputKeyCursorClause(null)).toBe('');
     expect(clickHouseOutputKeyCursorClause('tx:1')).toContain('output_key >');
     expect(clickHouseOutputPageParams('tx:1', 50)).toEqual({

@@ -1,3 +1,5 @@
+import { createClient as createLibsqlClient } from '@libsql/client';
+import { ApiKey } from '@onlydoge/access-control';
 import { configKeyDogecoinHistoryReady } from '@onlydoge/indexing-pipeline';
 import { describe, expect, it } from 'vitest';
 
@@ -22,6 +24,110 @@ describe('relational metadata store', () => {
       await ctx.runtime.metadata.deleteByPrefix('dogecoin:test:');
       await expect(ctx.runtime.metadata.getJsonValue('dogecoin:test:tail')).resolves.toBeNull();
     } finally {
+      await ctx.cleanup();
+    }
+  });
+
+  it('allows exactly one absent-key claim under contention', async () => {
+    const ctx = await createTestApp('indexer');
+
+    try {
+      const candidates = Array.from({ length: 20 }, (_, index) => ({ owner: `worker-${index}` }));
+      const results = await Promise.all(
+        candidates.map((candidate) =>
+          ctx.runtime.metadata.compareAndSwapJsonValue('test:absent-claim', null, candidate),
+        ),
+      );
+      const winnerIndex = results.findIndex(Boolean);
+
+      expect(results.filter(Boolean)).toHaveLength(1);
+      expect(winnerIndex).toBeGreaterThanOrEqual(0);
+      await expect(ctx.runtime.metadata.getJsonValue('test:absent-claim')).resolves.toEqual(
+        candidates[winnerIndex],
+      );
+    } finally {
+      await ctx.cleanup();
+    }
+  });
+
+  it('allows exactly one matching-value swap under contention', async () => {
+    const ctx = await createTestApp('indexer');
+
+    try {
+      const key = 'test:existing-claim';
+      const expected = { epoch: 1, owner: 'original' };
+      const candidates = [
+        { epoch: 2, owner: 'worker-a' },
+        { epoch: 2, owner: 'worker-b' },
+      ];
+      await ctx.runtime.metadata.setJsonValue(key, expected);
+
+      const results = await Promise.all(
+        candidates.map((candidate) =>
+          ctx.runtime.metadata.compareAndSwapJsonValue(key, expected, candidate),
+        ),
+      );
+      const winnerIndex = results.findIndex(Boolean);
+
+      expect(results.filter(Boolean)).toHaveLength(1);
+      expect(winnerIndex).toBeGreaterThanOrEqual(0);
+      await expect(ctx.runtime.metadata.getJsonValue(key)).resolves.toEqual(
+        candidates[winnerIndex],
+      );
+      await expect(
+        ctx.runtime.metadata.compareAndSwapJsonValue(key, expected, { epoch: 3, owner: 'stale' }),
+      ).resolves.toBe(false);
+      await expect(ctx.runtime.metadata.getJsonValue(key)).resolves.toEqual(
+        candidates[winnerIndex],
+      );
+    } finally {
+      await ctx.cleanup();
+    }
+  });
+
+  it('deletes only when the stored JSON matches exactly', async () => {
+    const ctx = await createTestApp('indexer');
+
+    try {
+      const key = 'test:delete-cas';
+      const marker = { version: 1, owner: 'worker-a' };
+      await ctx.runtime.metadata.setJsonValue(key, marker);
+
+      await expect(
+        ctx.runtime.metadata.compareAndDeleteJsonValue(key, { version: 1, owner: 'worker-b' }),
+      ).resolves.toBe(false);
+      await expect(ctx.runtime.metadata.getJsonValue(key)).resolves.toEqual(marker);
+      await expect(ctx.runtime.metadata.compareAndDeleteJsonValue(key, marker)).resolves.toBe(true);
+      await expect(ctx.runtime.metadata.getJsonValue(key)).resolves.toBeNull();
+    } finally {
+      await ctx.cleanup();
+    }
+  });
+
+  it('updates the timestamp after a successful swap', async () => {
+    const ctx = await createTestApp('indexer');
+    const client = createLibsqlClient({ url: `file:${ctx.tempRoot}/onlydoge.sqlite.db` });
+
+    try {
+      const key = 'test:cas-timestamp';
+      await ctx.runtime.metadata.setJsonValue(key, { epoch: 1 });
+      const before = await client.execute({
+        sql: 'SELECT updated_at FROM app_config WHERE key = ?',
+        args: [key],
+      });
+      await new Promise((resolve) => setTimeout(resolve, 5));
+
+      await expect(
+        ctx.runtime.metadata.compareAndSwapJsonValue(key, { epoch: 1 }, { epoch: 2 }),
+      ).resolves.toBe(true);
+      const after = await client.execute({
+        sql: 'SELECT updated_at FROM app_config WHERE key = ?',
+        args: [key],
+      });
+
+      expect(after.rows[0]?.updated_at).not.toBe(before.rows[0]?.updated_at);
+    } finally {
+      client.close();
       await ctx.cleanup();
     }
   });
@@ -81,6 +187,95 @@ describe('relational metadata store', () => {
           resourceType: 'block',
         }),
       ]);
+    } finally {
+      await ctx.cleanup();
+    }
+  });
+
+  it('atomically creates exactly one bootstrap API key', async () => {
+    const ctx = await createTestApp();
+
+    try {
+      const candidates = Array.from(
+        { length: 8 },
+        (_, index) => ApiKey.create({ id: `key_bootstrap_${index}`, role: 'admin' }).record,
+      );
+      const results = await Promise.all(
+        candidates.map((record) => ctx.runtime.metadata.createBootstrapApiKey(record)),
+      );
+
+      expect(results.filter((result) => result.created)).toHaveLength(1);
+      await expect(ctx.runtime.metadata.countApiKeys()).resolves.toBe(1);
+      await expect(ctx.runtime.metadata.countActiveAdminApiKeys()).resolves.toBe(1);
+    } finally {
+      await ctx.cleanup();
+    }
+  });
+
+  it('writes many config values in one call', async () => {
+    const ctx = await createTestApp('indexer');
+
+    try {
+      await ctx.runtime.metadata.setJsonValue('test:batch:kept', 'before');
+      await ctx.runtime.metadata.setJsonValue('test:batch:replaced', 1);
+
+      await ctx.runtime.metadata.setJsonValues([
+        ['test:batch:replaced', 2],
+        ['test:batch:new', { stage: 'online', tail: 12 }],
+        ['test:batch:null', null],
+        // A key repeated within one batch keeps its last value.
+        ['test:batch:replaced', 3],
+      ]);
+      await ctx.runtime.metadata.setJsonValues([]);
+
+      await expect(ctx.runtime.metadata.getJsonValue('test:batch:kept')).resolves.toBe('before');
+      await expect(ctx.runtime.metadata.getJsonValue('test:batch:replaced')).resolves.toBe(3);
+      await expect(ctx.runtime.metadata.getJsonValue('test:batch:new')).resolves.toEqual({
+        stage: 'online',
+        tail: 12,
+      });
+      await expect(ctx.runtime.metadata.getJsonValue('test:batch:null')).resolves.toBeNull();
+    } finally {
+      await ctx.cleanup();
+    }
+  });
+
+  it('upserts raw block identities in batches', async () => {
+    const ctx = await createTestApp('indexer');
+    const block = (blockHeight: number, blockHash: string) => ({
+      blockHeight,
+      blockHash,
+      previousBlockHash: blockHeight > 0 ? `block-${blockHeight - 1}` : null,
+      blockTime: 1_700_000_000 + blockHeight,
+      txCount: blockHeight + 1,
+      rawStorageKey: 'block',
+      fetchedAt: '2026-01-01T00:00:00.000Z',
+      processedAt: null,
+    });
+
+    try {
+      await ctx.runtime.metadata.upsertCoreBlocks([]);
+      await ctx.runtime.metadata.upsertCoreBlocks([
+        block(0, 'block-0'),
+        block(1, 'block-1'),
+        block(2, 'block-2'),
+      ]);
+      // A re-synced height replaces the stored identity, as the per-block upsert does.
+      await ctx.runtime.metadata.upsertCoreBlocks([block(2, 'block-2b'), block(3, 'block-3')]);
+
+      await expect(ctx.runtime.metadata.getCoreBlockByHash('block-1')).resolves.toEqual({
+        blockHash: 'block-1',
+        blockHeight: 1,
+      });
+      await expect(ctx.runtime.metadata.getCoreBlockByHash('block-2')).resolves.toBeNull();
+      await expect(ctx.runtime.metadata.getCoreBlockByHash('block-2b')).resolves.toEqual({
+        blockHash: 'block-2b',
+        blockHeight: 2,
+      });
+      await expect(ctx.runtime.metadata.getCoreBlockByHash('block-3')).resolves.toEqual({
+        blockHash: 'block-3',
+        blockHeight: 3,
+      });
     } finally {
       await ctx.cleanup();
     }

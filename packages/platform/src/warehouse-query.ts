@@ -31,8 +31,12 @@ export function clickHouseClientOptions(
     request_timeout: requestTimeoutMs,
   };
   assignClickHouseStringOption(options, 'database', settings.database);
-  assignClickHouseStringOption(options, 'username', credentials?.user ?? settings.user);
-  assignClickHouseStringOption(options, 'password', credentials?.password ?? settings.password);
+  assignClickHouseStringOption(options, 'username', credentials ? credentials.user : settings.user);
+  assignClickHouseStringOption(
+    options,
+    'password',
+    credentials ? credentials.password : settings.password,
+  );
   return options;
 }
 
