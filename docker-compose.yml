@@ -104,7 +104,7 @@ services:
     restart: 'no'
 
   clickhouse:
-    image: clickhouse/clickhouse-server:26.6.1.1193@sha256:1d1f6508eba2dccce2cee9913907c5f7766327debc57a6b1991f2c9e3176c163
+    image: clickhouse/clickhouse-server:26.9.4.3@sha256:317c280a2334651a54b3e07201c2de4c09588b8e66e64f719cee26d0f434ca81
     restart: unless-stopped
     stop_grace_period: 2m
     # Hard cgroup ceiling. ClickHouse derives max_server_memory_usage from this
