@@ -78,6 +78,15 @@ export interface CoreDogecoinStateStorePort {
    * and the indexer trusts its recorded process tail.
    */
   getCoreProcessedTail?(): Promise<number | null | undefined>;
+  /**
+   * Completes the history of blocks processed while current state was not
+   * maintained (see `CoreHistoryFinalizationContext`). Stores whose history
+   * is complete by construction leave this undefined.
+   */
+  finalizeCoreDogecoinHistory?(
+    throughBlockHeight: number,
+    context?: CoreHistoryFinalizationContext,
+  ): Promise<void>;
   getCoreUtxoOutputs(outputKeys: string[]): Promise<Map<string, ProjectionUtxoOutput>>;
   materializeCoreDogecoinCurrentState(
     asOfBlockHeight: number,
@@ -123,6 +132,31 @@ export type CoreWindowInsertStage =
 export interface CoreStateMaterializationProgress {
   completedRanges: number;
   rangeCount: number;
+}
+
+export type CoreHistoryFinalizationPhase = 'debits' | 'facts';
+
+export interface CoreHistoryFinalizationProgress {
+  completedRanges: number;
+  phase: CoreHistoryFinalizationPhase;
+  rangeCount: number;
+}
+
+/**
+ * History finalization completes the address movements and transaction facts
+ * of blocks that were processed before current state existed. It runs as an
+ * ordered list of output-key ranges (debit movements and input totals) and
+ * then an ordered list of height bands (fact corrections). A caller that
+ * records `onProgress` can hand the last progress back as `resumeFrom` to
+ * continue a failed attempt instead of starting over; progress recorded for a
+ * different range count is ignored.
+ */
+export interface CoreHistoryFinalizationContext {
+  /** Called after statements that advance no range, such as the block index build. */
+  onActivity?: () => Promise<void> | void;
+  onProgress?: (progress: CoreHistoryFinalizationProgress) => Promise<void> | void;
+  resumeFrom?: CoreHistoryFinalizationProgress;
+  statementTimeoutMs?: number;
 }
 
 export interface CoreDogecoinApplyContext {
