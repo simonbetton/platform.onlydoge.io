@@ -1,6 +1,7 @@
 import { EventEmitter } from 'node:events';
 import { Client, type Notification } from 'pg';
 
+import { createLogger } from './logger';
 import {
   MEMPOOL_APPEAR_CHANNEL,
   MEMPOOL_WATCH_CHANGED_CHANNEL,
@@ -71,18 +72,34 @@ export class PostgresMempoolWatchBus implements MempoolWatchBus {
       return;
     }
 
-    this.listener = new Client({
+    const listener = new Client({
       connectionString: this.database.location,
+      connectionTimeoutMillis: 5_000,
       ...sslOptions(this.database),
     });
-    this.notifier = new Client({
+    const notifier = new Client({
       connectionString: this.database.location,
+      connectionTimeoutMillis: 5_000,
       ...sslOptions(this.database),
     });
-    await this.listener.connect();
-    await this.notifier.connect();
-    await this.listener.query(`LISTEN ${MEMPOOL_APPEAR_CHANNEL}`);
-    await this.listener.query(`LISTEN ${MEMPOOL_WATCH_CHANGED_CHANNEL}`);
+    attachClientErrorHandler(listener, () => {
+      void this.stop();
+    });
+    attachClientErrorHandler(notifier, () => {
+      void this.stop();
+    });
+    try {
+      await listener.connect();
+      await notifier.connect();
+      await listener.query(`LISTEN ${MEMPOOL_APPEAR_CHANNEL}`);
+      await listener.query(`LISTEN ${MEMPOOL_WATCH_CHANGED_CHANNEL}`);
+    } catch (error) {
+      await Promise.allSettled([listener.end(), notifier.end()]);
+      throw error;
+    }
+
+    this.listener = listener;
+    this.notifier = notifier;
     this.listener.on('notification', (message) => this.handleNotification(message));
     signal?.addEventListener(
       'abort',
@@ -129,6 +146,7 @@ export class PostgresMempoolWatchBus implements MempoolWatchBus {
   }
 
   private async notify(channel: string, payload: string): Promise<void> {
+    await this.start();
     if (!this.notifier) {
       throw new Error('mempool watch bus is not started');
     }
@@ -150,4 +168,14 @@ export function createMempoolWatchBus(input: {
 
 function sslOptions(database: DatabaseSettings): { ssl?: DatabaseSettings['ssl'] } {
   return database.ssl ? { ssl: database.ssl } : {};
+}
+
+function attachClientErrorHandler(client: Client, onError: () => void): void {
+  client.on('error', (error) => {
+    createLogger({ component: 'mempool-watch-bus', service: 'onlydoge' }).error(
+      { err: error },
+      'mempool watch bus client error',
+    );
+    onError();
+  });
 }

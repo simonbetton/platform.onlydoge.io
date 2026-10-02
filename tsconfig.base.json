@@ -14,7 +14,6 @@
     "resolveJsonModule": true,
     "verbatimModuleSyntax": true,
     "types": ["bun-types"],
-    "baseUrl": ".",
     "paths": {
       "@onlydoge/shared-kernel": ["./packages/shared-kernel/src/index.ts"],
       "@onlydoge/api": ["./apps/api/src/index.ts"],
@@ -26,5 +25,5 @@
       "@onlydoge/indexing-pipeline": ["./packages/modules/indexing-pipeline/src/index.ts"]
     }
   },
-  "include": ["apps/**/*.ts", "packages/**/*.ts", "scripts/deploy-*.ts", "tests/**/*.ts"]
+  "include": ["apps/**/*.ts", "packages/**/*.ts", "scripts/*.ts", "tests/**/*.ts"]
 }

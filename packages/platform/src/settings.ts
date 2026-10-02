@@ -1,11 +1,15 @@
 import { URL } from 'node:url';
 
-import type { CoreDogecoinIndexerSettings } from '@onlydoge/indexing-pipeline';
+import type {
+  CoreBackfillBlockSource,
+  CoreDogecoinIndexerSettings,
+} from '@onlydoge/indexing-pipeline';
 import { expandHomePath, type Mode, parseMode } from '@onlydoge/shared-kernel';
 
 export interface DatabaseSettings {
   driver: 'sqlite' | 'postgres' | 'mysql';
   location: string;
+  poolMax?: number;
   ssl?: {
     ca?: string;
     rejectUnauthorized?: boolean;
@@ -42,6 +46,7 @@ export interface DogecoinSettings {
   mempoolRetentionSeconds: number;
   mempoolSampleIntervalMs: number;
   rpcEndpoint: string;
+  rpcTimeoutMs: number;
   rps: number;
   zmqBlockEndpoint?: string | null;
   zmqTxEndpoint?: string | null;
@@ -105,7 +110,8 @@ function parseDogecoinSettings(env: NodeJS.ProcessEnv): DogecoinSettings {
       env.ONLYDOGE_RPC_ENDPOINT,
       'http://127.0.0.1:22555',
     ),
-    rps: parsePositiveInteger(env.ONLYDOGE_DOGECOIN_RPC_RPS, 25),
+    rpcTimeoutMs: parsePositiveInteger(env.ONLYDOGE_DOGECOIN_RPC_TIMEOUT_MS, 60_000),
+    rps: parsePositiveInteger(env.ONLYDOGE_DOGECOIN_RPC_RPS, 64),
     zmqBlockEndpoint: env.ONLYDOGE_DOGECOIN_ZMQ_BLOCK_ENDPOINT ?? null,
     zmqTxEndpoint:
       env.ONLYDOGE_DOGECOIN_ZMQ_TX_ENDPOINT ?? env.ONLYDOGE_DOGECOIN_ZMQ_BLOCK_ENDPOINT ?? null,
@@ -311,14 +317,16 @@ function isPostgresLocation(location: string): boolean {
 }
 
 function postgresDatabaseSettings(location: string, env: NodeJS.ProcessEnv): DatabaseSettings {
+  const poolMax = parsePositiveInteger(env.ONLYDOGE_DATABASE_POOL_MAX, 10);
   const ssl = parseDatabaseSslSettings(env);
   if (!ssl) {
-    return { driver: 'postgres', location };
+    return { driver: 'postgres', location, poolMax };
   }
 
   return {
     driver: 'postgres',
     location: stripPostgresSslQueryParams(location),
+    poolMax,
     ssl,
   };
 }
@@ -471,6 +479,9 @@ function applyClickHouseCredential(
 
 function parseIndexerSettings(env: NodeJS.ProcessEnv): IndexerSettings {
   return {
+    coreBackfillBlockSource: parseBackfillBlockSource(env.ONLYDOGE_CORE_BACKFILL_BLOCK_SOURCE),
+    coreBackfillWindowBlocks: parsePositiveInteger(env.ONLYDOGE_CORE_BACKFILL_WINDOW_BLOCKS, 2_000),
+    coreBackfillWindowRows: parsePositiveInteger(env.ONLYDOGE_CORE_BACKFILL_WINDOW_ROWS, 200_000),
     coreBlockTimeoutMs: parsePositiveInteger(env.ONLYDOGE_CORE_BLOCK_TIMEOUT_MS, 120_000),
     coreDbStatementTimeoutMs: parsePositiveInteger(
       env.ONLYDOGE_CORE_DB_STATEMENT_TIMEOUT_MS,
@@ -487,9 +498,27 @@ function parseIndexerSettings(env: NodeJS.ProcessEnv): IndexerSettings {
       env.ONLYDOGE_INDEXER_LEASE_HEARTBEAT_INTERVAL_MS,
       5_000,
     ),
-    syncWindow: parsePositiveInteger(env.ONLYDOGE_INDEXER_SYNC_WINDOW, 32),
-    syncConcurrency: parsePositiveInteger(env.ONLYDOGE_INDEXER_SYNC_CONCURRENCY, 4),
+    syncBatchSize: parsePositiveInteger(env.ONLYDOGE_INDEXER_SYNC_BATCH_SIZE, 16),
+    syncConcurrency: parsePositiveInteger(env.ONLYDOGE_INDEXER_SYNC_CONCURRENCY, 8),
+    syncRetryAttempts: parsePositiveInteger(env.ONLYDOGE_INDEXER_SYNC_RETRY_ATTEMPTS, 6),
+    syncRetryBaseDelayMs: parsePositiveInteger(env.ONLYDOGE_INDEXER_SYNC_RETRY_BASE_DELAY_MS, 500),
+    syncWindow: parsePositiveInteger(env.ONLYDOGE_INDEXER_SYNC_WINDOW, 256),
   };
+}
+
+const backfillBlockSources: readonly CoreBackfillBlockSource[] = ['auto', 'node', 'storage'];
+
+function parseBackfillBlockSource(value: string | undefined): CoreBackfillBlockSource {
+  if (!value) {
+    return 'auto';
+  }
+
+  const source = backfillBlockSources.find((candidate) => candidate === value);
+  if (!source) {
+    throw new Error(`Invalid backfill block source: ${value}`);
+  }
+
+  return source;
 }
 
 function parsePositiveInteger(value: string | undefined, fallback: number): number {

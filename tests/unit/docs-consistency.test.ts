@@ -33,11 +33,11 @@ describe('docs consistency', () => {
     );
   });
 
-  it('includes production RPC and ZMQ examples', () => {
-    const productionExample = readFileSync(join(repoRoot, '.env.production.example'), 'utf8');
-    expect(productionExample).toContain('ONLYDOGE_DOGECOIN_RPC_ENDPOINT=');
-    expect(productionExample).toContain('ONLYDOGE_DOGECOIN_ZMQ_BLOCK_ENDPOINT=');
-    expect(productionExample).toContain('ONLYDOGE_DOGECOIN_ZMQ_TX_ENDPOINT=');
+  it('documents external node RPC and ZMQ settings in the env example', () => {
+    const example = readFileSync(join(repoRoot, '.env.example'), 'utf8');
+    expect(example).toContain('ONLYDOGE_DOGECOIN_RPC_ENDPOINT=');
+    expect(example).toContain('ONLYDOGE_DOGECOIN_ZMQ_BLOCK_ENDPOINT=');
+    expect(example).toContain('ONLYDOGE_DOGECOIN_ZMQ_TX_ENDPOINT=');
   });
 });
 

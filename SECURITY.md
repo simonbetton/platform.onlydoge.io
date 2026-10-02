@@ -21,9 +21,7 @@ Do not commit real `.env` files, API keys, database URLs with live credentials, 
 
 The repository intentionally tracks only example env files:
 
-- `.env.local.example`
-- `.env.production.example`
-- `.env.managed.example`
+- `.env.example`
 
 Real env files are ignored by `.gitignore`.
 

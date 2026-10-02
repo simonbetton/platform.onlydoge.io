@@ -48,9 +48,7 @@ describe('Bun version consistency', () => {
       expect(configuredVersion, name).toBe(version);
     }
 
-    expect(bunWorkflows.sort()).toEqual(
-      ['ci.yml', 'deploy-production.yml', 'publish-image.yml', 'security.yml'].sort(),
-    );
+    expect(bunWorkflows.sort()).toEqual(['ci.yml', 'publish-image.yml', 'security.yml'].sort());
 
     const readme = await readFile(new URL('README.md', root), 'utf8');
     expect(readme).toContain(`Bun ${version}`);

@@ -1,5 +1,10 @@
+import { readFileSync } from 'node:fs';
+import { join } from 'node:path';
+
 import { HttpBlockchainRpcGateway } from '@onlydoge/platform';
 import { afterEach, describe, expect, it, vi } from 'vitest';
+
+const fixturesDir = join(import.meta.dirname, '../fixtures/dogecoin-blocks');
 
 describe('http blockchain rpc gateway', () => {
   afterEach(() => {
@@ -177,55 +182,78 @@ describe('http blockchain rpc gateway', () => {
     vi.useRealTimers();
   });
 
-  it('loads dogecoin blocks with boolean verbosity and batched tx hydration', async () => {
-    const bodies: Array<
-      | { id?: unknown; method?: string; params?: unknown[] }
-      | Array<{
-          id?: unknown;
-          method?: string;
-          params?: unknown[];
-        }>
-    > = [];
+  it('loads dogecoin blocks as raw hex in two JSON-RPC batches and decodes them locally', async () => {
+    const bodies: unknown[] = [];
+    const rawBlocks: Record<number, string> = {
+      0: readFixture('0.hex'),
+      1: readFixture('1.hex'),
+    };
+    const hashes: Record<number, string> = {
+      0: readExpected(0).hash,
+      1: readExpected(1).hash,
+    };
 
     vi.spyOn(globalThis, 'fetch').mockImplementation(
       async (_input: RequestInfo | URL, init?: RequestInit) => {
-        const body = JSON.parse(String(init?.body ?? 'null')) as
-          | { id?: unknown; method?: string; params?: unknown[] }
-          | Array<{ id?: unknown; method?: string; params?: unknown[] }>;
+        const body = JSON.parse(String(init?.body ?? 'null')) as Array<{
+          id: number;
+          method: string;
+          params: unknown[];
+        }>;
         bodies.push(body);
-
-        if (Array.isArray(body)) {
-          return Response.json(
-            body.map((call) => ({
-              id: call.id,
-              result: {
-                txid: String(call.params?.[0] ?? ''),
-                vin: [],
-                vout: [],
-              },
-              error: null,
-            })),
-          );
-        }
-
-        if (body.method === 'getblockhash') {
-          return Response.json({ result: 'block-hash', error: null });
-        }
-
-        if (body.method === 'getblock') {
-          return Response.json({
-            result: {
-              hash: 'block-hash',
-              height: 42,
-              time: 1_700_000_000,
-              previousblockhash: 'prev-hash',
-              tx: ['tx-a', 'tx-b'],
-            },
+        return Response.json(
+          body.map((call) => ({
+            id: call.id,
             error: null,
-          });
-        }
+            result:
+              call.method === 'getblockhash'
+                ? hashes[Number(call.params[0])]
+                : rawBlocks[heightForHash(hashes, String(call.params[0]))],
+          })),
+        );
+      },
+    );
 
-        return Response.json({ result: null, error: { message: 'unexpected method' } });
+    const gateway = new HttpBlockchainRpcGateway();
+    const snapshots = await gateway.getBlockSnapshots(
+      {
+        architecture: 'dogecoin',
+        rpcEndpoint: 'http://rpc-user:rpc-password@dogecoin-rpc.example.com:22555/',
+        rps: Number.MAX_SAFE_INTEGER,
+      },
+      [0, 1],
+    );
+
+    expect(snapshots.map((snapshot) => snapshot.block)).toMatchObject([
+      { hash: hashes[0], height: 0, tx: [{ txid: readExpected(0).tx[0]?.txid }] },
+      { hash: hashes[1], height: 1, previousblockhash: hashes[0] },
+    ]);
+    expect(bodies).toEqual([
+      [
+        { jsonrpc: '1.0', id: 0, method: 'getblockhash', params: [0] },
+        { jsonrpc: '1.0', id: 1, method: 'getblockhash', params: [1] },
+      ],
+      [
+        { jsonrpc: '1.0', id: 0, method: 'getblock', params: [hashes[0], false] },
+        { jsonrpc: '1.0', id: 1, method: 'getblock', params: [hashes[1], false] },
+      ],
+    ]);
+  });
+
+  it('rejects raw blocks whose decoded hash does not match getblockhash', async () => {
+    vi.spyOn(globalThis, 'fetch').mockImplementation(
+      async (_input: RequestInfo | URL, init?: RequestInit) => {
+        const body = JSON.parse(String(init?.body ?? 'null')) as Array<{
+          id: number;
+          method: string;
+        }>;
+        return Response.json(
+          body.map((call) => ({
+            id: call.id,
+            error: null,
+            result: call.method === 'getblockhash' ? 'f'.repeat(64) : readFixture('1.hex'),
+          })),
+        );
       },
     );
 
@@ -234,52 +262,12 @@ describe('http blockchain rpc gateway', () => {
       gateway.getBlockSnapshot(
         {
           architecture: 'dogecoin',
-          rpcEndpoint: 'http://rpc-user:rpc-password@dogecoin-rpc.example.com:22555/',
+          rpcEndpoint: 'http://dogecoin-rpc.example.com:22555/',
           rps: Number.MAX_SAFE_INTEGER,
         },
-        42,
+        1,
       ),
-    ).resolves.toEqual({
-      block: {
-        hash: 'block-hash',
-        height: 42,
-        time: 1_700_000_000,
-        previousblockhash: 'prev-hash',
-        tx: [
-          { txid: 'tx-a', vin: [], vout: [] },
-          { txid: 'tx-b', vin: [], vout: [] },
-        ],
-      },
-    });
-
-    expect(bodies).toEqual([
-      {
-        jsonrpc: '1.0',
-        id: 'onlydoge',
-        method: 'getblockhash',
-        params: [42],
-      },
-      {
-        jsonrpc: '1.0',
-        id: 'onlydoge',
-        method: 'getblock',
-        params: ['block-hash', true],
-      },
-      [
-        {
-          jsonrpc: '1.0',
-          id: 0,
-          method: 'getrawtransaction',
-          params: ['tx-a', true],
-        },
-        {
-          jsonrpc: '1.0',
-          id: 1,
-          method: 'getrawtransaction',
-          params: ['tx-b', true],
-        },
-      ],
-    ]);
+    ).rejects.toThrow('dogecoin block hash mismatch');
   });
 
   it('reads dogecoin mempool info and verbose entries', async () => {
@@ -345,3 +333,16 @@ describe('http blockchain rpc gateway', () => {
     ]);
   });
 });
+
+function readFixture(name: string): string {
+  return readFileSync(join(fixturesDir, name), 'utf8').trim();
+}
+
+function readExpected(height: number): { hash: string; tx: Array<{ txid: string }> } {
+  return JSON.parse(readFixture(`${height}.expected.json`));
+}
+
+function heightForHash(hashes: Record<number, string>, hash: string): number {
+  const entry = Object.entries(hashes).find(([, value]) => value === hash);
+  return entry ? Number(entry[0]) : -1;
+}

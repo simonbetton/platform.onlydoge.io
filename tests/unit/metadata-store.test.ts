@@ -212,6 +212,75 @@ describe('relational metadata store', () => {
     }
   });
 
+  it('writes many config values in one call', async () => {
+    const ctx = await createTestApp('indexer');
+
+    try {
+      await ctx.runtime.metadata.setJsonValue('test:batch:kept', 'before');
+      await ctx.runtime.metadata.setJsonValue('test:batch:replaced', 1);
+
+      await ctx.runtime.metadata.setJsonValues([
+        ['test:batch:replaced', 2],
+        ['test:batch:new', { stage: 'online', tail: 12 }],
+        ['test:batch:null', null],
+        // A key repeated within one batch keeps its last value.
+        ['test:batch:replaced', 3],
+      ]);
+      await ctx.runtime.metadata.setJsonValues([]);
+
+      await expect(ctx.runtime.metadata.getJsonValue('test:batch:kept')).resolves.toBe('before');
+      await expect(ctx.runtime.metadata.getJsonValue('test:batch:replaced')).resolves.toBe(3);
+      await expect(ctx.runtime.metadata.getJsonValue('test:batch:new')).resolves.toEqual({
+        stage: 'online',
+        tail: 12,
+      });
+      await expect(ctx.runtime.metadata.getJsonValue('test:batch:null')).resolves.toBeNull();
+    } finally {
+      await ctx.cleanup();
+    }
+  });
+
+  it('upserts raw block identities in batches', async () => {
+    const ctx = await createTestApp('indexer');
+    const block = (blockHeight: number, blockHash: string) => ({
+      blockHeight,
+      blockHash,
+      previousBlockHash: blockHeight > 0 ? `block-${blockHeight - 1}` : null,
+      blockTime: 1_700_000_000 + blockHeight,
+      txCount: blockHeight + 1,
+      rawStorageKey: 'block',
+      fetchedAt: '2026-01-01T00:00:00.000Z',
+      processedAt: null,
+    });
+
+    try {
+      await ctx.runtime.metadata.upsertCoreBlocks([]);
+      await ctx.runtime.metadata.upsertCoreBlocks([
+        block(0, 'block-0'),
+        block(1, 'block-1'),
+        block(2, 'block-2'),
+      ]);
+      // A re-synced height replaces the stored identity, as the per-block upsert does.
+      await ctx.runtime.metadata.upsertCoreBlocks([block(2, 'block-2b'), block(3, 'block-3')]);
+
+      await expect(ctx.runtime.metadata.getCoreBlockByHash('block-1')).resolves.toEqual({
+        blockHash: 'block-1',
+        blockHeight: 1,
+      });
+      await expect(ctx.runtime.metadata.getCoreBlockByHash('block-2')).resolves.toBeNull();
+      await expect(ctx.runtime.metadata.getCoreBlockByHash('block-2b')).resolves.toEqual({
+        blockHash: 'block-2b',
+        blockHeight: 2,
+      });
+      await expect(ctx.runtime.metadata.getCoreBlockByHash('block-3')).resolves.toEqual({
+        blockHash: 'block-3',
+        blockHeight: 3,
+      });
+    } finally {
+      await ctx.cleanup();
+    }
+  });
+
   it('stores singleton core indexer state and raw block identities', async () => {
     const ctx = await createTestApp('indexer');
 

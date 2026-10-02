@@ -12,10 +12,17 @@ const schemaLockName = 'clickhouse-schema';
 type ClickHouseClient = ReturnType<typeof createClient>;
 
 export interface ClickHouseMigration {
+  /**
+   * Cheap re-check run on every boot for migrations the ledger already marks
+   * completed. Must stay O(metadata) — it runs from every API and indexer
+   * process start. Defaults to `verify` when omitted.
+   */
+  check?(context: ClickHouseMigrationContext): Promise<void>;
   checksum: string;
   name: string;
   source: string;
   up(context: ClickHouseMigrationContext): Promise<void>;
+  /** Full verification, run once right after `up` succeeds. May scan data. */
   verify(context: ClickHouseMigrationContext): Promise<void>;
   version: number;
 }
@@ -60,6 +67,7 @@ export function clickHouseMigrations(): ClickHouseMigration[] {
       addressReadModelBackfillSource,
       backfillReadModels,
       verifyReadModels,
+      checkReadModelsPopulated,
     ),
     migration(
       3,
@@ -71,6 +79,34 @@ export function clickHouseMigrations(): ClickHouseMigration[] {
         );
       },
       verifyTransactionRefsTable,
+    ),
+    migration(
+      4,
+      'zstd_column_codecs',
+      zstdColumnCodecsSource,
+      async ({ client, step }) => {
+        for (const [index, statement] of splitSqlStatements(zstdColumnCodecsSource).entries()) {
+          await step(`statement-${index + 1}`, () =>
+            client.command({ query: statement }).then(noop),
+          );
+        }
+      },
+      verifyZstdColumnCodecs,
+    ),
+    migration(
+      5,
+      'old_parts_lifetime_default',
+      oldPartsLifetimeDefaultSource,
+      async ({ client, step }) => {
+        for (const [index, statement] of splitSqlStatements(
+          oldPartsLifetimeDefaultSource,
+        ).entries()) {
+          await step(`statement-${index + 1}`, () =>
+            client.command({ query: statement }).then(noop),
+          );
+        }
+      },
+      verifyOldPartsLifetimeDefault,
     ),
   ]);
 }
@@ -110,7 +146,7 @@ export async function runClickHouseMigrations(
           (record) => record.version === item.version,
         );
         if (current?.state === 'completed') {
-          await item.verify(migrationContext(client, item.version, options));
+          await (item.check ?? item.verify)(migrationContext(client, item.version, options));
           continue;
         }
         await writeLedger(client, item, 'started');
@@ -149,6 +185,7 @@ function migration(
   source: string,
   up: ClickHouseMigration['up'],
   verify: ClickHouseMigration['verify'],
+  check?: ClickHouseMigration['check'],
 ): ClickHouseMigration {
   return {
     version,
@@ -157,6 +194,7 @@ function migration(
     checksum: createHash('sha256').update(source).digest('hex'),
     up,
     verify,
+    ...(check ? { check } : {}),
   };
 }
 
@@ -314,28 +352,87 @@ async function verifyCanonicalSchema({ client }: ClickHouseMigrationContext): Pr
   }
 }
 
+/**
+ * `LEFT ANTI JOIN` only runs with the `hash` / `grace_hash` algorithms, and a
+ * plain hash join loads the whole right table into RAM. `grace_hash` spills
+ * buckets to disk once the in-memory table passes `max_bytes_in_join`, which
+ * keeps the full-table read-model joins bounded regardless of table size.
+ */
+const boundedAntiJoinSettings = {
+  join_algorithm: 'grace_hash',
+  max_bytes_in_join: '1073741824',
+  max_bytes_before_external_group_by: '536870912',
+  max_bytes_before_external_sort: '536870912',
+} as const;
+
+const readModelPairs = [
+  {
+    source: 'dogecoin_utxo_outputs_current_v1',
+    target: 'dogecoin_utxo_outputs_current_by_address_v1',
+    keys: ['output_key', 'version'],
+  },
+  {
+    source: 'dogecoin_address_movements_v1',
+    target: 'dogecoin_address_movements_by_address_v1',
+    keys: ['movement_id'],
+  },
+] as const;
+
 async function backfillReadModels({ client, step }: ClickHouseMigrationContext): Promise<void> {
   await step('backfill-current-utxos-by-address', () =>
-    client.command({ query: currentUtxoBackfill }).then(noop),
+    client
+      .command({ query: currentUtxoBackfill, clickhouse_settings: boundedAntiJoinSettings })
+      .then(noop),
   );
   await step('backfill-movements-by-address', () =>
-    client.command({ query: movementBackfill }).then(noop),
+    client
+      .command({ query: movementBackfill, clickhouse_settings: boundedAntiJoinSettings })
+      .then(noop),
   );
 }
 
 async function verifyReadModels({ client }: ClickHouseMigrationContext): Promise<void> {
-  await verifyKeyCoverage(
-    client,
-    'dogecoin_utxo_outputs_current_v1',
-    'dogecoin_utxo_outputs_current_by_address_v1',
-    ['output_key', 'version'],
-  );
-  await verifyKeyCoverage(
-    client,
-    'dogecoin_address_movements_v1',
-    'dogecoin_address_movements_by_address_v1',
-    ['movement_id'],
-  );
+  for (const pair of readModelPairs) {
+    await verifyKeyCoverage(client, pair.source, pair.target, [...pair.keys]);
+  }
+}
+
+/**
+ * Steady-state boot check. The full anti-join in `verifyReadModels` reads both
+ * tables end to end (hundreds of GB on a synced Dogecoin warehouse) and was the
+ * single largest memory consumer on the server, re-run from every API and
+ * indexer start. Once the backfill is ledgered, the materialized views keep the
+ * read models in lock-step with their sources, so a boot only needs to catch
+ * the failure mode the backfill exists for: a populated source with an empty
+ * read model.
+ *
+ * Each side is probed for one row rather than counted. `count()` is only
+ * answered from part metadata while a table has no lightweight-deleted rows;
+ * one window rewind later it reads the whole table (265M rows on a half-synced
+ * warehouse), which on a cold disk outlasted the request timeout and failed
+ * the boot.
+ */
+async function checkReadModelsPopulated({ client }: ClickHouseMigrationContext): Promise<void> {
+  for (const pair of readModelPairs) {
+    const result = await client.query({
+      query: `
+        SELECT
+          (SELECT count() FROM (SELECT 1 FROM ${pair.source} LIMIT 1)) AS sourceRows,
+          (SELECT count() FROM (SELECT 1 FROM ${pair.target} LIMIT 1)) AS targetRows
+      `,
+      format: 'JSONEachRow',
+    });
+    const rows = (await result.json<{
+      sourceRows: number | string;
+      targetRows: number | string;
+    }>()) as Array<{ sourceRows: number | string; targetRows: number | string }>;
+    const [row] = rows;
+    if (Number(row?.sourceRows ?? 0) > 0 && Number(row?.targetRows ?? 0) === 0) {
+      throw new Error(
+        `ClickHouse read model ${pair.target} is empty while ${pair.source} has rows`,
+      );
+    }
+  }
 }
 
 async function verifyKeyCoverage(
@@ -352,6 +449,7 @@ async function verifyKeyCoverage(
       LEFT ANTI JOIN ${target} AS target ON ${predicate}
     `,
     format: 'JSONEachRow',
+    clickhouse_settings: boundedAntiJoinSettings,
   });
   const rows = (await result.json<{ missing: number | string }>()) as Array<{
     missing: number | string;
@@ -487,6 +585,170 @@ ORDER BY txid
 SETTINGS old_parts_lifetime = 0;
 `;
 
+/**
+ * Hash-like text (txids, block hashes, output keys, movement ids) is most of
+ * every core table, and hex is incompressible for LZ4 but halves under ZSTD's
+ * entropy coding. Measured on Dogecoin core tables: 245 -> 126 bytes/row for
+ * address movements, 118 -> 63 for creates, 105 -> 51 for spends. Backfill on
+ * a disk-bound host is limited by warehouse write and merge bandwidth, so
+ * halving the bytes is the cheapest speedup there is (about 1.5x measured) and
+ * it halves the final footprint.
+ *
+ * `MODIFY COLUMN ... CODEC` only changes table metadata: new parts and merges
+ * write ZSTD, existing parts are rewritten lazily as they merge.
+ */
+const zstdColumnCodecsSource = `
+ALTER TABLE dogecoin_core_utxo_creates_v1
+  MODIFY COLUMN block_height CODEC(ZSTD(1)),
+  MODIFY COLUMN block_hash CODEC(ZSTD(1)),
+  MODIFY COLUMN block_time CODEC(ZSTD(1)),
+  MODIFY COLUMN txid CODEC(ZSTD(1)),
+  MODIFY COLUMN tx_index CODEC(ZSTD(1)),
+  MODIFY COLUMN vout CODEC(ZSTD(1)),
+  MODIFY COLUMN output_key CODEC(ZSTD(1)),
+  MODIFY COLUMN address CODEC(ZSTD(1)),
+  MODIFY COLUMN script_type CODEC(ZSTD(1)),
+  MODIFY COLUMN value_base CODEC(ZSTD(1)),
+  MODIFY COLUMN version CODEC(ZSTD(1));
+
+ALTER TABLE dogecoin_core_utxo_spends_v1
+  MODIFY COLUMN spent_output_key CODEC(ZSTD(1)),
+  MODIFY COLUMN spent_by_txid CODEC(ZSTD(1)),
+  MODIFY COLUMN spent_in_block CODEC(ZSTD(1)),
+  MODIFY COLUMN spent_input_index CODEC(ZSTD(1)),
+  MODIFY COLUMN version CODEC(ZSTD(1));
+
+ALTER TABLE dogecoin_address_movements_v1
+  MODIFY COLUMN movement_id CODEC(ZSTD(1)),
+  MODIFY COLUMN block_height CODEC(ZSTD(1)),
+  MODIFY COLUMN block_hash CODEC(ZSTD(1)),
+  MODIFY COLUMN block_time CODEC(ZSTD(1)),
+  MODIFY COLUMN txid CODEC(ZSTD(1)),
+  MODIFY COLUMN tx_index CODEC(ZSTD(1)),
+  MODIFY COLUMN entry_index CODEC(ZSTD(1)),
+  MODIFY COLUMN address CODEC(ZSTD(1)),
+  MODIFY COLUMN amount_base CODEC(ZSTD(1)),
+  MODIFY COLUMN output_key CODEC(ZSTD(1));
+
+ALTER TABLE dogecoin_address_movements_by_address_v1
+  MODIFY COLUMN movement_id CODEC(ZSTD(1)),
+  MODIFY COLUMN block_height CODEC(ZSTD(1)),
+  MODIFY COLUMN block_hash CODEC(ZSTD(1)),
+  MODIFY COLUMN block_time CODEC(ZSTD(1)),
+  MODIFY COLUMN txid CODEC(ZSTD(1)),
+  MODIFY COLUMN tx_index CODEC(ZSTD(1)),
+  MODIFY COLUMN entry_index CODEC(ZSTD(1)),
+  MODIFY COLUMN address CODEC(ZSTD(1)),
+  MODIFY COLUMN amount_base CODEC(ZSTD(1)),
+  MODIFY COLUMN amount_base_i256 CODEC(ZSTD(1)),
+  MODIFY COLUMN output_key CODEC(ZSTD(1));
+
+ALTER TABLE analytics_transactions_v1
+  MODIFY COLUMN block_height CODEC(ZSTD(1)),
+  MODIFY COLUMN block_hash CODEC(ZSTD(1)),
+  MODIFY COLUMN block_time CODEC(ZSTD(1)),
+  MODIFY COLUMN txid CODEC(ZSTD(1)),
+  MODIFY COLUMN tx_index CODEC(ZSTD(1)),
+  MODIFY COLUMN input_count CODEC(ZSTD(1)),
+  MODIFY COLUMN output_count CODEC(ZSTD(1)),
+  MODIFY COLUMN total_input_base CODEC(ZSTD(1)),
+  MODIFY COLUMN gross_output_base CODEC(ZSTD(1)),
+  MODIFY COLUMN fee_base CODEC(ZSTD(1)),
+  MODIFY COLUMN total_input_base_i256 CODEC(ZSTD(1)),
+  MODIFY COLUMN gross_output_base_i256 CODEC(ZSTD(1)),
+  MODIFY COLUMN fee_base_i256 CODEC(ZSTD(1)),
+  MODIFY COLUMN version CODEC(ZSTD(1));
+
+ALTER TABLE dogecoin_transaction_refs_v1
+  MODIFY COLUMN txid CODEC(ZSTD(1)),
+  MODIFY COLUMN block_height CODEC(ZSTD(1)),
+  MODIFY COLUMN block_hash CODEC(ZSTD(1)),
+  MODIFY COLUMN block_time CODEC(ZSTD(1)),
+  MODIFY COLUMN tx_index CODEC(ZSTD(1)),
+  MODIFY COLUMN version CODEC(ZSTD(1));
+
+ALTER TABLE dogecoin_utxo_outputs_current_v1
+  MODIFY COLUMN block_height CODEC(ZSTD(1)),
+  MODIFY COLUMN block_hash CODEC(ZSTD(1)),
+  MODIFY COLUMN block_time CODEC(ZSTD(1)),
+  MODIFY COLUMN txid CODEC(ZSTD(1)),
+  MODIFY COLUMN tx_index CODEC(ZSTD(1)),
+  MODIFY COLUMN vout CODEC(ZSTD(1)),
+  MODIFY COLUMN output_key CODEC(ZSTD(1)),
+  MODIFY COLUMN address CODEC(ZSTD(1)),
+  MODIFY COLUMN script_type CODEC(ZSTD(1)),
+  MODIFY COLUMN value_base CODEC(ZSTD(1)),
+  MODIFY COLUMN spent_by_txid CODEC(ZSTD(1)),
+  MODIFY COLUMN spent_in_block CODEC(ZSTD(1)),
+  MODIFY COLUMN spent_input_index CODEC(ZSTD(1)),
+  MODIFY COLUMN version CODEC(ZSTD(1));
+
+ALTER TABLE dogecoin_utxo_outputs_current_by_address_v1
+  MODIFY COLUMN block_height CODEC(ZSTD(1)),
+  MODIFY COLUMN block_hash CODEC(ZSTD(1)),
+  MODIFY COLUMN block_time CODEC(ZSTD(1)),
+  MODIFY COLUMN txid CODEC(ZSTD(1)),
+  MODIFY COLUMN tx_index CODEC(ZSTD(1)),
+  MODIFY COLUMN vout CODEC(ZSTD(1)),
+  MODIFY COLUMN output_key CODEC(ZSTD(1)),
+  MODIFY COLUMN address CODEC(ZSTD(1)),
+  MODIFY COLUMN script_type CODEC(ZSTD(1)),
+  MODIFY COLUMN value_base CODEC(ZSTD(1)),
+  MODIFY COLUMN spent_by_txid CODEC(ZSTD(1)),
+  MODIFY COLUMN spent_in_block CODEC(ZSTD(1)),
+  MODIFY COLUMN spent_input_index CODEC(ZSTD(1)),
+  MODIFY COLUMN version CODEC(ZSTD(1));
+
+ALTER TABLE dogecoin_balances_current_v1
+  MODIFY COLUMN address CODEC(ZSTD(1)),
+  MODIFY COLUMN balance CODEC(ZSTD(1)),
+  MODIFY COLUMN as_of_block_height CODEC(ZSTD(1)),
+  MODIFY COLUMN version CODEC(ZSTD(1));
+
+ALTER TABLE analytics_balances_current_v1
+  MODIFY COLUMN address CODEC(ZSTD(1)),
+  MODIFY COLUMN balance CODEC(ZSTD(1)),
+  MODIFY COLUMN balance_i256 CODEC(ZSTD(1)),
+  MODIFY COLUMN as_of_block_height CODEC(ZSTD(1)),
+  MODIFY COLUMN version CODEC(ZSTD(1));
+
+ALTER TABLE dogecoin_core_processed_blocks_v1
+  MODIFY COLUMN block_hash CODEC(ZSTD(1));
+
+ALTER TABLE dogecoin_applied_blocks_v1
+  MODIFY COLUMN block_hash CODEC(ZSTD(1));
+`;
+
+/** `table.column` for every column the codec migration touches, read from its SQL. */
+function zstdCodecColumns(): string[] {
+  return splitSqlStatements(zstdColumnCodecsSource).flatMap((statement) => {
+    const table = /ALTER TABLE (\w+)/u.exec(statement)?.[1] ?? '';
+    return [...statement.matchAll(/MODIFY COLUMN (\w+) CODEC\(ZSTD\(1\)\)/gu)].map(
+      (match) => `${table}.${match[1]}`,
+    );
+  });
+}
+
+async function verifyZstdColumnCodecs({ client }: ClickHouseMigrationContext): Promise<void> {
+  const result = await client.query({
+    query: `
+      SELECT concat(table, '.', name) AS column, compression_codec AS codec
+      FROM system.columns
+      WHERE database = currentDatabase()
+    `,
+    format: 'JSONEachRow',
+  });
+  const rows = (await result.json<{ codec: string; column: string }>()) as Array<{
+    codec: string;
+    column: string;
+  }>;
+  const codecs = new Map(rows.map((row) => [row.column, row.codec]));
+  const missing = zstdCodecColumns().find((column) => !codecs.get(column)?.includes('ZSTD(1)'));
+  if (missing) {
+    throw new Error(`ClickHouse schema verification failed for ${missing} codec`);
+  }
+}
+
 async function verifyTransactionRefsTable({ client }: ClickHouseMigrationContext): Promise<void> {
   const result = await client.query({
     query: `
@@ -509,6 +771,72 @@ async function verifyTransactionRefsTable({ client }: ClickHouseMigrationContext
   const [row] = rows;
   if (row?.engine !== 'ReplacingMergeTree' || normalizeExpression(row.sortingKey) !== 'txid') {
     throw new Error('ClickHouse schema verification failed for dogecoin_transaction_refs_v1');
+  }
+}
+
+/**
+ * Migrations 1 and 3 create the five current-state tables below with
+ * `old_parts_lifetime = 0`. The override dates from the first schema (commit
+ * 4dfc060) and nothing records why; it sits on the large ReplacingMergeTree
+ * tables whose rows are rewritten on every spend or balance change, so the
+ * likely motive was reclaiming the disk held by merged-away parts at once
+ * during heavy merging.
+ *
+ * ClickHouse keeps merged-away (inactive) parts for `old_parts_lifetime`
+ * seconds precisely because merged parts are not fsynced: after a hard stop
+ * of the server or host the new part can be incomplete while, with a lifetime
+ * of 0, its source parts are already deleted. With the default (480 s) the
+ * startup check restores the sources and merges them again; with 0 the broken
+ * part is detached and the table has a hole that no tail reconciliation can
+ * see. The disk this costs is the parts replaced in the last eight minutes,
+ * bounded by merge throughput, which is small next to the tables themselves.
+ *
+ * `RESET SETTING` drops the table-level override so these tables follow the
+ * server default like every other MergeTree table in the schema (480 s unless
+ * `config.d` sets `<merge_tree><old_parts_lifetime>`). It rewrites table
+ * metadata only; no part is read or written.
+ */
+const oldPartsLifetimeDefaultSource = `
+ALTER TABLE dogecoin_utxo_outputs_current_v1 RESET SETTING old_parts_lifetime;
+ALTER TABLE dogecoin_utxo_outputs_current_by_address_v1 RESET SETTING old_parts_lifetime;
+ALTER TABLE analytics_transactions_v1 RESET SETTING old_parts_lifetime;
+ALTER TABLE analytics_balances_current_v1 RESET SETTING old_parts_lifetime;
+ALTER TABLE dogecoin_transaction_refs_v1 RESET SETTING old_parts_lifetime;
+`;
+
+/** The tables the lifetime migration resets, read from its SQL. */
+function oldPartsLifetimeTables(): string[] {
+  return splitSqlStatements(oldPartsLifetimeDefaultSource).map((statement) => {
+    const table = /^ALTER TABLE (\w+) RESET SETTING old_parts_lifetime$/u.exec(statement)?.[1];
+    if (!table) {
+      throw new Error(`unexpected statement in old_parts_lifetime migration: ${statement}`);
+    }
+    return table;
+  });
+}
+
+async function verifyOldPartsLifetimeDefault({
+  client,
+}: ClickHouseMigrationContext): Promise<void> {
+  const tables = oldPartsLifetimeTables();
+  const result = await client.query({
+    query: `
+      SELECT name, engine_full AS engineFull
+      FROM system.tables
+      WHERE database = currentDatabase() AND name IN ({names:Array(String)})
+    `,
+    query_params: { names: tables },
+    format: 'JSONEachRow',
+  });
+  const rows = (await result.json<{ engineFull: string; name: string }>()) as Array<{
+    engineFull: string;
+    name: string;
+  }>;
+  for (const table of tables) {
+    const row = rows.find((candidate) => candidate.name === table);
+    if (!row || row.engineFull.includes('old_parts_lifetime')) {
+      throw new Error(`ClickHouse schema verification failed for ${table} old_parts_lifetime`);
+    }
   }
 }
 

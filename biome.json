@@ -1,7 +1,15 @@
 {
   "$schema": "./node_modules/biome/schema.json",
   "files": {
-    "includes": ["**", "!.agents", "!node_modules", "!dist", "!coverage"]
+    "includes": [
+      "**",
+      "!.agents",
+      "!!.claude",
+      "!node_modules",
+      "!dist",
+      "!coverage",
+      "!tests/fixtures"
+    ]
   },
   "formatter": {
     "enabled": true,
@@ -12,7 +20,7 @@
   "linter": {
     "enabled": true,
     "rules": {
-      "recommended": true,
+      "preset": "recommended",
       "nursery": {
         "useSortedClasses": "off"
       }

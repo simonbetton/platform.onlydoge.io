@@ -61,94 +61,106 @@ type DogecoinFixtureMempoolEntry = {
   time: number;
 };
 
+import { encodeChain, type EncodedBlock, testAddress } from './dogecoin-encoder';
+
+const sourceAddress = testAddress('miner-source');
+const intermediaryAddress = testAddress('seed-relay');
+const targetAddress = testAddress('target-sink');
+
+/**
+ * Real, decodable Dogecoin blocks. Symbolic ids (`doge-tx-2`) resolve to the
+ * actual txids via `dogecoinTxid()`; block hashes via `dogecoinBlockHash()`.
+ */
+const encodedChain = encodeChain([
+  {
+    time: 1_700_000_000,
+    tx: [
+      {
+        id: 'doge-tx-0',
+        vin: [{ coinbase: true }],
+        vout: [{ address: sourceAddress, value: '100.00000000' }],
+      },
+    ],
+  },
+  {
+    time: 1_700_000_060,
+    tx: [
+      {
+        id: 'doge-tx-1',
+        vin: [{ id: 'doge-tx-0', vout: 0 }],
+        vout: [
+          { address: intermediaryAddress, value: '40.00000000' },
+          { address: sourceAddress, value: '59.00000000' },
+        ],
+      },
+    ],
+  },
+  {
+    time: 1_700_000_120,
+    tx: [
+      {
+        id: 'doge-tx-2',
+        vin: [{ id: 'doge-tx-1', vout: 0 }],
+        vout: [
+          { address: targetAddress, value: '25.00000000' },
+          { address: intermediaryAddress, value: '14.00000000' },
+        ],
+      },
+    ],
+  },
+]);
+
+const txidsById = new Map(
+  encodedChain.flatMap((block) => block.tx.map((tx) => [tx.id, tx.txid] as const)),
+);
+
+export function dogecoinTxid(id: string): string {
+  const txid = txidsById.get(id);
+  if (!txid) {
+    throw new Error(`unknown fixture transaction id: ${id}`);
+  }
+  return txid;
+}
+
+export function dogecoinBlockHash(height: number): string {
+  return requireEncodedBlock(height).hash;
+}
+
+function requireEncodedBlock(height: number): EncodedBlock {
+  const block = encodedChain[height];
+  if (!block) {
+    throw new Error(`unknown fixture block height: ${height}`);
+  }
+  return block;
+}
+
+function toFixtureBlock(block: EncodedBlock): DogecoinFixtureBlock {
+  return {
+    hash: block.hash,
+    height: block.height,
+    previousblockhash: block.previousblockhash,
+    time: block.time,
+    tx: block.tx.map((tx) => ({
+      txid: tx.txid,
+      vin: tx.vin,
+      vout: tx.vout.map((output) => ({
+        n: output.n,
+        value: output.value,
+        scriptPubKey: { type: 'pubkeyhash', addresses: [output.address] },
+      })),
+    })),
+  };
+}
+
 export const dogecoinFixture = {
-  latestBlockHeight: 2,
-  sourceAddress: 'DMinerSource1111111111111111111111111',
-  intermediaryAddress: 'DSeedRelay1111111111111111111111111',
-  targetAddress: 'DTargetSink1111111111111111111111111',
+  latestBlockHeight: encodedChain.length - 1,
+  sourceAddress,
+  intermediaryAddress,
+  targetAddress,
   blocksByHeight: {
-    0: {
-      hash: 'doge-block-0',
-      height: 0,
-      previousblockhash: null,
-      time: 1_700_000_000,
-      tx: [
-        {
-          txid: 'doge-tx-0',
-          vin: [{ coinbase: 'coinbase' }],
-          vout: [
-            {
-              n: 0,
-              value: '100.00000000',
-              scriptPubKey: {
-                type: 'pubkeyhash',
-                addresses: ['DMinerSource1111111111111111111111111'],
-              },
-            },
-          ],
-        },
-      ],
-    },
-    1: {
-      hash: 'doge-block-1',
-      height: 1,
-      previousblockhash: 'doge-block-0',
-      time: 1_700_000_060,
-      tx: [
-        {
-          txid: 'doge-tx-1',
-          vin: [{ txid: 'doge-tx-0', vout: 0 }],
-          vout: [
-            {
-              n: 0,
-              value: '40.00000000',
-              scriptPubKey: {
-                type: 'pubkeyhash',
-                addresses: ['DSeedRelay1111111111111111111111111'],
-              },
-            },
-            {
-              n: 1,
-              value: '59.00000000',
-              scriptPubKey: {
-                type: 'pubkeyhash',
-                addresses: ['DMinerSource1111111111111111111111111'],
-              },
-            },
-          ],
-        },
-      ],
-    },
-    2: {
-      hash: 'doge-block-2',
-      height: 2,
-      previousblockhash: 'doge-block-1',
-      time: 1_700_000_120,
-      tx: [
-        {
-          txid: 'doge-tx-2',
-          vin: [{ txid: 'doge-tx-1', vout: 0 }],
-          vout: [
-            {
-              n: 0,
-              value: '25.00000000',
-              scriptPubKey: {
-                type: 'pubkeyhash',
-                addresses: ['DTargetSink1111111111111111111111111'],
-              },
-            },
-            {
-              n: 1,
-              value: '14.00000000',
-              scriptPubKey: {
-                type: 'pubkeyhash',
-                addresses: ['DSeedRelay1111111111111111111111111'],
-              },
-            },
-          ],
-        },
-      ],
-    },
+    0: toFixtureBlock(requireEncodedBlock(0)),
+    1: toFixtureBlock(requireEncodedBlock(1)),
+    2: toFixtureBlock(requireEncodedBlock(2)),
   },
   mempoolInfo: {
     size: 3,
@@ -210,4 +222,8 @@ export const dogecoinHashesByHeight = new Map(
 
 export const dogecoinBlocksByHash = new Map(
   Object.values(dogecoinFixture.blocksByHeight).map((block) => [block.hash, block]),
+);
+
+export const dogecoinRawBlocksByHash = new Map(
+  encodedChain.map((block) => [block.hash, block.hex]),
 );

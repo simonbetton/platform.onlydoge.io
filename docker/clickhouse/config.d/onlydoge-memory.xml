@@ -1,3 +1,48 @@
+<!--
+  Server-level memory profile for a warehouse node that must stay under a
+  20 GiB memory limit (docker-compose.yml caps the container at
+  CLICKHOUSE_MEMORY_LIMIT, default 20g; ClickHouse reads that cgroup limit as
+  its "total RAM").
+
+  Budget at a 20 GiB limit:
+    tracked allocations (queries, merges, caches)  <= 0.70 * 20 GiB = 14 GiB
+    untracked (allocator slack, thread stacks, page cache pressure)  ~6 GiB
+-->
 <clickhouse>
-  <max_server_memory_usage_to_ram_ratio>0.80</max_server_memory_usage_to_ram_ratio>
+  <max_server_memory_usage_to_ram_ratio>0.70</max_server_memory_usage_to_ram_ratio>
+
+  <!-- Background merges/mutations share of the tracked budget (default 0.5). -->
+  <merges_mutations_memory_usage_to_ram_ratio>0.25</merges_mutations_memory_usage_to_ram_ratio>
+
+  <!--
+    In-memory caches. Defaults are 5 GiB (mark, index mark, primary index),
+    8 GiB (uncompressed) and are sized for much larger hosts. The workload is
+    write-heavy with point lookups by ORDER BY prefix, so it barely fills them.
+  -->
+  <mark_cache_size>1073741824</mark_cache_size>
+  <index_mark_cache_size>268435456</index_mark_cache_size>
+  <primary_index_cache_size>536870912</primary_index_cache_size>
+  <uncompressed_cache_size>536870912</uncompressed_cache_size>
+  <index_uncompressed_cache_size>134217728</index_uncompressed_cache_size>
+
+  <!--
+    Fewer simultaneous merges: each one holds a block per column in memory
+    (observed peaks up to ~330 MiB on the wide movement tables). Default is 16
+    with a 2x concurrency ratio, i.e. up to 32 concurrent merges.
+  -->
+  <background_pool_size>8</background_pool_size>
+  <background_merges_mutations_concurrency_ratio>1</background_merges_mutations_concurrency_ratio>
+  <!--
+    These MergeTree thresholds default to 20 / 25 / 8 and must stay below the
+    pool size above (the server refuses to start otherwise). With half the
+    pool busy, new merges are also capped in size, which bounds their memory.
+  -->
+  <merge_tree>
+    <number_of_free_entries_in_pool_to_execute_mutation>4</number_of_free_entries_in_pool_to_execute_mutation>
+    <number_of_free_entries_in_pool_to_execute_optimize_entire_partition>4</number_of_free_entries_in_pool_to_execute_optimize_entire_partition>
+    <number_of_free_entries_in_pool_to_lower_max_size_of_merge>4</number_of_free_entries_in_pool_to_lower_max_size_of_merge>
+  </merge_tree>
+
+  <!-- Indexer runs at most 4 concurrent chunk reads; explorer/analytics are quota-bound. -->
+  <max_concurrent_queries>64</max_concurrent_queries>
 </clickhouse>

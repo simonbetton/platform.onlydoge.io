@@ -37,7 +37,6 @@ packages/
 
 tests/
   adapters/     Docker-backed production adapter integration tests
-  e2e/          opt-in production E2E checks with teardown
   integration/
   unit/
 ```
@@ -67,7 +66,7 @@ Production should run split `http` and `indexer` containers.
 
 ## Requirements
 
-- Bun 1.3.14
+- Bun 1.4.0
 - Docker and Docker Compose for the bundled local or self-hosted stacks
 - PostgreSQL, ClickHouse, and S3-compatible object storage for production-style stacks
 - Dogecoin RPC endpoint for real indexing work
@@ -105,22 +104,44 @@ resulting `package-lock.json`, and verify with `npm ci --omit=dev`,
 the production image build. Dependabot maintains this npm subtree separately
 from the Bun workspace.
 
-Run locally with Docker:
+## Quickstart (Docker)
+
+No configuration is required. This starts Dogecoin Core, PostgreSQL, ClickHouse, MinIO, and the
+OnlyDoge API + indexer, then prints indexer status once the app is up:
 
 ```bash
-cp .env.local.example .env.local
+bun install
 bun run docker:local:up
 ```
 
-Useful local commands:
+Follow progress:
 
 ```bash
+bun run docker:local:status          # one line: stage, tails, blocks/s, ETA
+bun run docker:local:status:watch    # refresh every 5s
+curl -s localhost:2277/v1/status | jq # same data as JSON, no API key needed
 bun run docker:local:logs
-bun run docker:local:down
-bun run docker:local:reset
 ```
 
-The local Docker stack includes `dogeorg/dogecoin-node` for Dogecoin Core RPC and ZMQ. First sync can take a long time and needs substantial disk space. On Apple Silicon, Docker runs the amd64 image under emulation. If you previously started a standalone `dogecoin-node` container on the same ports, stop and remove it before bringing this stack up.
+Stop or wipe:
+
+```bash
+bun run docker:local:down            # keep data
+bun run docker:local:reset           # drop app volumes (Postgres, ClickHouse, MinIO, node data)
+```
+
+To override defaults (ports, credentials, where the ~250 GB of chain data lives), copy
+`.env.example` to `.env.local`; it is picked up automatically when present. Put the
+Dogecoin data directory on an SSD: `ONLYDOGE_DATA_DOGECOIN=/path/on/ssd`. Spinning USB disks and
+macOS bind mounts make node RPC slow enough to bottleneck the indexer.
+
+The Dogecoin node is `docker/dogecoin`, a native amd64/arm64 image built from the official
+Dogecoin Core release tarballs with checksum verification, so Apple Silicon and Graviton hosts
+do not run the node under emulation. Node flags are driven by `DOGECOIN_*` env vars
+(`-txindex=1`, `-rpcthreads=8`, `-rpcworkqueue=256`, `-dbcache=2048` by default).
+
+Expect the node's own initial block download to take many hours and ~250 GB. The indexer waits
+for it and reports `sync_eta`/`process_eta` once it has throughput samples.
 
 Local service endpoints:
 
@@ -166,29 +187,34 @@ Core application settings:
 - `ONLYDOGE_IP`
 - `ONLYDOGE_PORT`
 
+Dogecoin node connection:
+
+- `ONLYDOGE_DOGECOIN_RPC_ENDPOINT`
+- `ONLYDOGE_DOGECOIN_RPC_TIMEOUT_MS` (per JSON-RPC request; default 60000)
+- `ONLYDOGE_DOGECOIN_RPC_RPS` (per HTTP request, not per block; default 64)
+- `ONLYDOGE_DOGECOIN_ZMQ_BLOCK_ENDPOINT`
+- `ONLYDOGE_DOGECOIN_ZMQ_TX_ENDPOINT`
+
 Current Dogecoin indexer tuning:
 
-- `ONLYDOGE_INDEXER_SYNC_WINDOW`
-- `ONLYDOGE_INDEXER_SYNC_CONCURRENCY`
+- `ONLYDOGE_INDEXER_SYNC_WINDOW` (blocks per sync window; progress is checkpointed every batch round, default 256)
+- `ONLYDOGE_INDEXER_SYNC_BATCH_SIZE` (blocks per JSON-RPC batch, default 16)
+- `ONLYDOGE_INDEXER_SYNC_CONCURRENCY` (max parallel batches; adapts down when the node is slow, default 8)
+- `ONLYDOGE_INDEXER_SYNC_RETRY_ATTEMPTS` / `ONLYDOGE_INDEXER_SYNC_RETRY_BASE_DELAY_MS`
 - `ONLYDOGE_CORE_BLOCK_TIMEOUT_MS`
 - `ONLYDOGE_CORE_DB_STATEMENT_TIMEOUT_MS`
 - `ONLYDOGE_CORE_SYNC_COMPLETE_DISTANCE`
 - `ONLYDOGE_CORE_PROCESS_LOAD_CONCURRENCY`
-- `ONLYDOGE_CORE_PROCESS_WINDOW`
+- `ONLYDOGE_CORE_PROCESS_WINDOW` (blocks per window once online)
+- `ONLYDOGE_CORE_BACKFILL_BLOCK_SOURCE` (`auto` | `node` | `storage`; where backfill windows read blocks from, default `auto`)
+- `ONLYDOGE_CORE_BACKFILL_WINDOW_BLOCKS` (max blocks per backfill window, default 2000)
+- `ONLYDOGE_CORE_BACKFILL_WINDOW_ROWS` (target inputs + outputs per backfill window, default 200000)
 - `ONLYDOGE_CORE_PROGRESS_WATCHDOG_MS`
 - `ONLYDOGE_CORE_RAW_STORAGE_TIMEOUT_MS`
 - `ONLYDOGE_CORE_REPROCESS_DEPTH`
 - `ONLYDOGE_CORE_ONLINE_TIP_DISTANCE`
 
-Managed deployment settings:
-
-- `ONLYDOGE_IMAGE`
-- `ONLYDOGE_PUBLIC_HOST`
-- `ONLYDOGE_REMOTE_DIR`
-- `ONLYDOGE_SSH_TARGET`
-- `ONLYDOGE_SSH_JUMP`
-
-Managed production uses env-based database CA material. Do not put `sslrootcert=/storage/do-ca.pem` in `ONLYDOGE_DATABASE`; use `ONLYDOGE_DATABASE_SSLROOTCERT_PEM` or `ONLYDOGE_DATABASE_SSLROOTCERT_BASE64`.
+External managed databases can pass CA material through env: use `ONLYDOGE_DATABASE_SSLROOTCERT_PEM` or `ONLYDOGE_DATABASE_SSLROOTCERT_BASE64` rather than a file path inside the container.
 
 In production, startup fails fast if database config, `ONLYDOGE_STORAGE`, or `ONLYDOGE_WAREHOUSE` are missing. Production will not silently fall back to local SQLite, file storage, or DuckDB.
 
@@ -196,18 +222,24 @@ The default ClickHouse profile is tuned for stability over peak throughput.
 
 - Address-heavy explorer reads use address-oriented read tables instead of scanning write-optimized facts directly.
 - Current-state UTXO lookups avoid `FINAL` and use bounded `LIMIT 1 BY output_key` reads.
-- The ClickHouse server memory ratio is capped below total RAM to leave headroom for merges, the page cache, and the OS.
+- Address transaction history paginates the address's movements first and only joins transaction facts for that page.
+- The ClickHouse container is capped at `CLICKHOUSE_MEMORY_LIMIT` (default `20g`); the server budgets 70% of that for tracked allocations, leaving headroom for allocator slack, the page cache, and the OS.
+- Per-query memory is capped at 4 GiB and per-user at 10 GiB; caches, background merge concurrency, and concurrent queries are bounded to match.
 - Default query and insert thread counts are capped to reduce memory spikes.
-- External sort and group-by thresholds spill earlier instead of holding large intermediates in RAM.
+- External sort and group-by thresholds spill at 512 MiB, and joins default to `grace_hash` with a 1 GiB in-memory limit, instead of holding large intermediates in RAM.
 
-The app boots ClickHouse with runtime-safe warehouse migrations. Existing deployments automatically create and backfill the address-oriented read tables on startup before serving explorer traffic. The checked-in `docker/clickhouse/init/001_schema.sql` file is retained for reference and local volume bootstrap, but production schema authority lives in the versioned ClickHouse migration ledger.
+The app boots ClickHouse with runtime-safe warehouse migrations. Existing deployments automatically create and backfill the address-oriented read tables on startup before serving explorer traffic. Once a migration is ledgered as completed, later boots only run its cheap metadata check; full data verification runs once, right after the migration applies. Production schema authority lives in the versioned ClickHouse migration ledger (`packages/platform/src/clickhouse-migrations.ts`).
 
 ## Local Docker Workflow
 
-The local setup intentionally favors developer feedback over immutability.
+Compose files: `docker-compose.yml` is the complete default stack; `docker-compose.local.yml`
+is an override layered on top by the `docker:local:*` scripts.
 
-- The source tree is bind-mounted into the app container.
-- The app runs `bun run apps/onlydoge/src/index.ts` without `bun --watch`; Docker restart policy recovers process exits.
+The local override intentionally favors developer feedback over immutability.
+
+- The source tree is bind-mounted into the API and indexer containers (development image target).
+- Both run `bun run apps/onlydoge/src/index.ts` without `bun --watch`; Docker restart policy recovers process exits.
+- Infrastructure ports (Postgres, ClickHouse, MinIO, Dogecoin RPC/ZMQ) are published on localhost.
 - Infrastructure is persisted in Docker volumes.
 - A MinIO bootstrap job creates the S3 bucket automatically.
 - ClickHouse is initialized with the Dogecoin warehouse schema, including the address-oriented explorer read models.
@@ -216,23 +248,68 @@ The local setup intentionally favors developer feedback over immutability.
 - Every other `/v1` route requires `x-api-token`.
 - Each authenticated API key has an in-process budget of 300 protected requests per minute.
 
-If you change dependency manifests, restart the local app container or rerun `bun run docker:local:up`.
+If you change dependency manifests, rerun `bun run docker:local:up`.
+Any other Compose invocation can be run through the same file set with `bun run docker:local -- <compose args>`.
 If you change ClickHouse credentials, run `bun run docker:local:reset` before bringing the stack up again so the ClickHouse volume is recreated with the new user setup.
 
-The local and bundled production Compose stacks mount the checked-in ClickHouse schema and memory tuning files:
+The default Compose stack mounts the checked-in ClickHouse memory and system-log tuning files:
 
-- `docker/clickhouse/init/001_schema.sql`
 - `docker/clickhouse/config.d/onlydoge-memory.xml`
-- `docker/clickhouse/users.d/onlydoge-memory.xml`
-
-The repository also includes ClickHouse host log-retention files for self-hosted ClickHouse operations:
-
 - `docker/clickhouse/config.d/onlydoge-log-retention.xml`
+- `docker/clickhouse/users.d/onlydoge-memory.xml`
+- `docker/clickhouse/users.d/onlydoge-analytics.xml`
+
+The repository also includes host-level retention files for self-hosted ClickHouse operations:
+
 - `docker/clickhouse/logrotate.d/clickhouse-server`
 - `docker/clickhouse/logrotate.d/rsyslog`
 - `docker/clickhouse/journald.conf.d/onlydoge-retention.conf`
 
-Those files codify the current memory and 3-day log-retention profile used for heavy Dogecoin backfills. The retention files are installed on the ClickHouse host with the commands in the production runbook; they are not mounted by `docker-compose.local.yml` or `docker-compose.prod.yml`.
+Those files codify the current memory and 3-day log-retention profile used for heavy Dogecoin backfills. The host-level files are installed on the ClickHouse host with the commands in the production runbook; they are not mounted by `docker-compose.yml`.
+
+## How Sync Works
+
+The indexer (`packages/modules/indexing-pipeline`) runs one leader (Postgres lease) through three
+stages, all resumable:
+
+1. `sync_backfill`: fetch raw blocks from Dogecoin Core and store them. Each JSON-RPC batch asks
+   for `getblockhash` × N then `getblock(hash, false)` × N and decodes the raw hex locally
+   (`packages/platform/src/dogecoin-raw-block.ts`: AuxPoW header, txids, P2PKH/P2SH/P2PK/multisig
+   addresses). One block costs the node one sequential block-file read; `-txindex` is never hit
+   during sync. Snapshots go to raw block storage (MinIO/S3), a row per block to Postgres
+   `core_blocks`, and txid→block refs to ClickHouse. `sync_tail` is the highest contiguous stored
+   height and is checkpointed after every round of batches, so a crash or a slow node never loses
+   completed work. Parallel batches adapt (AIMD): a failed batch halves concurrency, sustained
+   success ramps it back.
+2. `process_backfill`: derive UTXO creates/spends window by window and append them to ClickHouse
+   behind a write-ahead marker that is rewound on crash. Windows are sized by work, not block
+   count: one closes at `ONLYDOGE_CORE_BACKFILL_WINDOW_ROWS` inputs + outputs or
+   `ONLYDOGE_CORE_BACKFILL_WINDOW_BLOCKS` blocks, and the row target halves itself whenever a
+   window's warehouse apply uses more than half of `ONLYDOGE_CORE_DB_STATEMENT_TIMEOUT_MS`. Blocks
+   are read ahead while the previous window is applied. With
+   `ONLYDOGE_CORE_BACKFILL_BLOCK_SOURCE=auto` (the default) finalized heights are re-read from
+   Dogecoin Core, which serves consecutive blocks from its block files far faster than an object
+   store serves one object per block; heights inside the reorg window, and everything while the node
+   is failing, come from the stored snapshots. A window's four fact tables are inserted
+   concurrently. When processing catches the tip, current UTXO/balance state is materialized once
+   and the stage becomes `online`.
+3. `online`: incremental sync + process per new block, re-applying the last
+   `ONLYDOGE_CORE_REPROCESS_DEPTH` blocks to absorb reorgs.
+
+Indexer progress is a dozen metadata keys rewritten every window. They are written in one
+statement, and on PostgreSQL that statement (like the indexer state row and raw-sync block rows)
+commits without waiting for a WAL flush: losing the newest of those writes in a database crash only
+replays idempotent work. The write-ahead recovery marker and the leader lease still commit
+synchronously.
+
+Failure model: RPC timeouts and node overload are retried with backoff and reduced concurrency;
+they surface in `/v1/status` as `lastError` and in `scripts/indexer-health.ts` rather than by
+restarting the process. The progress watchdog only exits the process when a step shows no
+activity at all for `ONLYDOGE_CORE_PROGRESS_WATCHDOG_MS`, which indicates a genuine hang.
+
+Status is available from three places with identical data: `GET /v1/status/` (public JSON),
+`bun run status` / `bun run docker:local:status` (one line, `--watch` to poll, `--json`), and
+the indexer container health check.
 
 ## Dogecoin Bootstrap
 
@@ -240,7 +317,7 @@ Configure Dogecoin through environment variables, start the API/indexer, then cr
 
 ```bash
 ONLYDOGE_DOGECOIN_RPC_ENDPOINT='http://rpc-user:rpc-password@dogecoin-rpc.example.com:22555/' \
-ONLYDOGE_DOGECOIN_RPC_RPS=25 \
+ONLYDOGE_DOGECOIN_RPC_RPS=64 \
 bun run dev:both
 ```
 
@@ -248,83 +325,31 @@ OnlyDoge starts indexing Dogecoin immediately when the runtime is in `both` or `
 
 ## Production
 
-The preferred production shape is Docker Compose with separate API and indexer containers:
+There is one deployment shape: `docker-compose.yml` on a Docker host, with a reverse proxy
+(Caddy, Nginx, Traefik, or a cloud load balancer) in front of port `2277` for TLS. Operational
+detail lives in the [production runbook](docs/production-runbook.md).
 
-- `onlydoge-api`
-- `onlydoge-indexer`
-- PostgreSQL
-- S3-compatible raw block storage
-- ClickHouse
-- Reverse proxy such as Caddy, Nginx, Traefik, or a cloud load balancer
-
-Self-hosted production-style stack:
+Self-hosted stack (`docker-compose.yml` alone, production image target, bundled node):
 
 ```bash
-cp .env.production.example .env.production
-bun run docker:prod:up
+cp .env.example .env      # set real passwords; every key is optional
+bun run docker:up         # docker compose up -d --build
+bun run docker:status
 ```
 
-Set `ONLYDOGE_DOGECOIN_RPC_ENDPOINT` in `.env.production` to an external Dogecoin
-Core RPC endpoint that is reachable from both application containers; a host
-`127.0.0.1` address points back into each container and will not work.
-`ONLYDOGE_DOGECOIN_ZMQ_BLOCK_ENDPOINT` and `ONLYDOGE_DOGECOIN_ZMQ_TX_ENDPOINT`
-are optional for the indexer, but are recommended for low-latency mempool watch
-notifications. RPC polling remains the fallback when ZMQ is unavailable.
+To use an external Dogecoin Core instead of the bundled one, set
+`ONLYDOGE_DOGECOIN_RPC_ENDPOINT` (and optionally the two `ONLYDOGE_DOGECOIN_ZMQ_*`
+endpoints) in `.env` to an address reachable from the containers — a host
+`127.0.0.1` points back into each container and will not work — and start with
+`docker compose up -d --scale dogecoin=0`. ZMQ is optional but recommended for
+low-latency mempool watch notifications; RPC polling is the fallback.
 
 Stop or inspect it:
 
 ```bash
-bun run docker:prod:down
-bun run docker:prod:logs
+bun run docker:down
+bun run docker:logs
 ```
-
-Managed Docker deployment:
-
-```bash
-cp .env.managed.example .env.managed
-bun run deploy:production
-```
-
-Managed production requires
-`ONLYDOGE_ANALYTICS_WAREHOUSE_USER` and
-`ONLYDOGE_ANALYTICS_WAREHOUSE_PASSWORD` for a dedicated ClickHouse identity.
-Grant that identity read-only query access with safe resource settings; the
-primary read/write warehouse credentials are never used as an analytics
-fallback.
-
-The production deploy command:
-
-- validates canonical `.env.managed` settings,
-- requires `PROD_ADMIN_API_TOKEN` unless `--skipE2e` is passed,
-- runs lint, typecheck, and tests,
-- builds and pushes the configured image tag,
-- resolves the pushed image to an immutable digest,
-- deploys that digest,
-- fails fast if old `once-*` containers are still running on the target host,
-- verifies `/up`, `/v1/heartbeat`, `/openapi/json`, and indexer health,
-- prints production indexer stats freshness and `lastError`,
-- runs production E2E by default.
-
-The low-level deploy script remains available for rollback or automation:
-
-```bash
-bun run deploy:docker -- --envFile .env.managed --image ghcr.io/simonbetton/onlydoge-indexer@sha256:<digest>
-```
-
-The low-level deploy script:
-
-- deploys the supplied image digest,
-- uploads `docker-compose.managed.yml`,
-- uploads `docker/caddy/Caddyfile`,
-- writes the resolved env file to the target host,
-- starts Caddy, API, and indexer with Docker Compose,
-- verifies `/up`,
-- verifies `/v1/heartbeat`,
-- verifies `/openapi/json`,
-- verifies indexer health,
-- prints production indexer stats freshness and `lastError`.
-
-`--skipE2e` is a health-check-only deploy. It skips API-key creation/teardown, disposable metadata checks, and the full production data-freshness assertions in the E2E suite.
 
 ## Images
 
@@ -333,7 +358,7 @@ Production images are published to GitHub Container Registry:
 - `ghcr.io/simonbetton/onlydoge-indexer:latest`
 - `ghcr.io/simonbetton/onlydoge-indexer:vX.Y.Z`
 
-Push a fresh multi-arch image without deploying it:
+Push a fresh multi-arch image:
 
 ```bash
 bun run image:push
@@ -347,7 +372,7 @@ bun run image:builder:init
 
 The image push script uses a `docker-container` Buildx builder named `onlydoge-multiarch`, which avoids the multi-platform limitation of the default Docker driver on tools like OrbStack. You still need to be authenticated to `ghcr.io` before pushing.
 
-The production image defaults to `--mode=both` for compatibility, but production should run split API and indexer containers. The API container owns public HTTP health; the indexer container owns indexing progress and can restart independently.
+The production image defaults to `--mode=both` for compatibility; `docker-compose.yml` runs split API and indexer containers. The API container owns public HTTP health; the indexer container owns indexing progress and can restart independently. To run a published image instead of building locally, override `image:` for both app services with an immutable `@sha256:` reference.
 
 ## Rebuild
 
@@ -390,31 +415,6 @@ Explorer routes require `x-api-token`. Public unauthenticated routes are `/up`, 
 
 History-dependent routes return `425` until Dogecoin history readiness is marked true. In online mode, raw sync and processing follow the Dogecoin node's confirmed chain tip, while the last `ONLYDOGE_CORE_REPROCESS_DEPTH` processed blocks remain reorg-active and are refreshed/replayed on tip updates. That reorg window is separate from the mempool.
 
-## Production E2E
-
-The production E2E suite is opt-in and tears down the disposable metadata it creates:
-
-```bash
-bun run e2e:production
-```
-
-Required environment:
-
-- `PROD_BASE_URL`
-- `PROD_ADMIN_API_TOKEN`
-- `EXPECTED_IMAGE_DIGEST`
-
-Optional SSH checks:
-
-- `PROD_SSH_TARGET`
-- `PROD_SSH_JUMP`
-
-Deploy plus E2E:
-
-```bash
-bun run deploy:production
-```
-
 ## Quality Gates
 
 ```bash
@@ -429,14 +429,14 @@ GitHub Actions mirrors these gates:
 - `CI`: lint, typecheck, Vitest, and production Docker build.
 - `Security`: CodeQL, dependency review, secret scanning, and image vulnerability scanning.
 - `Publish Image`: multi-arch GHCR publish with SBOM and provenance.
-- `Deploy Production`: manual environment-protected deploy that runs quality checks, publishes the selected commit image, deploys that exact digest, and runs production E2E unless skipped.
 
 ## Notes For Operators
 
 - Keep passwords URL-safe if you inject them directly into `ONLYDOGE_DATABASE`. If you need special characters, URL-encode them.
 - The current ClickHouse schema supports Dogecoin current-state reads and core-backed history without a separate full transfer graph.
-- The local and production Compose stacks assume the warehouse database name is `onlydoge`.
+- The Compose stack assumes the warehouse database name is `onlydoge`.
 - Raw block storage is written to S3-compatible object storage in Dockerized environments.
-- The checked-in ClickHouse memory profile assumes a warehouse node in roughly the `16 GB RAM` class. If you run a materially smaller box, lower the profile values before deployment.
+- The checked-in ClickHouse memory profile targets a 20 GiB container limit (`CLICKHOUSE_MEMORY_LIMIT`). The server ratio adapts to whatever limit you set, but the per-query (4 GiB) and per-user (10 GiB) caps in `docker/clickhouse/users.d/onlydoge-memory.xml` are absolute; lower them if you run a materially smaller box.
 - ClickHouse log-retention files cap system logs, host syslog, ClickHouse file logs, and journald at 3 days.
-- The current checked-in indexer defaults are intentionally conservative for production backfill: `ONLYDOGE_CORE_BLOCK_TIMEOUT_MS=120000`, `ONLYDOGE_CORE_DB_STATEMENT_TIMEOUT_MS=30000`, `ONLYDOGE_CORE_SYNC_COMPLETE_DISTANCE=6`, `ONLYDOGE_CORE_PROCESS_LOAD_CONCURRENCY=8`, `ONLYDOGE_CORE_PROCESS_WINDOW=100`, `ONLYDOGE_CORE_PROGRESS_WATCHDOG_MS=180000`, `ONLYDOGE_CORE_RAW_STORAGE_TIMEOUT_MS=30000`, `ONLYDOGE_CORE_REPROCESS_DEPTH=10`, `ONLYDOGE_CORE_ONLINE_TIP_DISTANCE=6`, `ONLYDOGE_INDEXER_SYNC_WINDOW=32`, `ONLYDOGE_INDEXER_SYNC_CONCURRENCY=4`, and `ONLYDOGE_WAREHOUSE_REQUEST_TIMEOUT_MS=30000`.
+- The current checked-in indexer defaults are intentionally conservative for production backfill: `ONLYDOGE_CORE_BLOCK_TIMEOUT_MS=120000`, `ONLYDOGE_CORE_DB_STATEMENT_TIMEOUT_MS=30000`, `ONLYDOGE_CORE_SYNC_COMPLETE_DISTANCE=6`, `ONLYDOGE_CORE_PROCESS_LOAD_CONCURRENCY=8`, `ONLYDOGE_CORE_PROCESS_WINDOW=100`, `ONLYDOGE_CORE_BACKFILL_BLOCK_SOURCE=auto`, `ONLYDOGE_CORE_BACKFILL_WINDOW_BLOCKS=2000`, `ONLYDOGE_CORE_BACKFILL_WINDOW_ROWS=200000`, `ONLYDOGE_CORE_PROGRESS_WATCHDOG_MS=180000`, `ONLYDOGE_CORE_RAW_STORAGE_TIMEOUT_MS=30000`, `ONLYDOGE_CORE_REPROCESS_DEPTH=10`, `ONLYDOGE_CORE_ONLINE_TIP_DISTANCE=6`, `ONLYDOGE_INDEXER_SYNC_WINDOW=256`, `ONLYDOGE_INDEXER_SYNC_BATCH_SIZE=16`, `ONLYDOGE_INDEXER_SYNC_CONCURRENCY=8`, and `ONLYDOGE_WAREHOUSE_REQUEST_TIMEOUT_MS=30000`.
+- Backfill speed is bound by the disk under ClickHouse, then by how fast the node serves blocks. Core tables store hash-like text with ZSTD (about half the bytes of the ClickHouse default), MinIO's background scanner is slowed to `slowest`, and ClickHouse's sampled metric/trace logs are off, because on a slow or shared disk each of those was competing with the indexer for the same I/O. If Postgres, ClickHouse, and MinIO share a spinning disk, also raise the timeouts listed under "Slow or shared disks" in `.env.example`: a single warehouse write can stall for tens of seconds behind a merge there.

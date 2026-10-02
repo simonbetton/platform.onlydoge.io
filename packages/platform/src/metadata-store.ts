@@ -17,6 +17,7 @@ import type {
 } from '@onlydoge/access-control';
 import {
   type BlockProjectionBatch,
+  type CoordinatorConfigEntry,
   type CoordinatorConfigPort,
   type CoreBlockRecord,
   type CoreIndexerStage,
@@ -29,15 +30,23 @@ import {
 } from '@onlydoge/indexing-pipeline';
 import {
   ConflictError,
+  InfrastructureError,
   nowIsoString,
+  OnlyDogeError,
   type PrimaryId,
   safeJsonParse,
 } from '@onlydoge/shared-kernel';
 import mysql from 'mysql2/promise';
 import { Pool, type PoolClient } from 'pg';
+import { createLogger } from './logger';
 import type { ActiveMempoolWatch } from './mempool-watch-types';
 import { MEMPOOL_WATCH_MAX_CONCURRENT } from './mempool-watch-types';
-import { compileQuery, type SqlValue, toBoolean } from './metadata-query';
+import {
+  compileQuery,
+  metadataInfrastructureMessage,
+  type SqlValue,
+  toBoolean,
+} from './metadata-query';
 import type { SchemaLockPort } from './schema-lock';
 import type { DatabaseSettings } from './settings';
 
@@ -107,13 +116,23 @@ export class RelationalMetadataStore
     SchemaLockPort
 {
   private auditEventsHasLegacyResourceIds = false;
+  private automaticMigrations = true;
+  private migratePromise: Promise<void> | null = null;
+  private migrating = false;
+  private schemaReady = false;
   private sqliteBootstrapQueue: Promise<void> = Promise.resolve();
   private sqliteSchemaLockQueue: Promise<void> = Promise.resolve();
 
   private constructor(private readonly client: SupportedClient) {}
 
-  public static async connect(settings: DatabaseSettings): Promise<RelationalMetadataStore> {
+  public static async connect(
+    settings: DatabaseSettings,
+    options?: { migrate?: boolean },
+  ): Promise<RelationalMetadataStore> {
     const store = await RelationalMetadataStore.open(settings);
+    if (options?.migrate === false) {
+      return store;
+    }
     try {
       await store.migrate();
       return store;
@@ -127,6 +146,8 @@ export class RelationalMetadataStore
     settings: DatabaseSettings,
   ): Promise<MetadataMigrationStatus> {
     const store = await RelationalMetadataStore.open(settings);
+    // Status inspection must report pending migrations and drift without writing.
+    store.automaticMigrations = false;
     try {
       return await store.readMigrationStatus();
     } finally {
@@ -146,11 +167,14 @@ export class RelationalMetadataStore
     if (settings.driver === 'postgres') {
       return new RelationalMetadataStore({
         kind: 'postgres',
-        raw: new Pool(postgresPoolOptions(settings)),
+        raw: createPostgresPool(settings),
       });
     }
 
-    return new RelationalMetadataStore({ kind: 'mysql', raw: mysql.createPool(settings.location) });
+    return new RelationalMetadataStore({
+      kind: 'mysql',
+      raw: createMysqlPool(settings.location),
+    });
   }
 
   public async close(): Promise<void> {
@@ -223,7 +247,7 @@ export class RelationalMetadataStore
     if (this.client.kind !== 'postgres') {
       throw new TypeError('expected postgres metadata client');
     }
-    const connection = await this.client.raw.connect();
+    const connection = await this.postgresConnect();
     const key = advisoryLockKey(name);
     try {
       await connection.query('SELECT pg_advisory_lock($1)', [key]);
@@ -348,7 +372,7 @@ export class RelationalMetadataStore
       throw new TypeError('expected postgres metadata client');
     }
 
-    const connection = await this.client.raw.connect();
+    const connection = await this.postgresConnect();
     const executor = { kind: 'postgres' as const, raw: connection };
     try {
       await connection.query('BEGIN');
@@ -674,7 +698,7 @@ export class RelationalMetadataStore
       return work();
     }
 
-    const client = await this.client.raw.connect();
+    const client = await this.postgresConnect();
     try {
       await client.query('BEGIN');
       await client.query('SELECT pg_advisory_xact_lock($1)', [advisoryLockKey(apiKeyId)]);
@@ -697,10 +721,17 @@ export class RelationalMetadataStore
     return rows.map((row) => this.mapAuditEvent(row));
   }
 
+  /**
+   * Deletes a key only if it still holds `expectedValue`. The delete skips the
+   * synchronous WAL flush where the database supports it: the one caller is
+   * the indexer clearing its write-ahead recovery marker after a window is
+   * fully applied, and a marker that reappears after a database crash only
+   * makes the next start rewind and replay that window.
+   */
   public async compareAndDeleteJsonValue<T>(key: string, expectedValue: T): Promise<boolean> {
     const expectedJson = JSON.stringify(expectedValue);
     return (
-      (await this.mutate('DELETE FROM app_config WHERE key = ? AND value_json = ?', [
+      (await this.executeRelaxed('DELETE FROM app_config WHERE key = ? AND value_json = ?', [
         key,
         expectedJson,
       ])) === 1
@@ -783,6 +814,29 @@ export class RelationalMetadataStore
     );
   }
 
+  /**
+   * Writes several config keys in one statement. Used for indexer progress,
+   * which is republished every window, so the write skips the synchronous WAL
+   * flush where the database supports it (see `executeRelaxed`).
+   */
+  public async setJsonValues(entries: readonly CoordinatorConfigEntry[]): Promise<void> {
+    const values = new Map(entries.map(([key, value]) => [key, JSON.stringify(value)]));
+    if (values.size === 0) {
+      return;
+    }
+
+    const now = nowIsoString();
+    const args = [...values].flatMap(([key, json]): SqlValue[] => [key, json, now]);
+    await this.executeRelaxed(
+      `
+        INSERT INTO app_config (key, value_json, updated_at)
+        VALUES ${valueTuples(values.size, 3)}
+        ${this.upsertClause('key', ['value_json', 'updated_at'])}
+      `,
+      args,
+    );
+  }
+
   public async canReadDogecoinHistory(): Promise<boolean> {
     return (await this.getJsonValue<boolean>(configKeyDogecoinHistoryReady())) === true;
   }
@@ -806,39 +860,22 @@ export class RelationalMetadataStore
       updatedAt: now,
     };
 
-    if (this.client.kind === 'mysql') {
-      await this.execute(
-        `
-          INSERT INTO core_indexer_state (
-            id, stage, sync_tail, process_tail, online_tip, last_error, updated_at
-          )
-          VALUES (1, ?, ?, ?, ?, ?, ?)
-          ON DUPLICATE KEY UPDATE
-            stage = VALUES(stage),
-            sync_tail = VALUES(sync_tail),
-            process_tail = VALUES(process_tail),
-            online_tip = VALUES(online_tip),
-            last_error = VALUES(last_error),
-            updated_at = VALUES(updated_at)
-        `,
-        [next.stage, next.syncTail, next.processTail, next.onlineTip, next.lastError, now],
-      );
-      return next;
-    }
-
-    await this.execute(
+    // The singleton state row is a checkpoint: losing the latest write only
+    // replays idempotent work, so it does not wait for a WAL flush.
+    await this.executeRelaxed(
       `
         INSERT INTO core_indexer_state (
           id, stage, sync_tail, process_tail, online_tip, last_error, updated_at
         )
         VALUES (1, ?, ?, ?, ?, ?, ?)
-        ON CONFLICT(id) DO UPDATE SET
-          stage = excluded.stage,
-          sync_tail = excluded.sync_tail,
-          process_tail = excluded.process_tail,
-          online_tip = excluded.online_tip,
-          last_error = excluded.last_error,
-          updated_at = excluded.updated_at
+        ${this.upsertClause('id', [
+          'stage',
+          'sync_tail',
+          'process_tail',
+          'online_tip',
+          'last_error',
+          'updated_at',
+        ])}
       `,
       [next.stage, next.syncTail, next.processTail, next.onlineTip, next.lastError, now],
     );
@@ -854,45 +891,38 @@ export class RelationalMetadataStore
   }
 
   public async upsertCoreBlock(record: CoreBlockRecord): Promise<void> {
-    if (this.client.kind === 'mysql') {
-      await this.execute(
-        `
-          INSERT INTO core_blocks (
-            block_height, block_hash, previous_block_hash, block_time, tx_count,
-            raw_storage_key, fetched_at, processed_at
-          )
-          VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-          ON DUPLICATE KEY UPDATE
-            block_hash = VALUES(block_hash),
-            previous_block_hash = VALUES(previous_block_hash),
-            block_time = VALUES(block_time),
-            tx_count = VALUES(tx_count),
-            raw_storage_key = VALUES(raw_storage_key),
-            fetched_at = VALUES(fetched_at),
-            processed_at = VALUES(processed_at)
-        `,
-        coreBlockParams(record),
-      );
+    await this.upsertCoreBlocks([record]);
+  }
+
+  /**
+   * One statement per raw sync batch. Rows behind the sync tail are rewritten
+   * by the next sync attempt if they are lost, so this also skips the
+   * synchronous WAL flush where the database supports it.
+   */
+  public async upsertCoreBlocks(records: CoreBlockRecord[]): Promise<void> {
+    const byHeight = new Map(records.map((record) => [record.blockHeight, record]));
+    if (byHeight.size === 0) {
       return;
     }
 
-    await this.execute(
+    await this.executeRelaxed(
       `
         INSERT INTO core_blocks (
           block_height, block_hash, previous_block_hash, block_time, tx_count,
           raw_storage_key, fetched_at, processed_at
         )
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-        ON CONFLICT(block_height) DO UPDATE SET
-          block_hash = excluded.block_hash,
-          previous_block_hash = excluded.previous_block_hash,
-          block_time = excluded.block_time,
-          tx_count = excluded.tx_count,
-          raw_storage_key = excluded.raw_storage_key,
-          fetched_at = excluded.fetched_at,
-          processed_at = excluded.processed_at
+        VALUES ${valueTuples(byHeight.size, 8)}
+        ${this.upsertClause('block_height', [
+          'block_hash',
+          'previous_block_hash',
+          'block_time',
+          'tx_count',
+          'raw_storage_key',
+          'fetched_at',
+          'processed_at',
+        ])}
       `,
-      coreBlockParams(record),
+      [...byHeight.values()].flatMap(coreBlockParams),
     );
   }
 
@@ -963,7 +993,17 @@ export class RelationalMetadataStore
     await this.run(sql, args);
   }
 
-  private async migrate(): Promise<void> {
+  public async migrate(): Promise<void> {
+    this.migrating = true;
+    try {
+      await this.runMetadataMigrations();
+      this.schemaReady = true;
+    } finally {
+      this.migrating = false;
+    }
+  }
+
+  private async runMetadataMigrations(): Promise<void> {
     validateMigrationDefinitions(metadataMigrations);
     await this.withMigrationLock(async (executor) => {
       await this.bootstrapMigrationLedger(executor);
@@ -1029,9 +1069,7 @@ export class RelationalMetadataStore
     }
 
     const connection =
-      this.client.kind === 'postgres'
-        ? await this.client.raw.connect()
-        : await this.client.raw.getConnection();
+      this.client.kind === 'postgres' ? await this.postgresConnect() : await this.mysqlConnect();
     const executor =
       this.client.kind === 'postgres'
         ? ({ kind: 'postgres', raw: connection as PoolClient } as const)
@@ -1879,20 +1917,23 @@ export class RelationalMetadataStore
     args: SqlValue[] = [],
     executor: SupportedExecutor = this.client,
   ): Promise<T[]> {
-    if (executor.kind === 'sqlite') {
-      const result = await executor.raw.execute({ sql, args });
-      return result.rows.map((row) => Object.fromEntries(Object.entries(row)) as T);
-    }
-    if (executor.kind === 'postgres') {
-      const result = await executor.raw.query(compileQuery('postgres', sql), args);
-      return result.rows as T[];
-    }
+    await this.ensureSchema(executor);
+    return this.metadataQuery(async () => {
+      if (executor.kind === 'sqlite') {
+        const result = await executor.raw.execute({ sql, args });
+        return result.rows.map((row) => Object.fromEntries(Object.entries(row)) as T);
+      }
+      if (executor.kind === 'postgres') {
+        const result = await executor.raw.query(compileQuery('postgres', sql), args);
+        return result.rows as T[];
+      }
 
-    const [rows] = await executor.raw.query(
-      compileQuery('mysql', compileMysqlStatement(sql)),
-      args,
-    );
-    return rows as T[];
+      const [rows] = await executor.raw.query(
+        compileQuery('mysql', compileMysqlStatement(sql)),
+        args,
+      );
+      return rows as T[];
+    });
   }
 
   private async run(
@@ -1900,24 +1941,27 @@ export class RelationalMetadataStore
     args: SqlValue[] = [],
     executor: SupportedExecutor = this.client,
   ): Promise<void> {
-    if (executor.kind === 'sqlite') {
-      await executor.raw.execute({ sql, args });
-      return;
-    }
-    if (executor.kind === 'postgres') {
-      await executor.raw.query(compileQuery('postgres', sql), args);
-      return;
-    }
-
-    const mysqlSql = compileMysqlStatement(sql);
-    try {
-      await executor.raw.query(compileQuery('mysql', mysqlSql), args);
-    } catch (error) {
-      if (isDuplicateMysqlIndexError(error) && mysqlSql !== sql) {
+    await this.ensureSchema(executor);
+    await this.metadataQuery(async () => {
+      if (executor.kind === 'sqlite') {
+        await executor.raw.execute({ sql, args });
         return;
       }
-      throw error;
-    }
+      if (executor.kind === 'postgres') {
+        await executor.raw.query(compileQuery('postgres', sql), args);
+        return;
+      }
+
+      const mysqlSql = compileMysqlStatement(sql);
+      try {
+        await executor.raw.query(compileQuery('mysql', mysqlSql), args);
+      } catch (error) {
+        if (isDuplicateMysqlIndexError(error) && mysqlSql !== sql) {
+          return;
+        }
+        throw error;
+      }
+    });
   }
 
   private async mutate(
@@ -1925,17 +1969,109 @@ export class RelationalMetadataStore
     args: SqlValue[] = [],
     executor: SupportedExecutor = this.client,
   ): Promise<number> {
-    if (executor.kind === 'sqlite') {
-      const result = await executor.raw.execute({ sql, args });
-      return result.rowsAffected;
-    }
-    if (executor.kind === 'postgres') {
-      const result = await executor.raw.query(compileQuery('postgres', sql), args);
-      return result.rowCount ?? 0;
+    await this.ensureSchema(executor);
+    return this.metadataQuery(async () => {
+      if (executor.kind === 'sqlite') {
+        const result = await executor.raw.execute({ sql, args });
+        return result.rowsAffected;
+      }
+      if (executor.kind === 'postgres') {
+        const result = await executor.raw.query(compileQuery('postgres', sql), args);
+        return result.rowCount ?? 0;
+      }
+
+      const [result] = await executor.raw.query(
+        compileQuery('mysql', compileMysqlStatement(sql)),
+        args,
+      );
+      return 'affectedRows' in result ? result.affectedRows : 0;
+    });
+  }
+
+  /**
+   * Executes a write whose loss is harmless: progress telemetry and
+   * checkpoints that the indexer republishes or re-derives. PostgreSQL commits
+   * these asynchronously (`synchronous_commit = off` for the one transaction),
+   * which removes a WAL flush per write; on slow disks that flush dominated
+   * indexer loop time. Commit order is preserved, so a crash can only lose the
+   * newest writes, never reorder them. Other databases execute normally.
+   */
+  private async executeRelaxed(sql: string, args: SqlValue[]): Promise<number> {
+    if (this.client.kind !== 'postgres') {
+      return this.mutate(sql, args);
     }
 
-    const [result] = await executor.raw.query(compileQuery('mysql', sql), args);
-    return 'affectedRows' in result ? result.affectedRows : 0;
+    await this.ensureSchema(this.client);
+    const connection = await this.postgresConnect();
+    try {
+      return await this.metadataQuery(() =>
+        runPostgresRelaxedStatement(connection, compileQuery('postgres', sql), args),
+      );
+    } finally {
+      connection.release();
+    }
+  }
+
+  private upsertClause(conflictColumn: string, columns: string[]): string {
+    if (this.client.kind === 'mysql') {
+      const assignments = columns.map((column) => `${column} = VALUES(${column})`).join(', ');
+      return `ON DUPLICATE KEY UPDATE ${assignments}`;
+    }
+
+    const assignments = columns.map((column) => `${column} = excluded.${column}`).join(', ');
+    return `ON CONFLICT(${conflictColumn}) DO UPDATE SET ${assignments}`;
+  }
+
+  private async ensureSchema(executor: SupportedExecutor): Promise<void> {
+    if (
+      !this.automaticMigrations ||
+      this.schemaReady ||
+      this.migrating ||
+      executor !== this.client
+    ) {
+      return;
+    }
+
+    this.migratePromise ??= this.migrate().finally(() => {
+      if (!this.schemaReady) {
+        this.migratePromise = null;
+      }
+    });
+    await this.migratePromise;
+  }
+
+  private async postgresConnect(): Promise<PoolClient> {
+    if (this.client.kind !== 'postgres') {
+      throw new TypeError('expected postgres metadata client');
+    }
+
+    const pool = this.client.raw;
+    return this.metadataQuery(() => pool.connect());
+  }
+
+  private async mysqlConnect(): Promise<mysql.PoolConnection> {
+    if (this.client.kind !== 'mysql') {
+      throw new TypeError('expected mysql metadata client');
+    }
+
+    const pool = this.client.raw;
+    return this.metadataQuery(() => pool.getConnection());
+  }
+
+  private async metadataQuery<T>(work: () => Promise<T>): Promise<T> {
+    try {
+      return await work();
+    } catch (error) {
+      throw this.toMetadataInfrastructureError(error);
+    }
+  }
+
+  private toMetadataInfrastructureError(error: unknown): Error {
+    if (error instanceof OnlyDogeError) {
+      return error;
+    }
+
+    return new InfrastructureError(metadataInfrastructureMessage(error), { cause: error });
   }
 
   private booleanCondition(column: string, expected: boolean): string {
@@ -2243,11 +2379,51 @@ function coreBlockParams(record: CoreBlockRecord): SqlValue[] {
   ];
 }
 
+function createPostgresPool(settings: DatabaseSettings): Pool {
+  const pool = new Pool(postgresPoolOptions(settings));
+  pool.on('error', (error) => {
+    createLogger({ component: 'metadata', service: 'onlydoge' }).error(
+      { err: error },
+      'metadata postgres pool error',
+    );
+  });
+  return pool;
+}
+
+function createMysqlPool(location: string): mysql.Pool {
+  return mysql.createPool(location);
+}
+
 function postgresPoolOptions(settings: DatabaseSettings): ConstructorParameters<typeof Pool>[0] {
   return {
     connectionString: settings.location,
+    connectionTimeoutMillis: 5_000,
+    max: settings.poolMax ?? 10,
     ...(settings.ssl ? { ssl: settings.ssl } : {}),
   };
+}
+
+/** Runs one statement in a transaction that commits asynchronously; returns affected rows. */
+async function runPostgresRelaxedStatement(
+  connection: PoolClient,
+  sql: string,
+  args: SqlValue[],
+): Promise<number> {
+  await connection.query('BEGIN');
+  try {
+    await connection.query('SET LOCAL synchronous_commit TO OFF');
+    const result = await connection.query(sql, args);
+    await connection.query('COMMIT');
+    return result.rowCount ?? 0;
+  } catch (error) {
+    await connection.query('ROLLBACK').catch(() => undefined);
+    throw error;
+  }
+}
+
+function valueTuples(rows: number, columns: number): string {
+  const tuple = `(${placeholders(columns)})`;
+  return Array.from({ length: rows }, () => tuple).join(', ');
 }
 
 function placeholders(count: number): string {

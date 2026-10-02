@@ -97,3 +97,23 @@ export function configKeyDogecoinTransactionRefsReady(): string {
 export function configKeyDogecoinTransactionRefsBackfillTail(): string {
   return 'dogecoin_transaction_refs_backfill_tail';
 }
+
+export function configKeyIndexerSyncBlocksPerSecond(): string {
+  return 'indexer_sync_blocks_per_second';
+}
+
+export function configKeyIndexerSyncEtaSeconds(): string {
+  return 'indexer_sync_eta_seconds';
+}
+
+export function configKeyIndexerProcessBlocksPerSecond(): string {
+  return 'indexer_process_blocks_per_second';
+}
+
+export function configKeyIndexerProcessEtaSeconds(): string {
+  return 'indexer_process_eta_seconds';
+}
+
+export function configKeyIndexerLastActivityAt(): string {
+  return 'indexer_last_activity_at';
+}

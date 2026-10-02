@@ -15,12 +15,21 @@ import type {
   ProjectionUtxoOutput,
 } from '../domain/projection-models';
 
+export type CoordinatorConfigEntry = readonly [key: string, value: unknown];
+
 export interface CoordinatorConfigPort {
   compareAndDeleteJsonValue<T>(key: string, expectedValue: T): Promise<boolean>;
   compareAndSwapJsonValue<T>(key: string, expectedValue: T | null, nextValue: T): Promise<boolean>;
   deleteByPrefix(prefix: string): Promise<void>;
   getJsonValue<T>(key: string): Promise<T | null>;
   setJsonValue<T>(key: string, value: T): Promise<void>;
+  /**
+   * Writes many keys in one round trip. Meant for progress telemetry that is
+   * rewritten every window: adapters may trade the durability of the latest
+   * write for throughput (a lost write is simply republished). Callers fall
+   * back to per-key `setJsonValue` when an adapter does not provide it.
+   */
+  setJsonValues?(entries: readonly CoordinatorConfigEntry[]): Promise<void>;
 }
 
 export interface DogecoinConfigPort {
@@ -63,6 +72,12 @@ export interface CoreDogecoinStateStorePort {
     context?: CoreDogecoinApplyContext,
   ): Promise<CoreDogecoinApplyResult>;
   getCoreIndexerState(): Promise<CoreIndexerState | null>;
+  /**
+   * Highest block height the warehouse holds as processed, `null` when it holds
+   * none. Stores that cannot tell leave this undefined (or resolve `undefined`)
+   * and the indexer trusts its recorded process tail.
+   */
+  getCoreProcessedTail?(): Promise<number | null | undefined>;
   getCoreUtxoOutputs(outputKeys: string[]): Promise<Map<string, ProjectionUtxoOutput>>;
   materializeCoreDogecoinCurrentState(
     asOfBlockHeight: number,
@@ -75,6 +90,8 @@ export interface CoreDogecoinStateStorePort {
   setCoreIndexerError(error: string | null): Promise<void>;
   setCoreIndexerStage(stage: CoreIndexerStage): Promise<void>;
   upsertCoreBlock(record: CoreBlockRecord): Promise<void>;
+  /** Batch form of `upsertCoreBlock`; one write per raw sync batch when provided. */
+  upsertCoreBlocks?(records: CoreBlockRecord[]): Promise<void>;
   upsertTransactionRefs(
     refs: Array<{
       blockHash: string;
@@ -103,8 +120,25 @@ export type CoreWindowInsertStage =
   | 'current_state'
   | 'processed_blocks';
 
+export interface CoreStateMaterializationProgress {
+  completedRanges: number;
+  rangeCount: number;
+}
+
 export interface CoreDogecoinApplyContext {
   abortSignal?: AbortSignal;
+  /**
+   * Current-state materialization runs as an ordered list of output-key
+   * ranges. A caller that records `onRangeCompleted` progress can hand it back
+   * here to continue a failed attempt instead of clearing and starting over;
+   * progress recorded for a different range count is ignored.
+   */
+  materialization?: {
+    /** Called after each statement of the phases that follow the ranges. */
+    onActivity?: () => Promise<void> | void;
+    onRangeCompleted?: (progress: CoreStateMaterializationProgress) => Promise<void> | void;
+    resumeFrom?: CoreStateMaterializationProgress;
+  };
   statementTimeoutMs?: number;
   testHooks?: {
     afterStage?: (stage: CoreWindowInsertStage) => void | Promise<void>;
@@ -147,6 +181,14 @@ export interface BlockchainRpcPort {
     },
     blockHeight: number,
   ): Promise<Record<string, unknown>>;
+  getBlockSnapshots(
+    dogecoin: {
+      architecture: 'dogecoin';
+      rpcEndpoint: string;
+      rps: number;
+    },
+    blockHeights: number[],
+  ): Promise<Record<string, unknown>[]>;
 }
 
 export interface ProjectionWarehousePort {
