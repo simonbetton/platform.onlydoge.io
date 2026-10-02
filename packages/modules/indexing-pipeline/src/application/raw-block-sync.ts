@@ -37,6 +37,8 @@ export interface RawBlockSyncDogecoin {
 
 export interface RawBlockSyncSink {
   upsertCoreBlock(record: CoreBlockRecord): Promise<void>;
+  /** Optional batch write; used instead of per-block upserts when provided. */
+  upsertCoreBlocks?(records: CoreBlockRecord[]): Promise<void>;
   upsertTransactionRefs(refs: TransactionRef[]): Promise<void>;
 }
 
@@ -243,12 +245,14 @@ export class RawBlockSyncer {
       );
     }
 
-    // Storage writes are latency-bound (object PUT + metadata upsert per
-    // block), so run them for the whole batch in parallel.
-    const refsPerBlock = await Promise.all(
+    // Object PUTs are latency-bound, so run them for the whole batch in
+    // parallel. Block metadata is written once per batch, after every
+    // snapshot of the batch is durable in raw storage.
+    const stored = await Promise.all(
       snapshots.map((snapshot, index) => this.storeSnapshot(batch[index] ?? -1, snapshot)),
     );
-    const refs = refsPerBlock.flat();
+    await this.upsertCoreBlocks(stored.map((entry) => entry.record));
+    const refs = stored.flatMap((entry) => entry.refs);
     if (refs.length > 0) {
       await this.sink.upsertTransactionRefs(refs);
     }
@@ -256,10 +260,19 @@ export class RawBlockSyncer {
     return { rpcMs, storeMs: Date.now() - rpcStartedAt - rpcMs };
   }
 
+  private async upsertCoreBlocks(records: CoreBlockRecord[]): Promise<void> {
+    if (this.sink.upsertCoreBlocks) {
+      await this.sink.upsertCoreBlocks(records);
+      return;
+    }
+
+    await Promise.all(records.map((record) => this.sink.upsertCoreBlock(record)));
+  }
+
   private async storeSnapshot(
     height: number,
     snapshot: Record<string, unknown>,
-  ): Promise<TransactionRef[]> {
+  ): Promise<StoredRawBlock> {
     const block = this.parseSnapshot(snapshot);
     if (block.height !== height) {
       throw new Error(`raw block height mismatch requested=${height} decoded=${block.height}`);
@@ -268,25 +281,32 @@ export class RawBlockSyncer {
     await this.rawBlocks.putPart(height, rawBlockPart, snapshot, {
       timeoutMs: this.settings.coreRawStorageTimeoutMs,
     });
-    await this.sink.upsertCoreBlock({
-      blockHeight: block.height,
-      blockHash: block.hash,
-      previousBlockHash: block.previousHash,
-      blockTime: block.time,
-      txCount: block.txids.length,
-      rawStorageKey: rawBlockPart,
-      fetchedAt: new Date().toISOString(),
-      processedAt: null,
-    });
 
-    return deriveTransactionRefsFromBlock({
-      blockHash: block.hash,
-      blockHeight: block.height,
-      blockTime: block.time,
-      source: 'raw_sync',
-      transactions: block.txids.map((txid) => ({ txid })),
-    });
+    return {
+      record: {
+        blockHeight: block.height,
+        blockHash: block.hash,
+        previousBlockHash: block.previousHash,
+        blockTime: block.time,
+        txCount: block.txids.length,
+        rawStorageKey: rawBlockPart,
+        fetchedAt: new Date().toISOString(),
+        processedAt: null,
+      },
+      refs: deriveTransactionRefsFromBlock({
+        blockHash: block.hash,
+        blockHeight: block.height,
+        blockTime: block.time,
+        source: 'raw_sync',
+        transactions: block.txids.map((txid) => ({ txid })),
+      }),
+    };
   }
+}
+
+interface StoredRawBlock {
+  record: CoreBlockRecord;
+  refs: TransactionRef[];
 }
 
 /** Tracks the highest height H such that every height in (base, H] completed. */

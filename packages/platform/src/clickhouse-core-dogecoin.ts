@@ -13,12 +13,29 @@ export const clickHouseCoreDogecoinTables = {
   currentUtxosByAddress: 'dogecoin_utxo_outputs_current_by_address_v1',
 } as const;
 
-export function buildCoreCurrentStateOutputKeyRanges(): ClickHouseStringRange[] {
+/**
+ * Splits the output-key space (lowercase hex txids) into contiguous ranges by
+ * the first `prefixLength` hex digits, plus one range below and one above hex.
+ * Two digits give 258 ranges, three give 4098.
+ */
+export function buildCoreCurrentStateOutputKeyRanges(prefixLength = 2): ClickHouseStringRange[] {
+  const buckets = 16 ** prefixLength;
   return [
-    { start: null, end: '00' },
-    ...Array.from({ length: 0x100 }, (_value, index) => coreCurrentStateOutputRange(index)),
+    { start: null, end: '0'.repeat(prefixLength) },
+    ...Array.from({ length: buckets }, (_value, index) =>
+      coreCurrentStateOutputRange(index, buckets, prefixLength),
+    ),
     { start: 'g', end: null },
   ];
+}
+
+/**
+ * Hex digits to split current-state materialization by, so one range stays
+ * around a million created outputs or fewer: each range is one bounded
+ * INSERT ... SELECT that has to finish inside the statement timeout.
+ */
+export function coreCurrentStateRangePrefixLength(createdOutputRows: number): number {
+  return createdOutputRows > 256 * 1_000_000 ? 3 : 2;
 }
 
 export function clickHouseStringRangeClause(column: string, range: ClickHouseStringRange): string {
@@ -35,15 +52,15 @@ export function clickHouseStringRangeParams(range: ClickHouseStringRange): Recor
   return Object.fromEntries(entries.filter(isClickHouseStringRangeParam));
 }
 
-function coreCurrentStateOutputRange(value: number): ClickHouseStringRange {
+function coreCurrentStateOutputRange(
+  value: number,
+  buckets: number,
+  prefixLength: number,
+): ClickHouseStringRange {
   return {
-    start: value.toString(16).padStart(2, '0'),
-    end: coreCurrentStateOutputRangeEnd(value),
+    start: value.toString(16).padStart(prefixLength, '0'),
+    end: value === buckets - 1 ? 'g' : (value + 1).toString(16).padStart(prefixLength, '0'),
   };
-}
-
-function coreCurrentStateOutputRangeEnd(value: number): string {
-  return value === 0xff ? 'g' : (value + 1).toString(16).padStart(2, '0');
 }
 
 function clickHouseRangeStartClause(column: string, range: ClickHouseStringRange): string {

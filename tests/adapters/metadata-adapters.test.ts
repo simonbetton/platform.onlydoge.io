@@ -179,8 +179,109 @@ describe.skipIf(process.env.ONLYDOGE_RUN_ADAPTER_TESTS !== '1')(
       },
       adapterTimeoutMs,
     );
+
+    it.each(['sqlite', 'postgres', 'mysql'] as const)(
+      'writes indexer progress, checkpoints, and block batches with %s',
+      async (driver) => {
+        const settings = metadataSettings(driver);
+        await resetMetadataDatabase(settings);
+        const store = await RelationalMetadataStore.connect(settings);
+
+        try {
+          // Batched progress: one statement, last duplicate wins, existing keys update.
+          await store.setJsonValue('indexer:stage', 'sync_backfill');
+          await store.setJsonValues([
+            ['indexer:stage', 'process_backfill'],
+            ['indexer:tail', 1],
+            ['indexer:eta', { seconds: 12.5 }],
+            ['indexer:tail', 2],
+          ]);
+          await store.setJsonValues([]);
+          await expect(store.getJsonValue('indexer:stage')).resolves.toBe('process_backfill');
+          await expect(store.getJsonValue('indexer:tail')).resolves.toBe(2);
+          await expect(store.getJsonValue('indexer:eta')).resolves.toEqual({ seconds: 12.5 });
+
+          // Lease and recovery marker: compare-and-swap, compare-and-delete.
+          const lease = { instanceId: 'a', heartbeatAt: '2026-01-01T00:00:00.000Z' };
+          const renewed = { instanceId: 'a', heartbeatAt: '2026-01-01T00:00:05.000Z' };
+          await expect(store.compareAndSwapJsonValue('primary', null, lease)).resolves.toBe(true);
+          await expect(store.compareAndSwapJsonValue('primary', null, renewed)).resolves.toBe(
+            false,
+          );
+          await expect(store.compareAndSwapJsonValue('primary', lease, renewed)).resolves.toBe(
+            true,
+          );
+          await store.setJsonValue('marker', { startHeight: 10, endHeight: 19 });
+          await expect(
+            store.compareAndDeleteJsonValue('marker', { startHeight: 10, endHeight: 29 }),
+          ).resolves.toBe(false);
+          await expect(
+            store.compareAndDeleteJsonValue('marker', { startHeight: 10, endHeight: 19 }),
+          ).resolves.toBe(true);
+          await expect(store.getJsonValue('marker')).resolves.toBeNull();
+
+          // Indexer state row: created, then partially updated.
+          await store.upsertCoreIndexerState({
+            stage: 'sync_backfill',
+            syncTail: 40,
+            processTail: -1,
+            onlineTip: 100,
+            lastError: null,
+          });
+          await expect(store.upsertCoreIndexerState({ processTail: 19 })).resolves.toMatchObject({
+            stage: 'sync_backfill',
+            syncTail: 40,
+            processTail: 19,
+            onlineTip: 100,
+          });
+          await expect(store.getCoreIndexerState()).resolves.toMatchObject({
+            syncTail: 40,
+            processTail: 19,
+          });
+
+          // Raw sync block batch: many rows in one statement, replayed rows replace.
+          await store.upsertCoreBlocks(
+            Array.from({ length: 40 }, (_value, height) => coreBlockRecord(height)),
+          );
+          await store.upsertCoreBlocks([]);
+          await store.upsertCoreBlocks([
+            coreBlockRecord(39, 'hash-39-reorged'),
+            coreBlockRecord(38, 'hash-38-reorged'),
+          ]);
+          await store.upsertCoreBlock(coreBlockRecord(37, 'hash-37-reorged'));
+          await expect(store.getCoreBlockByHash('hash-0')).resolves.toMatchObject({
+            blockHeight: 0,
+          });
+          await expect(store.getCoreBlockByHash('hash-36')).resolves.toMatchObject({
+            blockHeight: 36,
+          });
+          await expect(store.getCoreBlockByHash('hash-39')).resolves.toBeNull();
+          for (const height of [37, 38, 39]) {
+            await expect(store.getCoreBlockByHash(`hash-${height}-reorged`)).resolves.toMatchObject(
+              { blockHeight: height },
+            );
+          }
+        } finally {
+          await store.close();
+        }
+      },
+      adapterTimeoutMs,
+    );
   },
 );
+
+function coreBlockRecord(height: number, blockHash = `hash-${height}`) {
+  return {
+    blockHeight: height,
+    blockHash,
+    previousBlockHash: height > 0 ? `hash-${height - 1}` : null,
+    blockTime: 1_700_000_000 + height,
+    txCount: height + 1,
+    rawStorageKey: 'block',
+    fetchedAt: '2026-01-01T00:00:00.000Z',
+    processedAt: null,
+  };
+}
 
 function metadataSettings(driver: DatabaseSettings['driver']): DatabaseSettings {
   if (driver === 'sqlite') {

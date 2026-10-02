@@ -4,6 +4,7 @@ import { noopServiceLogger, type ServiceLogger } from '@onlydoge/shared-kernel';
 
 import type {
   BlockchainRpcPort,
+  CoordinatorConfigEntry,
   CoordinatorConfigPort,
   CoreDogecoinStateStorePort,
   DogecoinConfigPort,
@@ -15,9 +16,9 @@ import {
   configKeyCoreApplyRecovery,
   configKeyDogecoinAnalyticsFactsReady,
   configKeyDogecoinAnalyticsFactsTail,
+  configKeyDogecoinCurrentStateMaterialization,
   configKeyDogecoinCurrentStateReady,
   configKeyDogecoinHistoryReady,
-  configKeyDogecoinTransactionRefsBackfillTail,
   configKeyDogecoinTransactionRefsReady,
   configKeyIndexerFactProgress,
   configKeyIndexerFactTail,
@@ -54,8 +55,8 @@ import type {
   CoreIndexerState,
   ProjectionUtxoOutput,
 } from '../domain/projection-models';
-import { deriveTransactionRefsFromBlock, type TransactionRef } from '../domain/transaction-ref';
 import { mapWithConcurrency, range } from './concurrency';
+import { CoreBlockPrefetcher } from './core-block-prefetcher';
 import type { CoreDogecoinIndexerSettings } from './core-dogecoin-indexer-settings';
 import { RawBlockSyncer, type RawBlockSyncHooks, rawBlockPart } from './raw-block-sync';
 
@@ -81,6 +82,14 @@ interface DogecoinRuntimeConfig {
 const workerIdleMs = 250;
 const loopFailureBackoffMaxMs = 30_000;
 const throughputSmoothing = 0.3;
+/** A backfill window stops filling after this long, however few blocks it holds. */
+const backfillWindowMaxFillMs = 10_000;
+/** Floor for the adaptive backfill row target. */
+const backfillWindowMinRows = 5_000;
+/** How long `auto` keeps reading raw storage after a node read failed. */
+const nodeSourceRetryDelayMs = 60_000;
+/** How often a running materialization refreshes indexer state and logs progress. */
+const materializationHeartbeatMs = 30_000;
 
 interface ProgressObservation {
   observedAtMs: number;
@@ -108,12 +117,30 @@ interface CoreBlockMetrics {
 interface CoreWindowMetrics extends CoreBlockMetrics {
   blocks: number;
   end: number;
+  source: CoreWindowSource;
   start: number;
 }
 
 interface CoreProcessWindowBounds {
   firstHeight: number;
   lastHeight: number;
+}
+
+type CoreWindowSource = 'node' | 'storage';
+
+/**
+ * One processing window: the height range it may cover and how its block
+ * snapshots are loaded. Backfill windows may load fewer blocks than the range
+ * allows (row target reached, fill deadline hit); fixed windows load all of it.
+ */
+interface CoreWindowPlan extends CoreProcessWindowBounds {
+  load: () => Promise<Record<string, unknown>[]>;
+  source: CoreWindowSource;
+}
+
+interface CoreBackfillLoader {
+  prefetcher: CoreBlockPrefetcher;
+  source: CoreWindowSource;
 }
 
 interface CoreWindowKeyTracker {
@@ -133,6 +160,7 @@ interface CoreWindowMetricsInput {
   bounds: CoreProcessWindowBounds;
   buildMs: number;
   loadRawMs: number;
+  source: CoreWindowSource;
   totalStartedAt: number;
 }
 
@@ -158,12 +186,18 @@ export class CoreDogecoinIndexerService {
   private readonly logger: ServiceLogger;
   private readonly syncer: RawBlockSyncer;
   private activeBlockAttempt: CoreBlockAttempt | null = null;
+  private backfillLoader: CoreBackfillLoader | null = null;
+  private backfillTargetRows: number | null = null;
   private consecutiveLoopFailures = 0;
   private lastActivityAtMs = Date.now();
+  private lastMaterializationHeartbeatAtMs = 0;
+  private nodeSourceRetryAtMs = 0;
   private primaryLease: PrimaryLease | null = null;
   private processBlocksPerSecond: number | null = null;
   private progressObservation: ProgressObservation | null = null;
   private syncBlocksPerSecond: number | null = null;
+  private transactionRefsReady = false;
+  private warehouseTailReconciled = false;
 
   public constructor(
     private readonly configs: CoordinatorConfigPort,
@@ -254,10 +288,12 @@ export class CoreDogecoinIndexerService {
 
     try {
       await this.recoverPendingCoreApplyIfNeeded(dogecoin);
-      await this.backfillTransactionRefsIfNeeded(dogecoin);
-      await this.configs.setJsonValue(configKeyBlockHeight(), latest);
 
-      const state = await this.ensureState(dogecoin, latest);
+      const state = await this.reconcileProcessTailWithWarehouse(
+        dogecoin,
+        await this.ensureState(dogecoin, latest),
+      );
+      await this.markTransactionRefsReadyIfCaughtUp(dogecoin, state);
       await this.publishProgress(latest, state);
       await this.assertProgressWatchdog(dogecoin, latest, state);
       return await this.runDogecoinStage(dogecoin, latest, state);
@@ -312,6 +348,52 @@ export class CoreDogecoinIndexerService {
       'core indexer initialized',
     );
     return state;
+  }
+
+  /**
+   * The process tail lives in the metadata database, the processed windows in
+   * the warehouse, and the two do not share a durability boundary: after a
+   * hard stop (host power loss, a killed VM) the warehouse can come back
+   * without the newest parts while the recorded tail still points past them.
+   * Continuing from that tail would leave a permanent hole, so once per
+   * process start the tail is checked against what the warehouse actually
+   * holds and rewound to it, cleaning any partial rows above it first.
+   */
+  private async reconcileProcessTailWithWarehouse(
+    dogecoin: DogecoinRuntimeConfig,
+    state: CoreIndexerState,
+  ): Promise<CoreIndexerState> {
+    if (this.warehouseTailReconciled) {
+      return state;
+    }
+
+    const processedTail = await this.stateStore.getCoreProcessedTail?.();
+    this.warehouseTailReconciled = true;
+    if (processedTail === undefined) {
+      return state;
+    }
+
+    const warehouseTail = processedTail ?? -1;
+    if (warehouseTail >= state.processTail) {
+      return state;
+    }
+
+    this.logger.warn(
+      {
+        chain: dogecoin.id,
+        component: 'core-indexer',
+        phase: 'core-apply-recovery',
+        processTail: state.processTail,
+        warehouseTail,
+      },
+      'warehouse is behind the recorded process tail; rewinding to the warehouse tail',
+    );
+    await this.stateStore.recoverCoreDogecoinWindow(warehouseTail + 1, {
+      statementTimeoutMs: this.settings.coreDbStatementTimeoutMs,
+      updateCurrentState: await this.isDogecoinCurrentStateReady(),
+      validatePrevouts: false,
+    });
+    return this.stateStore.upsertCoreIndexerState({ processTail: warehouseTail });
   }
 
   private async storedSyncTail(): Promise<number> {
@@ -444,69 +526,39 @@ export class CoreDogecoinIndexerService {
     this.processBlocksPerSecond = smoothRate(this.processBlocksPerSecond, blocks, elapsedMs);
   }
 
-  private async backfillTransactionRefsIfNeeded(dogecoin: DogecoinRuntimeConfig): Promise<void> {
-    if (
-      (await this.configs.getJsonValue<boolean>(configKeyDogecoinTransactionRefsReady())) === true
-    ) {
+  /**
+   * Transaction refs are written by raw sync for every block it stores, and
+   * processed transactions always resolve through the core create table. The
+   * only transactions that need a ref are the ones in synced-but-unprocessed
+   * blocks, so the index is complete from the first moment processing has
+   * caught up with raw sync: everything older is processed, everything newer
+   * is synced with refs.
+   *
+   * This replaces a raw-block re-read backfill that fetched every stored block
+   * a second time and whose output was deleted again by each window rewind.
+   */
+  private async markTransactionRefsReadyIfCaughtUp(
+    dogecoin: DogecoinRuntimeConfig,
+    state: CoreIndexerState,
+  ): Promise<void> {
+    if (this.transactionRefsReady || !hasProcessedEverySyncedBlock(state)) {
       return;
     }
 
-    const state = await this.stateStore.getCoreIndexerState();
-    const syncTail = state?.syncTail ?? -1;
-    if (syncTail < 0) {
-      return;
-    }
-
-    const backfillTail =
-      (await this.configs.getJsonValue<number>(configKeyDogecoinTransactionRefsBackfillTail())) ??
-      -1;
-    const startHeight = backfillTail + 1;
-    if (startHeight > syncTail) {
-      await this.configs.setJsonValue(configKeyDogecoinTransactionRefsReady(), true);
-      return;
-    }
-
-    const endHeight = Math.min(syncTail, startHeight + this.settings.coreProcessWindow - 1);
-    const refs: TransactionRef[] = [];
-
-    for (const height of range(startHeight, endHeight)) {
-      const snapshot = await this.rawBlocks.getPart<Record<string, unknown>>(height, rawBlockPart, {
-        timeoutMs: this.settings.coreRawStorageTimeoutMs,
-      });
-      if (!snapshot) {
-        continue;
-      }
-
-      const block = parseDogecoinBlockSnapshot(snapshot);
-      refs.push(
-        ...deriveTransactionRefsFromBlock({
-          blockHash: block.hash,
-          blockHeight: block.height,
-          blockTime: block.time,
-          source: 'raw_sync',
-          transactions: block.tx.map((transaction) => ({
-            txid: requireString(transaction.txid, 'tx.txid'),
-          })),
-        }),
-      );
-    }
-
-    if (refs.length > 0) {
-      await this.stateStore.upsertTransactionRefs(refs);
-    }
-
-    await this.configs.setJsonValue(configKeyDogecoinTransactionRefsBackfillTail(), endHeight);
-    if (endHeight >= syncTail) {
+    const ready =
+      (await this.configs.getJsonValue<boolean>(configKeyDogecoinTransactionRefsReady())) === true;
+    if (!ready) {
       await this.configs.setJsonValue(configKeyDogecoinTransactionRefsReady(), true);
       this.logger.info(
         {
           chain: dogecoin.id,
           component: 'core-indexer',
-          throughHeight: syncTail,
+          throughHeight: state.syncTail,
         },
         'transaction refs backfill complete',
       );
     }
+    this.transactionRefsReady = true;
   }
 
   private async processBackfill(
@@ -530,7 +582,7 @@ export class CoreDogecoinIndexerService {
     state: CoreIndexerState,
     currentStateReady: boolean,
   ): Promise<boolean> {
-    if (state.processTail >= latest - this.settings.coreOnlineTipDistance) {
+    if (await this.shouldPromoteBackfill(latest, state, currentStateReady)) {
       await this.promoteBackfillToOnline(dogecoin, latest, state, currentStateReady);
       return true;
     }
@@ -539,13 +591,35 @@ export class CoreDogecoinIndexerService {
     return true;
   }
 
+  private async shouldPromoteBackfill(
+    latest: number,
+    state: CoreIndexerState,
+    currentStateReady: boolean,
+  ): Promise<boolean> {
+    if (state.processTail >= latest - this.settings.coreOnlineTipDistance) {
+      return true;
+    }
+    if (currentStateReady) {
+      return false;
+    }
+
+    // A materialization that already started for this tail is finished first,
+    // however far the tip moved meanwhile. Going back to sync would advance the
+    // tail and throw the partial materialization away; the online stage catches
+    // up the blocks that arrived in between.
+    const pending = await this.configs.getJsonValue<{ asOfBlockHeight?: number }>(
+      configKeyDogecoinCurrentStateMaterialization(),
+    );
+    return pending?.asOfBlockHeight === state.processTail;
+  }
+
   private async promoteBackfillToOnline(
     dogecoin: DogecoinRuntimeConfig,
     latest: number,
     state: CoreIndexerState,
     currentStateReady: boolean,
   ): Promise<void> {
-    await this.materializeCurrentStateIfNeeded(state, currentStateReady);
+    await this.materializeCurrentStateIfNeeded(dogecoin, latest, state, currentStateReady);
     await this.stateStore.upsertCoreIndexerState({
       stage: 'online',
       onlineTip: latest,
@@ -573,6 +647,8 @@ export class CoreDogecoinIndexerService {
   }
 
   private async materializeCurrentStateIfNeeded(
+    dogecoin: DogecoinRuntimeConfig,
+    latest: number,
     state: CoreIndexerState,
     currentStateReady: boolean,
   ): Promise<void> {
@@ -580,9 +656,65 @@ export class CoreDogecoinIndexerService {
       return;
     }
 
+    this.logger.info(
+      {
+        asOfBlockHeight: state.processTail,
+        chain: dogecoin.id,
+        component: 'core-indexer',
+        phase: 'core-current-state-materialization',
+      },
+      'core current state materialization started',
+    );
     await this.stateStore.materializeCoreDogecoinCurrentState(state.processTail, {
-      statementTimeoutMs: this.settings.coreDbStatementTimeoutMs,
+      // One materialization statement covers a whole key range, not one window.
+      statementTimeoutMs: Math.max(
+        this.settings.coreDbStatementTimeoutMs,
+        this.settings.coreBlockTimeoutMs,
+      ),
+      materialization: {
+        onActivity: () => this.materializationHeartbeat(dogecoin, latest, null),
+        onRangeCompleted: (progress) => this.materializationHeartbeat(dogecoin, latest, progress),
+      },
     });
+    this.logger.info(
+      {
+        asOfBlockHeight: state.processTail,
+        chain: dogecoin.id,
+        component: 'core-indexer',
+        phase: 'core-current-state-materialization',
+      },
+      'core current state materialization completed',
+    );
+  }
+
+  /**
+   * Materialization advances no tail, so without this the indexer would look
+   * stalled for as long as it runs: every finished statement counts as
+   * activity, and twice a minute the state row is refreshed for the health
+   * check and progress is logged.
+   */
+  private async materializationHeartbeat(
+    dogecoin: DogecoinRuntimeConfig,
+    latest: number,
+    progress: { completedRanges: number; rangeCount: number } | null,
+  ): Promise<void> {
+    this.recordActivity();
+    this.assertPrimaryLease();
+    if (Date.now() - this.lastMaterializationHeartbeatAtMs < materializationHeartbeatMs) {
+      return;
+    }
+
+    this.lastMaterializationHeartbeatAtMs = Date.now();
+    await this.stateStore.upsertCoreIndexerState({ onlineTip: latest, lastError: null });
+    this.logger.info(
+      {
+        chain: dogecoin.id,
+        component: 'core-indexer',
+        phase: 'core-current-state-materialization',
+        ...(progress ?? {}),
+      },
+      'core current state materialization progress',
+    );
   }
 
   private async returnBackfillToSync(
@@ -615,9 +747,9 @@ export class CoreDogecoinIndexerService {
     currentStateReady: boolean,
     stage: CoreIndexerState['stage'] = 'process_backfill',
   ): Promise<boolean> {
-    const end = Math.min(state.syncTail, state.processTail + this.settings.coreProcessWindow);
-    const heights = range(state.processTail + 1, end);
-    const metrics = await this.processWindow(dogecoin, latest, heights, currentStateReady);
+    const plan = this.planBackfillWindow(dogecoin, latest, state);
+    const metrics = await this.processWindow(dogecoin, plan, currentStateReady);
+    this.adaptBackfillTargetRows(metrics.applyMs);
     await this.publishWindowProgress(dogecoin, latest, metrics, stage);
 
     this.logger.info(
@@ -634,30 +766,201 @@ export class CoreDogecoinIndexerService {
     return true;
   }
 
+  /**
+   * Backfill windows are sized by work, not by a fixed block count: a window
+   * closes once it holds the row target, reaches the block limit, or has been
+   * filling for `backfillWindowMaxFillMs`. Blocks come through a read-ahead
+   * that keeps fetching while the previous window is applied.
+   */
+  private planBackfillWindow(
+    dogecoin: DogecoinRuntimeConfig,
+    latest: number,
+    state: CoreIndexerState,
+  ): CoreWindowPlan {
+    const firstHeight = state.processTail + 1;
+    const source = this.backfillSource(latest, firstHeight);
+    const readAheadLimit = backfillReadAheadLimit(source, latest, state.syncTail, this.settings);
+    const plan: CoreWindowPlan = {
+      firstHeight,
+      lastHeight: Math.min(readAheadLimit, state.processTail + this.backfillWindowBlocks()),
+      source,
+      load: () => this.loadBackfillSnapshots(dogecoin, plan, readAheadLimit),
+    };
+    return plan;
+  }
+
+  private backfillWindowBlocks(): number {
+    return this.settings.coreBackfillWindowBlocks ?? this.settings.coreProcessWindow;
+  }
+
+  private backfillSource(latest: number, firstHeight: number): CoreWindowSource {
+    const configured = this.settings.coreBackfillBlockSource ?? 'storage';
+    if (configured !== 'auto') {
+      return configured;
+    }
+    if (Date.now() < this.nodeSourceRetryAtMs) {
+      return 'storage';
+    }
+
+    // Heights inside the reorg window keep using the snapshots raw sync stored,
+    // so processing and the explorer agree on the block they describe.
+    return firstHeight <= finalizedNodeHeight(latest, this.settings) ? 'node' : 'storage';
+  }
+
+  private async loadBackfillSnapshots(
+    dogecoin: DogecoinRuntimeConfig,
+    plan: CoreWindowPlan,
+    readAheadLimit: number,
+  ): Promise<Record<string, unknown>[]> {
+    try {
+      return await this.fillBackfillWindow(dogecoin, plan, readAheadLimit);
+    } catch (error) {
+      if (!this.shouldFallBackToStorage(plan.source, error)) {
+        throw error;
+      }
+
+      this.nodeSourceRetryAtMs = Date.now() + nodeSourceRetryDelayMs;
+      this.logger.warn(
+        {
+          ...this.errorBindings(error),
+          blockEnd: plan.lastHeight,
+          blockStart: plan.firstHeight,
+          chain: dogecoin.id,
+          component: 'core-indexer',
+          phase: 'core-process-window',
+          retryNodeInMs: nodeSourceRetryDelayMs,
+        },
+        'node block read failed; processing from raw storage',
+      );
+      plan.source = 'storage';
+      return this.fillBackfillWindow(dogecoin, plan, readAheadLimit);
+    }
+  }
+
+  private shouldFallBackToStorage(source: CoreWindowSource, error: unknown): boolean {
+    return (
+      source === 'node' &&
+      this.settings.coreBackfillBlockSource === 'auto' &&
+      !(error instanceof PrimaryLeaseLostError)
+    );
+  }
+
+  private async fillBackfillWindow(
+    dogecoin: DogecoinRuntimeConfig,
+    plan: CoreWindowPlan,
+    readAheadLimit: number,
+  ): Promise<Record<string, unknown>[]> {
+    const { prefetcher } = this.backfillLoaderFor(dogecoin, plan.source);
+    const targetRows = this.currentBackfillTargetRows();
+    const fillDeadline = Date.now() + backfillWindowMaxFillMs;
+    const snapshots: Record<string, unknown>[] = [];
+    let rows = 0;
+
+    for (let height = plan.firstHeight; height <= plan.lastHeight; height += 1) {
+      const snapshot = await prefetcher.get(height, readAheadLimit);
+      this.recordActivity();
+      snapshots.push(snapshot);
+      rows += coreSnapshotRowCount(snapshot);
+      if (rows >= targetRows || Date.now() >= fillDeadline) {
+        break;
+      }
+    }
+
+    return snapshots;
+  }
+
+  private backfillLoaderFor(
+    dogecoin: DogecoinRuntimeConfig,
+    source: CoreWindowSource,
+  ): CoreBackfillLoader {
+    if (this.backfillLoader?.source === source) {
+      return this.backfillLoader;
+    }
+
+    this.backfillLoader?.prefetcher.reset();
+    this.backfillLoader = { prefetcher: this.createBackfillPrefetcher(dogecoin, source), source };
+    return this.backfillLoader;
+  }
+
+  private createBackfillPrefetcher(
+    dogecoin: DogecoinRuntimeConfig,
+    source: CoreWindowSource,
+  ): CoreBlockPrefetcher {
+    const readAhead = {
+      maxBufferedBlocks: this.backfillWindowBlocks() * 2,
+      maxBufferedWeight: (this.settings.coreBackfillWindowRows ?? Number.MAX_SAFE_INTEGER) * 2,
+      weigh: coreSnapshotRowCount,
+    };
+    if (source === 'node') {
+      return new CoreBlockPrefetcher((heights) => this.rpc.getBlockSnapshots(dogecoin, heights), {
+        ...readAhead,
+        batchSize: this.settings.syncBatchSize,
+        concurrency: this.settings.syncConcurrency,
+      });
+    }
+
+    return new CoreBlockPrefetcher(
+      (heights) => Promise.all(heights.map((height) => this.loadRawSnapshot(dogecoin, height))),
+      { ...readAhead, batchSize: 1, concurrency: this.settings.coreProcessLoadConcurrency },
+    );
+  }
+
+  private currentBackfillTargetRows(): number {
+    const configured = this.settings.coreBackfillWindowRows;
+    if (configured === undefined) {
+      return Number.POSITIVE_INFINITY;
+    }
+
+    return Math.min(configured, this.backfillTargetRows ?? configured);
+  }
+
+  /**
+   * Keeps window apply time well inside the statement budget on whatever
+   * hardware the warehouse runs on: halve the row target when an apply used
+   * more than half the budget (or failed), grow it back while applies are fast.
+   */
+  private adaptBackfillTargetRows(applyMs: number | null): void {
+    const configured = this.settings.coreBackfillWindowRows;
+    if (configured === undefined) {
+      return;
+    }
+
+    const current = Math.min(configured, this.backfillTargetRows ?? configured);
+    this.backfillTargetRows = nextBackfillTargetRows(
+      current,
+      configured,
+      applyMs,
+      this.settings.coreDbStatementTimeoutMs,
+    );
+  }
+
   private async processWindow(
     dogecoin: DogecoinRuntimeConfig,
-    _latest: number,
-    heights: number[],
+    plan: CoreWindowPlan,
     updateCurrentState: boolean,
   ): Promise<CoreWindowMetrics> {
-    const bounds = requireCoreProcessWindowBounds(heights);
-    const attempt = this.createCoreBlockAttempt(bounds.lastHeight);
+    const attempt = this.createCoreBlockAttempt(plan.lastHeight);
     this.activeBlockAttempt = attempt;
 
     try {
-      return await this.processWindowWithAttempt(
-        dogecoin,
-        heights,
-        bounds,
-        updateCurrentState,
-        attempt,
-      );
+      return await this.processWindowWithAttempt(plan, updateCurrentState, attempt);
     } catch (error) {
       await this.exitForCoreBlockTimeout(error, dogecoin, attempt.height);
       throw error;
     } finally {
       this.clearActiveBlockAttempt(attempt);
     }
+  }
+
+  private fixedWindowPlan(dogecoin: DogecoinRuntimeConfig, heights: number[]): CoreWindowPlan {
+    return {
+      ...requireCoreProcessWindowBounds(heights),
+      source: 'storage',
+      load: () =>
+        mapWithConcurrency(heights, this.settings.coreProcessLoadConcurrency, (height) =>
+          this.loadRawSnapshot(dogecoin, height),
+        ),
+    };
   }
 
   private createCoreBlockAttempt(height: number): CoreBlockAttempt {
@@ -669,17 +972,15 @@ export class CoreDogecoinIndexerService {
   }
 
   private async processWindowWithAttempt(
-    dogecoin: DogecoinRuntimeConfig,
-    heights: number[],
-    bounds: CoreProcessWindowBounds,
+    plan: CoreWindowPlan,
     updateCurrentState: boolean,
     attempt: CoreBlockAttempt,
   ): Promise<CoreWindowMetrics> {
     const totalStartedAt = Date.now();
-    const { result: snapshots, elapsedMs: loadRawMs } = await this.loadRawSnapshots(
-      dogecoin,
-      heights,
+    const { result: snapshots, elapsedMs: loadRawMs } = await this.runCoreBlockStep(
       attempt,
+      'load_raw',
+      plan.load,
     );
     const { result: applications, elapsedMs: buildMs } = await this.buildWindowApplications(
       snapshots,
@@ -692,23 +993,12 @@ export class CoreDogecoinIndexerService {
       applications,
       applyMs,
       applyResult,
-      bounds,
+      bounds: plan,
       buildMs,
       loadRawMs,
+      source: plan.source,
       totalStartedAt,
     });
-  }
-
-  private loadRawSnapshots(
-    dogecoin: DogecoinRuntimeConfig,
-    heights: number[],
-    attempt: CoreBlockAttempt,
-  ): Promise<{ elapsedMs: number; result: Record<string, unknown>[] }> {
-    return this.runCoreBlockStep(attempt, 'load_raw', () =>
-      mapWithConcurrency(heights, this.settings.coreProcessLoadConcurrency, (height) =>
-        this.loadRawSnapshot(dogecoin, height),
-      ),
-    );
   }
 
   private async loadRawSnapshot(
@@ -788,6 +1078,7 @@ export class CoreDogecoinIndexerService {
       await this.clearCoreApplyRecoveryMarker(marker);
       return applied;
     } catch (error) {
+      this.adaptBackfillTargetRows(null);
       this.logger.error(
         {
           action: 'marker-retained',
@@ -926,6 +1217,7 @@ export class CoreDogecoinIndexerService {
         applyMs: metrics.applyMs,
         blockEnd: metrics.end,
         blockStart: metrics.start,
+        blocks: metrics.blocks,
         blocksPerSecond: roundRate(this.processBlocksPerSecond),
         buildMs: metrics.buildMs,
         chain: dogecoin.id,
@@ -935,6 +1227,7 @@ export class CoreDogecoinIndexerService {
         phase: 'core-process-window',
         processTail: nextState.processTail,
         publishProgressMs: publishMs,
+        source: metrics.source,
         spends: metrics.spends,
         totalMs: metrics.totalMs + publishMs,
       },
@@ -1134,7 +1427,11 @@ export class CoreDogecoinIndexerService {
       this.settings.coreProcessWindow,
     );
     await this.storeRawBlockHeights(dogecoin, heights);
-    const metrics = await this.processWindow(dogecoin, latest, heights, currentStateReady);
+    const metrics = await this.processWindow(
+      dogecoin,
+      this.fixedWindowPlan(dogecoin, heights),
+      currentStateReady,
+    );
     await this.publishWindowProgress(dogecoin, latest, metrics, 'online');
 
     this.logger.info(
@@ -1152,65 +1449,77 @@ export class CoreDogecoinIndexerService {
   }
 
   private async publishProgress(latest: number, state: CoreIndexerState): Promise<void> {
-    const historyReady =
-      (await this.configs.getJsonValue<boolean>(configKeyDogecoinHistoryReady())) === true;
-    const analyticsFactsReady = await this.isDogecoinAnalyticsFactsReady();
+    const [historyReady, analyticsFactsReady] = await Promise.all([
+      this.isDogecoinHistoryReady(),
+      this.isDogecoinAnalyticsFactsReady(),
+    ]);
     this.assertPrimaryLease();
-    const writes = [
-      this.configs.setJsonValue(configKeyIndexerStage(), state.stage),
-      this.configs.setJsonValue(configKeyIndexerSyncTail(), state.syncTail),
-      this.configs.setJsonValue(configKeyIndexerProcessTail(), state.processTail),
-      this.configs.setJsonValue(
+    await this.setConfigValues(
+      this.progressEntries(latest, state, { analyticsFactsReady, historyReady }),
+    );
+    this.observeProgress(state);
+  }
+
+  private progressEntries(
+    latest: number,
+    state: CoreIndexerState,
+    readiness: { analyticsFactsReady: boolean; historyReady: boolean },
+  ): CoordinatorConfigEntry[] {
+    const entries: CoordinatorConfigEntry[] = [
+      [configKeyBlockHeight(), latest],
+      [configKeyIndexerStage(), state.stage],
+      [configKeyIndexerSyncTail(), state.syncTail],
+      [configKeyIndexerProcessTail(), state.processTail],
+      [
         configKeyIndexerFinalizedTail(),
         finalizedTail(state.processTail, this.settings.coreReprocessDepth),
-      ),
-      this.configs.setJsonValue(configKeyIndexerReprocessDepth(), this.settings.coreReprocessDepth),
-      this.configs.setJsonValue(configKeyIndexerSyncProgress(), toProgress(state.syncTail, latest)),
-      this.configs.setJsonValue(
-        configKeyIndexerProcessProgress(),
-        toProgress(state.processTail, latest),
-      ),
-      this.configs.setJsonValue(
-        configKeyIndexerSyncBlocksPerSecond(),
-        roundRate(this.syncBlocksPerSecond),
-      ),
-      this.configs.setJsonValue(
+      ],
+      [configKeyIndexerReprocessDepth(), this.settings.coreReprocessDepth],
+      [configKeyIndexerSyncProgress(), toProgress(state.syncTail, latest)],
+      [configKeyIndexerProcessProgress(), toProgress(state.processTail, latest)],
+      [configKeyIndexerSyncBlocksPerSecond(), roundRate(this.syncBlocksPerSecond)],
+      [
         configKeyIndexerSyncEtaSeconds(),
         etaSeconds(latest - state.syncTail, this.syncBlocksPerSecond),
-      ),
-      this.configs.setJsonValue(
-        configKeyIndexerProcessBlocksPerSecond(),
-        roundRate(this.processBlocksPerSecond),
-      ),
-      this.configs.setJsonValue(
+      ],
+      [configKeyIndexerProcessBlocksPerSecond(), roundRate(this.processBlocksPerSecond)],
+      [
         configKeyIndexerProcessEtaSeconds(),
         etaSeconds(latest - state.processTail, this.processBlocksPerSecond),
-      ),
-      this.configs.setJsonValue(
-        configKeyIndexerLastActivityAt(),
-        new Date(this.lastActivityAtMs).toISOString(),
-      ),
+      ],
+      [configKeyIndexerLastActivityAt(), new Date(this.lastActivityAtMs).toISOString()],
     ];
-    if (historyReady) {
-      writes.push(
-        this.configs.setJsonValue(configKeyIndexerFactTail(), state.processTail),
-        this.configs.setJsonValue(
-          configKeyIndexerFactProgress(),
-          toProgress(state.processTail, latest),
-        ),
+    if (readiness.historyReady) {
+      entries.push(
+        [configKeyIndexerFactTail(), state.processTail],
+        [configKeyIndexerFactProgress(), toProgress(state.processTail, latest)],
       );
     }
-    if (analyticsFactsReady) {
-      writes.push(
-        this.configs.setJsonValue(
-          configKeyDogecoinAnalyticsFactsTail(),
-          finalizedTail(state.processTail, this.settings.coreReprocessDepth),
-        ),
-      );
+    if (readiness.analyticsFactsReady) {
+      entries.push([
+        configKeyDogecoinAnalyticsFactsTail(),
+        finalizedTail(state.processTail, this.settings.coreReprocessDepth),
+      ]);
     }
 
-    await Promise.all(writes);
-    this.observeProgress(state);
+    return entries;
+  }
+
+  /**
+   * Progress is a dozen keys rewritten every window. Adapters that can, write
+   * them in one statement; the rest fall back to one write per key.
+   */
+  private async setConfigValues(entries: CoordinatorConfigEntry[]): Promise<void> {
+    if (this.configs.setJsonValues) {
+      await this.configs.setJsonValues(entries);
+      return;
+    }
+
+    await Promise.all(entries.map(([key, value]) => this.configs.setJsonValue(key, value)));
+  }
+
+  private async isDogecoinHistoryReady(): Promise<boolean> {
+    return (await this.configs.getJsonValue<boolean>(configKeyDogecoinHistoryReady())) === true;
   }
 
   private async isDogecoinAnalyticsFactsReady(): Promise<boolean> {
@@ -1363,6 +1672,13 @@ export class CoreDogecoinIndexerService {
   }
 
   private async leaseLeadership(): Promise<boolean> {
+    // A lease this instance renewed less than one heartbeat ago cannot have
+    // been replaced (takeover needs three missed heartbeats), so loop
+    // iterations shorter than the heartbeat skip the metadata round trip.
+    if (this.hasFreshPrimaryLease()) {
+      return true;
+    }
+
     const current = await this.configs.getJsonValue<PrimaryLease | string>(configKeyPrimary());
     const currentLease = toPrimaryLease(current);
     if (!currentLease) {
@@ -1370,6 +1686,15 @@ export class CoreDogecoinIndexerService {
     }
 
     return this.leaseKnownPrimary(current, currentLease);
+  }
+
+  private hasFreshPrimaryLease(): boolean {
+    const lease = this.primaryLease;
+    if (!lease) {
+      return false;
+    }
+
+    return Date.now() - Date.parse(lease.heartbeatAt) < this.settings.leaseHeartbeatIntervalMs;
   }
 
   private async leaseKnownPrimary(
@@ -1483,6 +1808,69 @@ function shouldContinueStartLoop(signal: AbortSignal | undefined): boolean {
   return signal?.aborted !== true;
 }
 
+function hasProcessedEverySyncedBlock(state: CoreIndexerState): boolean {
+  return state.syncTail >= 0 && state.processTail >= state.syncTail;
+}
+
+/** Highest height the node is trusted for without consulting the stored snapshot. */
+function finalizedNodeHeight(
+  latest: number,
+  settings: Pick<CoreDogecoinIndexerSettings, 'coreReprocessDepth'>,
+): number {
+  return latest - settings.coreReprocessDepth;
+}
+
+function backfillReadAheadLimit(
+  source: CoreWindowSource,
+  latest: number,
+  syncTail: number,
+  settings: Pick<CoreDogecoinIndexerSettings, 'coreBackfillBlockSource' | 'coreReprocessDepth'>,
+): number {
+  if (source === 'node' && settings.coreBackfillBlockSource === 'auto') {
+    return Math.min(syncTail, finalizedNodeHeight(latest, settings));
+  }
+
+  return syncTail;
+}
+
+function nextBackfillTargetRows(
+  current: number,
+  configured: number,
+  applyMs: number | null,
+  statementBudgetMs: number,
+): number {
+  if (applyMs === null || applyMs > statementBudgetMs / 2) {
+    return Math.max(Math.min(backfillWindowMinRows, configured), Math.floor(current / 2));
+  }
+  if (applyMs < statementBudgetMs / 6) {
+    return Math.min(configured, Math.ceil(current * 1.5));
+  }
+
+  return current;
+}
+
+/**
+ * Inputs + outputs of a block snapshot: the number of core rows it produces.
+ * Used only to size windows, so malformed snapshots count as zero here and are
+ * rejected later by the strict parser.
+ */
+export function coreSnapshotRowCount(snapshot: Record<string, unknown>): number {
+  const transactions = (snapshot.block as { tx?: unknown } | undefined)?.tx;
+  if (!Array.isArray(transactions)) {
+    return 0;
+  }
+
+  let rows = 0;
+  for (const transaction of transactions as Array<{ vin?: unknown; vout?: unknown } | null>) {
+    rows += arrayLength(transaction?.vin) + arrayLength(transaction?.vout);
+  }
+  return rows;
+}
+
+function arrayLength(value: unknown): number {
+  return Array.isArray(value) ? value.length : 0;
+}
+
 function shouldPromoteToProcessBackfill(
   state: CoreIndexerState,
   latest: number,
@@ -1541,6 +1929,7 @@ function coreWindowMetrics(input: CoreWindowMetricsInput): CoreWindowMetrics {
     creates: countCoreCreates(input.applications),
     end: input.applyResult.processTail,
     loadRawMs: input.loadRawMs,
+    source: input.source,
     spends: countCoreSpends(input.applications),
     start: coreWindowMetricStart(input.applications, input.bounds.firstHeight),
     totalMs: Date.now() - input.totalStartedAt,

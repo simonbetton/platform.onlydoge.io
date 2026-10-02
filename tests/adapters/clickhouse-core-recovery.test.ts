@@ -89,8 +89,109 @@ describe.skipIf(process.env.ONLYDOGE_RUN_ADAPTER_TESTS !== '1')(
       },
       adapterTimeoutMs,
     );
+
+    it(
+      'waits for nothing and deletes nothing when the tail is already clean',
+      async () => {
+        await resetClickHouse();
+        const store = await openMetadata('recovery-clean-tail');
+        try {
+          const adapter = await bootWarehouse(store);
+          const applications = recoveryWindowApplications();
+          const baseline = await applyCleanWindow(adapter, applications);
+
+          await adapter.recoverCoreDogecoinWindow(3);
+
+          expect(await readCoreWindowCounts()).toEqual(baseline);
+          await expect(adapter.getCoreProcessedTail()).resolves.toBe(2);
+        } finally {
+          await store.close();
+        }
+      },
+      adapterTimeoutMs,
+    );
+
+    it(
+      'materializes current state and converges when ranges are resumed or replayed',
+      async () => {
+        await resetClickHouse();
+        const store = await openMetadata('materialization');
+        try {
+          const adapter = await bootWarehouse(store);
+          await expect(adapter.getCoreProcessedTail()).resolves.toBeNull();
+          await applyCleanWindow(adapter, recoveryWindowApplications());
+
+          const completed: number[] = [];
+          await adapter.materializeCoreDogecoinCurrentState(2, {
+            materialization: {
+              onRangeCompleted: ({ completedRanges }) => {
+                completed.push(completedRanges);
+              },
+            },
+          });
+          const baseline = await readCurrentState();
+          expect(completed).toHaveLength(258);
+          expect(baseline).toEqual({
+            appliedBlocks: 2,
+            balances: [{ address: 'DRecoveryAddress', balance: '100000000' }],
+            unspentOutputs: ['spend-tx:0'],
+          });
+
+          // Every range finished, the derived tables did not: only those are rebuilt.
+          await adapter.materializeCoreDogecoinCurrentState(2, {
+            materialization: { resumeFrom: { completedRanges: 258, rangeCount: 258 } },
+          });
+          expect(await readCurrentState()).toEqual(baseline);
+
+          // The tail of the range list is replayed on top of rows it already wrote.
+          await adapter.materializeCoreDogecoinCurrentState(2, {
+            materialization: { resumeFrom: { completedRanges: 3, rangeCount: 258 } },
+          });
+          expect(await readCurrentState()).toEqual(baseline);
+
+          // A checkpoint for another range split is not trusted: start over.
+          await adapter.materializeCoreDogecoinCurrentState(2, {
+            materialization: { resumeFrom: { completedRanges: 3, rangeCount: 4098 } },
+          });
+          expect(await readCurrentState()).toEqual(baseline);
+        } finally {
+          await store.close();
+        }
+      },
+      adapterTimeoutMs,
+    );
   },
 );
+
+async function readCurrentState(): Promise<{
+  appliedBlocks: number;
+  balances: Array<{ address: string; balance: string }>;
+  unspentOutputs: string[];
+}> {
+  const client = clickHouseClient();
+  try {
+    const rows = async <T>(query: string): Promise<T[]> => {
+      const result = await client.query({ query, format: 'JSONEachRow' });
+      return (await result.json<T>()) as T[];
+    };
+    const outputs = await rows<{ output_key: string }>(
+      'SELECT output_key FROM dogecoin_utxo_outputs_current_v1 FINAL WHERE spent_by_txid IS NULL ORDER BY output_key',
+    );
+    const balances = await rows<{ address: string; balance: string }>(
+      'SELECT address, balance FROM dogecoin_balances_current_v1 FINAL ORDER BY address',
+    );
+    const appliedBlocks = await rows<{ count: number | string }>(
+      'SELECT count() AS count FROM dogecoin_applied_blocks_v1',
+    );
+    return {
+      appliedBlocks: Number(appliedBlocks[0]?.count ?? 0),
+      balances,
+      unspentOutputs: outputs.map((row) => row.output_key),
+    };
+  } finally {
+    await client.close();
+  }
+}
 
 async function applyCleanWindow(
   adapter: ClickHouseWarehouseAdapter,

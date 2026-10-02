@@ -26,6 +26,7 @@ x-onlydoge-env: &onlydoge-env
 
 x-onlydoge-indexer-env: &onlydoge-indexer-env
   <<: *onlydoge-env
+  ONLYDOGE_DATABASE_POOL_MAX: ${ONLYDOGE_DATABASE_POOL_MAX:-64}
   ONLYDOGE_DOGECOIN_ZMQ_BLOCK_ENDPOINT: ${ONLYDOGE_DOGECOIN_ZMQ_BLOCK_ENDPOINT:-tcp://dogecoin:28332}
   ONLYDOGE_DOGECOIN_ZMQ_TX_ENDPOINT: ${ONLYDOGE_DOGECOIN_ZMQ_TX_ENDPOINT:-tcp://dogecoin:28332}
   ONLYDOGE_INDEXER_LEASE_HEARTBEAT_INTERVAL_MS: ${ONLYDOGE_INDEXER_LEASE_HEARTBEAT_INTERVAL_MS:-5000}
@@ -34,6 +35,9 @@ x-onlydoge-indexer-env: &onlydoge-indexer-env
   ONLYDOGE_INDEXER_SYNC_CONCURRENCY: ${ONLYDOGE_INDEXER_SYNC_CONCURRENCY:-8}
   ONLYDOGE_INDEXER_SYNC_RETRY_ATTEMPTS: ${ONLYDOGE_INDEXER_SYNC_RETRY_ATTEMPTS:-6}
   ONLYDOGE_INDEXER_SYNC_RETRY_BASE_DELAY_MS: ${ONLYDOGE_INDEXER_SYNC_RETRY_BASE_DELAY_MS:-500}
+  ONLYDOGE_CORE_BACKFILL_BLOCK_SOURCE: ${ONLYDOGE_CORE_BACKFILL_BLOCK_SOURCE:-auto}
+  ONLYDOGE_CORE_BACKFILL_WINDOW_BLOCKS: ${ONLYDOGE_CORE_BACKFILL_WINDOW_BLOCKS:-2000}
+  ONLYDOGE_CORE_BACKFILL_WINDOW_ROWS: ${ONLYDOGE_CORE_BACKFILL_WINDOW_ROWS:-200000}
   ONLYDOGE_CORE_BLOCK_TIMEOUT_MS: ${ONLYDOGE_CORE_BLOCK_TIMEOUT_MS:-120000}
   ONLYDOGE_CORE_DB_STATEMENT_TIMEOUT_MS: ${ONLYDOGE_CORE_DB_STATEMENT_TIMEOUT_MS:-30000}
   ONLYDOGE_CORE_SYNC_COMPLETE_DISTANCE: ${ONLYDOGE_CORE_SYNC_COMPLETE_DISTANCE:-6}
@@ -50,6 +54,8 @@ services:
   postgres:
     image: postgres:17-alpine
     restart: unless-stopped
+    # Shutdown writes a checkpoint; on slow disks that outlasts Docker's 10 s default.
+    stop_grace_period: 2m
     environment:
       POSTGRES_DB: ${POSTGRES_DB:-onlydoge}
       POSTGRES_USER: ${POSTGRES_USER:-onlydoge}
@@ -64,17 +70,22 @@ services:
       - postgres_data:/var/lib/postgresql/data
 
   minio:
-    image: minio/minio:RELEASE.2025-09-07T16-13-09Z@sha256:14cea493d9a34af32f524e538b8346cf79f3321eff8e708c1e2960462bd8936e
+    image: quay.io/minio/minio:RELEASE.2025-09-07T16-13-09Z@sha256:14cea493d9a34af32f524e538b8346cf79f3321eff8e708c1e2960462bd8936e
     restart: unless-stopped
     command: ['server', '/data', '--console-address', ':9001']
     environment:
       MINIO_ROOT_USER: ${MINIO_ROOT_USER:-onlydoge}
       MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:-onlydoge123}
+      # Raw storage is millions of one-object prefixes on a single drive with
+      # no versioning, lifecycle, or replication, so MinIO's background scanner
+      # has nothing to do but re-read every object's metadata in a loop. Left
+      # at the default speed it was the largest steady reader on the data disk.
+      MINIO_SCANNER_SPEED: ${MINIO_SCANNER_SPEED:-slowest}
     volumes:
       - minio_data:/data
 
   minio-create-bucket:
-    image: minio/mc:RELEASE.2025-08-13T08-35-41Z@sha256:a7fe349ef4bd8521fb8497f55c6042871b2ae640607cf99d9bede5e9bdf11727
+    image: quay.io/minio/mc:RELEASE.2025-08-13T08-35-41Z@sha256:a7fe349ef4bd8521fb8497f55c6042871b2ae640607cf99d9bede5e9bdf11727
     depends_on:
       - minio
     entrypoint:
@@ -95,6 +106,7 @@ services:
   clickhouse:
     image: clickhouse/clickhouse-server:26.6.1.1193@sha256:1d1f6508eba2dccce2cee9913907c5f7766327debc57a6b1991f2c9e3176c163
     restart: unless-stopped
+    stop_grace_period: 2m
     # Hard cgroup ceiling. ClickHouse derives max_server_memory_usage from this
     # limit (see docker/clickhouse/config.d/onlydoge-memory.xml); keep the two
     # in step if you change it. memswap_limit == mem_limit disables swap.
@@ -130,6 +142,10 @@ services:
       context: docker/dogecoin
     image: onlydoge/dogecoin-core:1.14.9
     restart: unless-stopped
+    # dogecoind flushes its UTXO cache (up to DOGECOIN_DBCACHE MB) on shutdown. A
+    # SIGKILL after Docker's 10 s default mid-flush forces a long chainstate
+    # replay on the next start.
+    stop_grace_period: 10m
     environment:
       DOGECOIN_UACOMMENT: ${DOGECOIN_UACOMMENT:-OnlyDoge}
       DOGECOIN_RPC_USER: ${DOGECOIN_RPC_USER:-onlydoge}
