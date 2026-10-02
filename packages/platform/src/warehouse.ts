@@ -1,4 +1,5 @@
 import { AsyncLocalStorage } from 'node:async_hooks';
+import { randomUUID } from 'node:crypto';
 import { mkdir, readFile, writeFile } from 'node:fs/promises';
 import { dirname } from 'node:path';
 
@@ -52,9 +53,11 @@ import {
 
 import {
   buildCoreCurrentStateOutputKeyRanges,
+  type ClickHouseStringRange,
   clickHouseCoreDogecoinTables,
   clickHouseStringRangeClause,
   clickHouseStringRangeParams,
+  coreCurrentStateRangePrefixLength,
 } from './clickhouse-core-dogecoin';
 import { runClickHouseMigrations } from './clickhouse-migrations';
 import type { ClickHouseCoreDogecoinStore } from './core-dogecoin-state-store';
@@ -70,6 +73,7 @@ import {
   clickHousePagination,
   createAbortableRequestContext,
   formatBalanceTupleList,
+  formatClickHouseStringLiteral,
   queryTimeoutMs,
   toAddressMovementInsertRow,
   toAnalyticsBalanceCurrentInsertRow,
@@ -178,6 +182,20 @@ const explorerClickHouseSettings: ClickHouseCommandSettings = {
   timeout_before_checking_execution_speed: 0,
 };
 /**
+ * Core window inserts are large, single-writer batches: write each one
+ * straight into a part instead of parking it in the async-insert buffer and
+ * waiting out the flush timeout.
+ */
+const coreWindowInsertSettings: ClickHouseCommandSettings = {
+  async_insert: 0,
+};
+/**
+ * Every core window insert carries a query id with this prefix, so cleanup can
+ * tell whether an insert abandoned by its client is still running on the server.
+ */
+const coreWindowQueryIdPrefix = 'onlydoge-core-window-';
+const coreWindowInsertDrainPollMs = 500;
+/**
  * Memory ceiling for the heavy INSERT ... SELECT joins (current-state
  * materialization, analytics backfill). The anti-joins there only run with
  * `hash` or `grace_hash`; `grace_hash` re-buckets to disk once the in-memory
@@ -200,7 +218,16 @@ const coreUtxoSpendsTable = clickHouseCoreDogecoinTables.coreUtxoSpends;
 const utxoCurrentStateTable = clickHouseCoreDogecoinTables.currentUtxos;
 const utxoCurrentStateByAddressTable = clickHouseCoreDogecoinTables.currentUtxosByAddress;
 const transactionRefsTable = 'dogecoin_transaction_refs_v1';
-const coreCurrentStateOutputKeyRanges = buildCoreCurrentStateOutputKeyRanges();
+/** Rows of the by-address current-state table that one balance statement aggregates. */
+const coreBalanceRowsPerRange = 500_000;
+/** Processed blocks copied into the applied-block list per statement. */
+const coreAppliedBlockHeightsPerRange = 500_000;
+/**
+ * Materialization statements are bounded by the server-side
+ * `max_execution_time`, so the HTTP client that runs them only needs a request
+ * timeout that never fires first.
+ */
+const coreMaterializationRequestTimeoutMs = 3_600_000;
 type ClickHouseClient = ReturnType<typeof createClient>;
 type ClickHouseCommandParameters = Parameters<ClickHouseClient['command']>[0];
 type ClickHouseCommandSettings = NonNullable<ClickHouseCommandParameters['clickhouse_settings']>;
@@ -279,6 +306,10 @@ export class InMemoryWarehouseAdapter
   ): Promise<void> {
     this.rebuildBalancesFromCurrentUtxos();
     await this.afterMutation();
+  }
+
+  public async getCoreProcessedTail(): Promise<number | null> {
+    return this.getAppliedBlockTail();
   }
 
   public async recoverCoreDogecoinWindow(
@@ -1285,6 +1316,7 @@ export class ClickHouseWarehouseAdapter
 {
   private readonly client: ReturnType<typeof createClient>;
   private readonly analyticsClient: ReturnType<typeof createClient> | null;
+  private materializationClient: ReturnType<typeof createClient> | null = null;
   private readonly explorerReadContext = new AsyncLocalStorage<boolean>();
   private readonly logger: ServiceLogger;
   private readonly requestTimeoutMs: number;
@@ -1330,6 +1362,25 @@ export class ClickHouseWarehouseAdapter
     context?: CoreDogecoinApplyContext,
   ): Promise<void> {
     await this.rewindCoreDogecoinWindow(fromBlockHeight, context);
+  }
+
+  public async getCoreProcessedTail(): Promise<number | null> {
+    // Reads the last granule of each part in primary-key order. `max()` would
+    // need a row count beside it to tell an empty table from height 0, and
+    // neither is answered from part metadata once a rewind has left
+    // lightweight-deleted rows behind.
+    const rows = await this.queryRows<{ tail?: number | string }>({
+      query: `
+        SELECT block_height AS tail
+        FROM ${coreProcessedBlocksTable}
+        ORDER BY block_height DESC
+        LIMIT 1
+      `,
+      format: 'JSONEachRow',
+    });
+    const [row] = Array.isArray(rows) ? rows : [];
+
+    return row?.tail === undefined ? null : Number(row.tail);
   }
 
   private async applyCoreDogecoinWindowWithDeadline(
@@ -1408,6 +1459,7 @@ export class ClickHouseWarehouseAdapter
     fromBlockHeight: number,
     context: CoreDogecoinApplyContext | undefined,
   ): Promise<void> {
+    await this.waitForCoreWindowInserts(context);
     const settings = {
       ...clickHouseCoreMaterializationSettings(context),
       enable_lightweight_delete: 1 as const,
@@ -1483,13 +1535,16 @@ export class ClickHouseWarehouseAdapter
 
     await this.insertCoreCurrentStateMaterialization({
       asOfBlockHeight,
+      completedRanges: 0,
       createsTable: coreUtxoCreatesTable,
       spendsTable: coreUtxoSpendsTable,
       currentUtxosTable: utxoCurrentStateTable,
       currentUtxosByAddressTable: utxoCurrentStateByAddressTable,
       balancesTable,
       appliedBlocksTable,
+      dedupeByAddress: true,
       processedBlocksTable: coreProcessedBlocksTable,
+      ranges: await this.coreCurrentStateRanges(coreUtxoCreatesTable),
       ...coreApplyContextOption(context),
     });
   }
@@ -1521,32 +1576,112 @@ export class ClickHouseWarehouseAdapter
     context: CoreDogecoinApplyContext | undefined,
     requestContext: ClickHouseRequestContext,
   ): Promise<void> {
-    const createRows = pending.flatMap((application) => application.utxoCreates);
-    const spendRows = pending.flatMap((application) => application.utxoSpends);
-    await this.insertRows(
-      coreUtxoCreatesTable,
-      createRows.map(toCoreUtxoCreateInsertRow),
-      requestContext,
-    );
-    await runCoreWindowInsertStageHook(context, 'creates');
-    await this.insertRows(
-      coreUtxoSpendsTable,
-      spendRows.map(toCoreUtxoSpendInsertRow),
-      requestContext,
-    );
-    await runCoreWindowInsertStageHook(context, 'spends');
-    await this.insertCoreAddressMovements(pending, requestContext);
-    await runCoreWindowInsertStageHook(context, 'movements');
-    await this.insertCoreTransactionFacts(pending, requestContext);
-    await runCoreWindowInsertStageHook(context, 'transactions');
-    await this.applyCoreCurrentStateWindowIfEnabled(pending, context, requestContext);
+    // Everything that can fail on missing state is resolved before the first
+    // insert: prevouts are read once and shared by movements, transaction
+    // facts, and the current-state update.
+    const prevouts = await this.loadCoreWindowPrevouts(pending, context, requestContext);
+    const currentState = shouldUpdateCoreCurrentState(context)
+      ? await this.buildCoreCurrentStateWindow(pending, prevouts, requestContext)
+      : null;
+
+    await this.insertCoreWindowFacts(pending, prevouts, context, requestContext);
+    if (currentState) {
+      await this.insertCoreCurrentStateWindow(currentState, pending, requestContext);
+    }
     await runCoreWindowInsertStageHook(context, 'current_state');
-    await this.insertRows(
+    await this.insertCoreWindowRows(
       coreProcessedBlocksTable,
       pending.map(toCoreProcessedBlockInsertRow),
       requestContext,
     );
     await runCoreWindowInsertStageHook(context, 'processed_blocks');
+  }
+
+  /**
+   * Outputs spent by the window but created before it. They only exist in the
+   * current-state table, which is maintained once backfill has materialized
+   * it; until then the table is empty and the lookup is skipped.
+   */
+  private async loadCoreWindowPrevouts(
+    pending: CoreDogecoinBlockApplication[],
+    context: CoreDogecoinApplyContext | undefined,
+    requestContext: ClickHouseRequestContext,
+  ): Promise<Map<string, ProjectionUtxoOutput>> {
+    if (!shouldUpdateCoreCurrentState(context)) {
+      return new Map();
+    }
+
+    return this.getCurrentUtxoOutputMap(externalCoreSpendKeys(pending), requestContext);
+  }
+
+  /**
+   * The four fact tables are independent, so their inserts run concurrently.
+   * All of them are awaited before an error propagates: window recovery must
+   * never race an insert that is still in flight.
+   */
+  private async insertCoreWindowFacts(
+    pending: CoreDogecoinBlockApplication[],
+    prevouts: Map<string, ProjectionUtxoOutput>,
+    context: CoreDogecoinApplyContext | undefined,
+    requestContext: ClickHouseRequestContext,
+  ): Promise<void> {
+    const inserts = coreWindowFactInserts(pending, prevouts);
+    const outcomes = await Promise.allSettled(
+      inserts.map((insert) => this.insertCoreWindowRows(insert.table, insert.rows, requestContext)),
+    );
+    const failure = outcomes.find((outcome) => outcome.status === 'rejected');
+    if (failure) {
+      throw failure.reason;
+    }
+
+    for (const insert of inserts) {
+      await runCoreWindowInsertStageHook(context, insert.stage);
+    }
+  }
+
+  private insertCoreWindowRows(
+    table: string,
+    values: Record<string, unknown>[],
+    requestContext: ClickHouseRequestContext,
+  ): Promise<void> {
+    return this.insertRows(table, values, requestContext, {
+      queryId: `${coreWindowQueryIdPrefix}${randomUUID()}`,
+      settings: coreWindowInsertSettings,
+    });
+  }
+
+  /**
+   * A window insert whose request was abandoned (deadline hit, process killed)
+   * keeps running on the server once ClickHouse has the full body, and on slow
+   * disks it can finish tens of seconds later. Deleting a window's rows before
+   * such an insert lands would leave its rows behind and the replayed window
+   * would duplicate them, so tail cleanup first waits for every core window
+   * insert to leave the server's process list.
+   */
+  private async waitForCoreWindowInserts(
+    context: CoreDogecoinApplyContext | undefined,
+  ): Promise<void> {
+    const deadline = Date.now() + coreWindowTimeoutMs(context, 300_000) * 2;
+    while ((await this.countRunningCoreWindowInserts()) > 0) {
+      if (Date.now() >= deadline) {
+        throw new InfrastructureError('core window inserts are still running on the warehouse');
+      }
+      await sleep(coreWindowInsertDrainPollMs);
+    }
+  }
+
+  private async countRunningCoreWindowInserts(): Promise<number> {
+    const rows = await this.queryRows<{ running?: number | string }>({
+      query: `
+        SELECT count() AS running
+        FROM system.processes
+        WHERE startsWith(query_id, {queryIdPrefix:String})
+      `,
+      query_params: { queryIdPrefix: coreWindowQueryIdPrefix },
+      format: 'JSONEachRow',
+    });
+
+    return Number(Array.isArray(rows) ? (rows[0]?.running ?? 0) : 0);
   }
 
   private async insertPendingCoreWindowWithRecovery(
@@ -1636,79 +1771,9 @@ export class ClickHouseWarehouseAdapter
     );
   }
 
-  private async insertCoreAddressMovements(
-    pending: CoreDogecoinBlockApplication[],
-    requestContext: ClickHouseRequestContext,
-  ): Promise<void> {
-    const movements = await this.buildCoreAddressMovements(pending, requestContext);
-    await this.insertRows(
-      addressMovementsTable,
-      movements.map(toAddressMovementInsertRow),
-      requestContext,
-    );
-  }
-
-  private async buildCoreAddressMovements(
-    pending: CoreDogecoinBlockApplication[],
-    requestContext: ClickHouseRequestContext,
-  ): Promise<AddressMovement[]> {
-    const createdOutputs = coreCreatedOutputsByKey(pending);
-    const currentOutputs = await this.getCurrentUtxoOutputMap(
-      externalCoreSpendKeys(pending),
-      requestContext,
-    );
-
-    return pending.flatMap((application) =>
-      coreApplicationAddressMovements(application, createdOutputs, currentOutputs),
-    );
-  }
-
-  private async insertCoreTransactionFacts(
-    pending: CoreDogecoinBlockApplication[],
-    requestContext: ClickHouseRequestContext,
-  ): Promise<void> {
-    const createdOutputs = coreCreatedOutputsByKey(pending);
-    const currentOutputs = await this.getCurrentUtxoOutputMap(
-      externalCoreSpendKeys(pending),
-      requestContext,
-    );
-    const facts = pending.flatMap((application) =>
-      coreApplicationTransactionFacts(application, createdOutputs, currentOutputs),
-    );
-
-    await this.insertRows(
-      analyticsTransactionsTable,
-      facts.map(toAnalyticsTransactionFactInsertRow),
-      requestContext,
-    );
-  }
-
-  private async applyCoreCurrentStateWindowIfEnabled(
-    pending: CoreDogecoinBlockApplication[],
-    context: CoreDogecoinApplyContext | undefined,
-    requestContext: ClickHouseRequestContext,
-  ): Promise<void> {
-    if (!shouldUpdateCoreCurrentState(context)) {
-      return;
-    }
-
-    await this.applyCoreCurrentStateWindow(pending, requestContext);
-  }
-
-  private async applyCoreCurrentStateWindow(
-    pending: CoreDogecoinBlockApplication[],
-    requestContext: ClickHouseRequestContext,
-  ): Promise<void> {
-    const currentState = await this.buildCoreCurrentStateWindow(pending, requestContext);
-    if (!currentState) {
-      return;
-    }
-
-    await this.insertCoreCurrentStateWindow(currentState, pending, requestContext);
-  }
-
   private async buildCoreCurrentStateWindow(
     pending: CoreDogecoinBlockApplication[],
+    prevouts: Map<string, ProjectionUtxoOutput>,
     requestContext: ClickHouseRequestContext,
   ): Promise<CoreCurrentStateWindow | null> {
     const windowEnd = coreWindowEnd(pending);
@@ -1716,11 +1781,7 @@ export class ClickHouseWarehouseAdapter
       return null;
     }
 
-    const currentOutputs = await this.getCurrentUtxoOutputMap(
-      coreWindowSpendKeys(pending),
-      requestContext,
-    );
-    const mutation = applyCoreCurrentStateMutations(pending, currentOutputs);
+    const mutation = applyCoreCurrentStateMutations(pending, prevouts);
     const currentBalances = await this.getBalanceRowsByKeys(
       [...mutation.balanceDeltas.keys()],
       requestContext,
@@ -1738,52 +1799,88 @@ export class ClickHouseWarehouseAdapter
     pending: CoreDogecoinBlockApplication[],
     requestContext: ClickHouseRequestContext,
   ): Promise<void> {
-    await this.insertRows(
+    await this.insertCoreWindowRows(
       utxoCurrentStateTable,
       [...currentState.nextOutputs.values()].map((row) =>
         toUtxoInsertRow(row, coreCurrentUtxoVersion(row)),
       ),
       requestContext,
     );
-    await this.insertRows(
+    await this.insertCoreWindowRows(
       balancesTable,
       currentState.nextBalances.map((row) => toBalanceInsertRow(row, row.version)),
       requestContext,
     );
-    await this.insertRows(
+    await this.insertCoreWindowRows(
       analyticsBalancesCurrentTable,
       currentState.nextBalances.map((row) => toAnalyticsBalanceCurrentInsertRow(row, row.version)),
       requestContext,
     );
-    await this.insertRows(
+    await this.insertCoreWindowRows(
       appliedBlocksTable,
       toProjectionAppliedBlocks(pending).map(toAppliedBlockInsertRow),
       requestContext,
     );
   }
 
+  /**
+   * Builds current UTXOs, balances, and the applied-block list from the core
+   * fact tables. The work is a sequence of bounded statements (output-key
+   * ranges, then address ranges, then height ranges) so none of them depends
+   * on scanning a whole table inside one statement timeout, and the UTXO
+   * phase, which reads every create and spend, can resume where a failed
+   * attempt stopped (`context.materialization.resumeFrom`).
+   *
+   * Re-running a range is safe: current-state tables replace by key and
+   * version, and balances are aggregated over deduplicated rows.
+   */
   public async materializeCoreDogecoinCurrentState(
     asOfBlockHeight: number,
     context?: CoreDogecoinApplyContext,
   ): Promise<void> {
-    await this.clearCoreDogecoinCurrentState({
-      currentUtxosTable: utxoCurrentStateTable,
-      currentUtxosByAddressTable: utxoCurrentStateByAddressTable,
-      balancesTable,
-      appliedBlocksTable,
-      ...coreApplyContextOption(context),
-    });
+    const ranges = await this.coreCurrentStateRanges(coreUtxoCreatesTable);
+    const completedRanges = resumableCompletedRanges(context, ranges.length);
+    if (completedRanges === 0) {
+      await this.clearCoreDogecoinCurrentState({
+        currentUtxosTable: utxoCurrentStateTable,
+        currentUtxosByAddressTable: utxoCurrentStateByAddressTable,
+        balancesTable,
+        appliedBlocksTable,
+        ...coreApplyContextOption(context),
+      });
+    }
     await this.insertCoreCurrentStateMaterialization({
       asOfBlockHeight,
+      completedRanges,
       createsTable: coreUtxoCreatesTable,
       spendsTable: coreUtxoSpendsTable,
       currentUtxosTable: utxoCurrentStateTable,
       currentUtxosByAddressTable: utxoCurrentStateByAddressTable,
       balancesTable,
       appliedBlocksTable,
+      dedupeByAddress: true,
       processedBlocksTable: coreProcessedBlocksTable,
+      ranges,
       ...coreApplyContextOption(context),
     });
+  }
+
+  /** Output-key ranges sized to the number of created outputs. */
+  private async coreCurrentStateRanges(createsTable: string): Promise<ClickHouseStringRange[]> {
+    const rows = await this.queryRows<{ rows?: number | string }>({
+      query: `
+        SELECT sum(rows) AS rows
+        FROM system.parts
+        WHERE database = currentDatabase() AND table = {table:String} AND active
+      `,
+      query_params: { table: createsTable },
+      format: 'JSONEachRow',
+    });
+    const createdOutputRows = Number(Array.isArray(rows) ? (rows[0]?.rows ?? 0) : 0);
+
+    return buildCoreCurrentStateOutputKeyRanges(
+      coreCurrentStateRangePrefixLength(createdOutputRows),
+    );
   }
 
   private async clearCoreDogecoinCurrentState(input: {
@@ -1804,12 +1901,12 @@ export class ClickHouseWarehouseAdapter
       input.balancesTable,
       input.appliedBlocksTable,
     ]) {
-      await this.executeCommand({
+      await this.executeMaterializationCommand({
         query: `ALTER TABLE ${table} DELETE WHERE 1 = 1`,
         clickhouse_settings: mutationSettings,
       });
     }
-    await this.executeCommand({
+    await this.executeMaterializationCommand({
       query: `ALTER TABLE ${analyticsBalancesCurrentTable} DELETE WHERE 1 = 1`,
       clickhouse_settings: mutationSettings,
     });
@@ -1881,13 +1978,17 @@ export class ClickHouseWarehouseAdapter
     });
     await this.insertCoreCurrentStateMaterialization({
       asOfBlockHeight,
+      completedRanges: 0,
       createsTable: tables.creates,
       spendsTable: tables.spends,
       currentUtxosTable: tables.currentUtxos,
       currentUtxosByAddressTable: tables.currentUtxos,
       balancesTable: tables.balances,
       appliedBlocksTable: tables.appliedBlocks,
+      // Benchmark tables are plain MergeTree: written once, nothing to deduplicate.
+      dedupeByAddress: false,
       processedBlocksTable: tables.processedBlocks,
+      ranges: await this.coreCurrentStateRanges(tables.creates),
     });
   }
 
@@ -1897,20 +1998,27 @@ export class ClickHouseWarehouseAdapter
     }
   }
 
-  private async insertCoreCurrentStateMaterialization(input: {
-    appliedBlocksTable: string;
-    asOfBlockHeight: number;
-    balancesTable: string;
-    createsTable: string;
-    currentUtxosByAddressTable: string;
-    currentUtxosTable: string;
-    context?: CoreDogecoinApplyContext;
-    processedBlocksTable: string;
-    spendsTable: string;
-  }): Promise<void> {
+  private async insertCoreCurrentStateMaterialization(
+    input: CoreCurrentStateMaterialization,
+  ): Promise<void> {
+    await this.insertCoreCurrentUtxoRanges(input);
+    // Balances and applied blocks are derived from the finished UTXO set. After
+    // a resume they may hold rows from the attempt that failed, so start clean.
+    if (input.completedRanges > 0) {
+      await this.clearCoreDerivedState(input);
+    }
+    await this.insertCoreCurrentBalances(input);
+    await this.insertCoreAppliedBlocks(input);
+  }
+
+  private async insertCoreCurrentUtxoRanges(input: CoreCurrentStateMaterialization): Promise<void> {
     const materializationSettings = clickHouseCoreMaterializationSettings(input.context);
-    for (const range of coreCurrentStateOutputKeyRanges) {
-      await this.executeCommand({
+    for (const [index, range] of input.ranges.entries()) {
+      if (index < input.completedRanges) {
+        continue;
+      }
+
+      await this.executeMaterializationCommand({
         query: `
           INSERT INTO ${input.currentUtxosTable} (
             block_height,
@@ -1973,79 +2081,157 @@ export class ClickHouseWarehouseAdapter
         },
         clickhouse_settings: materializationSettings,
       });
+      await input.context?.materialization?.onRangeCompleted?.({
+        completedRanges: index + 1,
+        rangeCount: input.ranges.length,
+      });
     }
-    await this.executeCommand({
+  }
+
+  private async clearCoreDerivedState(input: CoreCurrentStateMaterialization): Promise<void> {
+    const mutationSettings = {
+      ...clickHouseCoreMaterializationSettings(input.context),
+      mutations_sync: '2',
+    };
+    for (const table of [
+      input.balancesTable,
+      analyticsBalancesCurrentTable,
+      input.appliedBlocksTable,
+    ]) {
+      await this.executeMaterializationCommand({
+        query: `ALTER TABLE ${table} DELETE WHERE 1 = 1`,
+        clickhouse_settings: mutationSettings,
+      });
+    }
+  }
+
+  /**
+   * One balance per address, aggregated in primary-key order over address
+   * ranges of roughly `coreBalanceRowsPerRange` rows. `FINAL` collapses rows a
+   * replayed range wrote twice; without it those outputs would count double.
+   */
+  private async insertCoreCurrentBalances(input: CoreCurrentStateMaterialization): Promise<void> {
+    const settings = {
+      ...clickHouseCoreMaterializationSettings(input.context),
+      optimize_aggregation_in_order: 1 as const,
+    };
+    const source = `${input.currentUtxosByAddressTable}${input.dedupeByAddress ? ' FINAL' : ''}`;
+    for (const range of await this.coreBalanceAddressRanges(input.currentUtxosByAddressTable)) {
+      for (const table of [input.balancesTable, analyticsBalancesCurrentTable]) {
+        await this.executeMaterializationCommand({
+          query: `
+            INSERT INTO ${table} (
+              address,
+              asset_address,
+              balance,
+              as_of_block_height,
+              version
+            )
+            SELECT
+              address,
+              '',
+              toString(sum(toInt256(value_base))),
+              {asOfBlockHeight:UInt64},
+              {asOfBlockHeight:UInt64}
+            FROM ${source}
+            WHERE
+              is_spendable = 1
+              AND address != ''
+              AND spent_by_txid IS NULL
+              ${clickHouseStringRangeClause('address', range)}
+            GROUP BY address
+          `,
+          query_params: {
+            ...clickHouseStringRangeParams(range),
+            asOfBlockHeight: input.asOfBlockHeight,
+          },
+          clickhouse_settings: settings,
+        });
+      }
+      await input.context?.materialization?.onActivity?.();
+    }
+  }
+
+  /**
+   * Address boundaries read from the table's primary index (one value per
+   * granule, no data scan), so every range holds a similar number of rows
+   * however skewed the address distribution is. An address never straddles
+   * two ranges.
+   */
+  private async coreBalanceAddressRanges(table: string): Promise<ClickHouseStringRange[]> {
+    const rows = await this.queryRows<{ boundary?: string }>({
       query: `
-        INSERT INTO ${input.balancesTable} (
-          address,
-          asset_address,
-          balance,
-          as_of_block_height,
-          version
-        )
-        SELECT
-          address,
-          '',
-          toString(sum(toInt256(value_base))),
-          {asOfBlockHeight:UInt64},
-          {asOfBlockHeight:UInt64}
-        FROM ${input.currentUtxosByAddressTable}
-        WHERE
-          is_spendable = 1
-          AND address != ''
-          AND spent_by_txid IS NULL
-        GROUP BY address
-      `,
-      query_params: { asOfBlockHeight: input.asOfBlockHeight },
-      clickhouse_settings: {
-        ...materializationSettings,
-        optimize_aggregation_in_order: 1,
-      },
-    });
-    await this.executeCommand({
-      query: `
-        INSERT INTO ${analyticsBalancesCurrentTable} (
-          address,
-          asset_address,
-          balance,
-          as_of_block_height,
-          version
-        )
-        SELECT
-          address,
-          '',
-          toString(sum(toInt256(value_base))),
-          {asOfBlockHeight:UInt64},
-          {asOfBlockHeight:UInt64}
-        FROM ${input.currentUtxosByAddressTable}
-        WHERE
-          is_spendable = 1
-          AND address != ''
-          AND spent_by_txid IS NULL
-        GROUP BY address
-      `,
-      query_params: { asOfBlockHeight: input.asOfBlockHeight },
-      clickhouse_settings: {
-        ...materializationSettings,
-        optimize_aggregation_in_order: 1,
-      },
-    });
-    await this.executeCommand({
-      query: `
-        INSERT INTO ${input.appliedBlocksTable} (block_height, block_hash)
-        SELECT block_height, block_hash
+        SELECT min(address) AS boundary
         FROM (
-          SELECT block_height, block_hash, version
-          FROM ${input.processedBlocksTable}
-          WHERE
-            block_height <= {asOfBlockHeight:UInt64}
-          ORDER BY block_height ASC, version DESC
-          LIMIT 1 BY block_height
+          SELECT
+            address,
+            intDiv(
+              sum(rows_in_granule) OVER (
+                ORDER BY address ASC, part_name ASC, mark_number ASC
+                ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
+              ),
+              {rowsPerRange:UInt64}
+            ) AS bucket
+          FROM mergeTreeIndex(currentDatabase(), ${formatClickHouseStringLiteral(table)})
         )
+        GROUP BY bucket
+        ORDER BY boundary ASC
       `,
-      query_params: { asOfBlockHeight: input.asOfBlockHeight },
-      clickhouse_settings: materializationSettings,
+      query_params: { rowsPerRange: coreBalanceRowsPerRange },
+      format: 'JSONEachRow',
     });
+
+    return stringRangesFromBoundaries(
+      (Array.isArray(rows) ? rows : []).map((row) => row.boundary ?? ''),
+    );
+  }
+
+  private async insertCoreAppliedBlocks(input: CoreCurrentStateMaterialization): Promise<void> {
+    const materializationSettings = clickHouseCoreMaterializationSettings(input.context);
+    for (
+      let startHeight = 0;
+      startHeight <= input.asOfBlockHeight;
+      startHeight += coreAppliedBlockHeightsPerRange
+    ) {
+      await this.executeMaterializationCommand({
+        query: `
+          INSERT INTO ${input.appliedBlocksTable} (block_height, block_hash)
+          SELECT block_height, block_hash
+          FROM (
+            SELECT block_height, block_hash, version
+            FROM ${input.processedBlocksTable}
+            WHERE
+              block_height >= {startHeight:UInt64}
+              AND block_height <= {endHeight:UInt64}
+            ORDER BY block_height ASC, version DESC
+            LIMIT 1 BY block_height
+          )
+        `,
+        query_params: {
+          startHeight,
+          endHeight: Math.min(
+            input.asOfBlockHeight,
+            startHeight + coreAppliedBlockHeightsPerRange - 1,
+          ),
+        },
+        clickhouse_settings: materializationSettings,
+      });
+      await input.context?.materialization?.onActivity?.();
+    }
+  }
+
+  /** Runs one materialization statement on the client with the long request timeout. */
+  private async executeMaterializationCommand(
+    parameters: ClickHouseCommandParameters,
+  ): Promise<void> {
+    this.materializationClient ??= createClient(
+      clickHouseClientOptions(this.settings, coreMaterializationRequestTimeoutMs),
+    );
+    try {
+      await this.materializationClient.command(parameters);
+    } catch (error) {
+      throw this.toInfrastructureError(error);
+    }
   }
 
   public async getCurrentAddressSummary(address: string) {
@@ -3084,6 +3270,41 @@ export class ClickHouseWarehouseAdapter
       return new Map();
     }
 
+    const heightRange = contiguousHeightRange(blockHeights);
+    const rows = heightRange
+      ? await this.queryCoreProcessedBlockRange(heightRange, requestContext)
+      : await this.queryCoreProcessedBlockChunks(blockHeights, requestContext);
+
+    return new Map(rows.map((row) => [Number(row.blockHeight), row]));
+  }
+
+  /** Windows are contiguous, so the usual lookup is one primary-key range read. */
+  private queryCoreProcessedBlockRange(
+    heightRange: { end: number; start: number },
+    requestContext?: ClickHouseRequestContext,
+  ): Promise<CoreProcessedBlockRow[]> {
+    return this.queryRows<CoreProcessedBlockRow>(
+      {
+        query: `
+          SELECT
+            block_height AS "blockHeight",
+            block_hash AS "blockHash"
+          FROM ${coreProcessedBlocksTable}
+          WHERE block_height >= {startHeight:UInt64} AND block_height <= {endHeight:UInt64}
+          ORDER BY block_height ASC, version DESC
+          LIMIT 1 BY block_height
+        `,
+        query_params: { startHeight: heightRange.start, endHeight: heightRange.end },
+        format: 'JSONEachRow',
+      },
+      requestContext,
+    );
+  }
+
+  private async queryCoreProcessedBlockChunks(
+    blockHeights: number[],
+    requestContext?: ClickHouseRequestContext,
+  ): Promise<CoreProcessedBlockRow[]> {
     const rowChunks = await Promise.all(
       chunkQueryValues([...new Set(blockHeights)]).map((chunk) =>
         this.queryRows<CoreProcessedBlockRow>(
@@ -3105,7 +3326,7 @@ export class ClickHouseWarehouseAdapter
       ),
     );
 
-    return new Map(rowChunks.flat().map((row) => [row.blockHeight, row]));
+    return rowChunks.flat();
   }
 
   private async getCoreUtxoCreateRows(
@@ -3186,6 +3407,7 @@ export class ClickHouseWarehouseAdapter
     table: string,
     values: Record<string, unknown>[],
     requestContext?: ClickHouseRequestContext,
+    options?: { queryId?: string; settings?: ClickHouseCommandSettings },
   ): Promise<void> {
     if (values.length === 0) {
       return;
@@ -3196,6 +3418,8 @@ export class ClickHouseWarehouseAdapter
         table,
         values,
         format: 'JSONEachRow',
+        ...(options?.settings ? { clickhouse_settings: options.settings } : {}),
+        ...(options?.queryId ? { query_id: options.queryId } : {}),
       },
       requestContext,
     );
@@ -3888,6 +4112,47 @@ function balanceKey(address: string, assetAddress: string): string {
   return `${address}:${assetAddress}`;
 }
 
+interface CoreCurrentStateMaterialization {
+  appliedBlocksTable: string;
+  asOfBlockHeight: number;
+  balancesTable: string;
+  /** Leading output-key ranges an earlier attempt already materialized. */
+  completedRanges: number;
+  context?: CoreDogecoinApplyContext;
+  createsTable: string;
+  currentUtxosByAddressTable: string;
+  currentUtxosTable: string;
+  dedupeByAddress: boolean;
+  processedBlocksTable: string;
+  ranges: ClickHouseStringRange[];
+  spendsTable: string;
+}
+
+function resumableCompletedRanges(
+  context: CoreDogecoinApplyContext | undefined,
+  rangeCount: number,
+): number {
+  const resumeFrom = context?.materialization?.resumeFrom;
+  if (!resumeFrom || resumeFrom.rangeCount !== rangeCount) {
+    return 0;
+  }
+
+  return Math.max(0, Math.min(rangeCount, Math.floor(resumeFrom.completedRanges)));
+}
+
+/** `[null, b1), [b1, b2), ..., [bn, null)` for sorted, distinct boundaries. */
+function stringRangesFromBoundaries(boundaries: string[]): ClickHouseStringRange[] {
+  const sorted = [...new Set(boundaries.filter((boundary) => boundary.length > 0))].sort();
+  const ranges: ClickHouseStringRange[] = [];
+  let start: string | null = null;
+  for (const boundary of sorted) {
+    ranges.push({ start, end: boundary });
+    start = boundary;
+  }
+  ranges.push({ start, end: null });
+  return ranges;
+}
+
 function coreApplyContextOption(context: CoreDogecoinApplyContext | undefined): {
   context?: CoreDogecoinApplyContext;
 } {
@@ -4075,6 +4340,10 @@ function clickHouseBool(value: boolean): number {
   return 0;
 }
 
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
 function abortReason(signal: AbortSignal): Error {
   if (signal.reason instanceof Error) {
     return signal.reason;
@@ -4244,12 +4513,6 @@ function coreWindowStart(pending: CoreDogecoinBlockApplication[]): number {
   return first.blockHeight;
 }
 
-function coreWindowSpendKeys(pending: CoreDogecoinBlockApplication[]): string[] {
-  return [
-    ...new Set(pending.flatMap((application) => application.utxoSpends.map(coreSpendOutputKey))),
-  ];
-}
-
 function externalCoreSpendKeys(applications: CoreDogecoinBlockApplication[]): string[] {
   const createdInWindow = new Set(
     applications.flatMap((application) =>
@@ -4263,6 +4526,65 @@ function externalCoreSpendKeys(applications: CoreDogecoinBlockApplication[]): st
         .filter((outputKey) => !createdInWindow.has(outputKey)),
     ),
   ];
+}
+
+interface CoreWindowFactInsert {
+  rows: Record<string, unknown>[];
+  stage: CoreWindowInsertStage;
+  table: string;
+}
+
+function coreWindowFactInserts(
+  pending: CoreDogecoinBlockApplication[],
+  prevouts: Map<string, ProjectionUtxoOutput>,
+): CoreWindowFactInsert[] {
+  const createdOutputs = coreCreatedOutputsByKey(pending);
+  return [
+    {
+      stage: 'creates',
+      table: coreUtxoCreatesTable,
+      rows: pending.flatMap((application) =>
+        application.utxoCreates.map(toCoreUtxoCreateInsertRow),
+      ),
+    },
+    {
+      stage: 'spends',
+      table: coreUtxoSpendsTable,
+      rows: pending.flatMap((application) => application.utxoSpends.map(toCoreUtxoSpendInsertRow)),
+    },
+    {
+      stage: 'movements',
+      table: addressMovementsTable,
+      rows: pending.flatMap((application) =>
+        coreApplicationAddressMovements(application, createdOutputs, prevouts).map(
+          toAddressMovementInsertRow,
+        ),
+      ),
+    },
+    {
+      stage: 'transactions',
+      table: analyticsTransactionsTable,
+      rows: pending.flatMap((application) =>
+        coreApplicationTransactionFacts(application, createdOutputs, prevouts).map(
+          toAnalyticsTransactionFactInsertRow,
+        ),
+      ),
+    },
+  ];
+}
+
+function contiguousHeightRange(blockHeights: number[]): { end: number; start: number } | null {
+  const start = blockHeights[0];
+  if (start === undefined) {
+    return null;
+  }
+
+  for (const [index, height] of blockHeights.entries()) {
+    if (height !== start + index) {
+      return null;
+    }
+  }
+  return { start, end: start + blockHeights.length - 1 };
 }
 
 function coreCreatedOutputsByKey(
@@ -4458,10 +4780,6 @@ function assertCorePrevoutsUnspent(
   if (alreadySpent) {
     throw new Error(`core dogecoin prevout already spent: ${alreadySpent}`);
   }
-}
-
-function coreSpendOutputKey(spend: CoreDogecoinSpend): string {
-  return spend.outputKey;
 }
 
 function applyCoreCurrentStateMutations(
