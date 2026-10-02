@@ -656,6 +656,35 @@ describe('clickhouse warehouse adapter', () => {
     expect(statements[2]).toContain('FROM dogecoin_utxo_outputs_current_v1');
   });
 
+  it('resets old_parts_lifetime on every table the schema created with it', () => {
+    const migrations = clickHouseMigrations();
+    const reset = migrations.find((migration) => migration.name === 'old_parts_lifetime_default');
+    const statements = (reset?.source ?? '')
+      .split(';')
+      .map((statement) => statement.trim())
+      .filter(Boolean);
+
+    // RESET SETTING only rewrites table metadata; anything else here could
+    // rewrite hundreds of gigabytes on a synced warehouse.
+    expect(statements.length).toBeGreaterThan(0);
+    for (const statement of statements) {
+      expect(statement).toMatch(/^ALTER TABLE \w+ RESET SETTING old_parts_lifetime$/u);
+    }
+
+    // Earlier migrations' CREATE statements are checksummed and cannot lose
+    // the override, so the reset must cover exactly the tables they gave it.
+    const createdWithZeroLifetime = migrations
+      .filter((migration) => migration.version < (reset?.version ?? 0))
+      .flatMap((migration) => migration.source.split(';'))
+      .filter((statement) => statement.includes('old_parts_lifetime = 0'))
+      .map((statement) => /CREATE TABLE IF NOT EXISTS (\w+)/u.exec(statement)?.[1])
+      .sort();
+    expect(createdWithZeroLifetime).toHaveLength(5);
+    expect(statements.map((statement) => /ALTER TABLE (\w+)/u.exec(statement)?.[1]).sort()).toEqual(
+      createdWithZeroLifetime,
+    );
+  });
+
   it('defines ordered checksummed schema and read-model migrations', () => {
     const migrations = clickHouseMigrations();
 
@@ -664,6 +693,8 @@ describe('clickhouse warehouse adapter', () => {
       { name: 'address_read_models_backfill', version: 2 },
       { name: 'transaction_refs_table', version: 3 },
       { name: 'zstd_column_codecs', version: 4 },
+
+      { name: 'old_parts_lifetime_default', version: 5 },
     ]);
     expect(migrations.every((migration) => migration.checksum.length === 64)).toBe(true);
     expect(migrations[0]?.source).toContain(
