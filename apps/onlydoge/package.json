@@ -7,6 +7,6 @@
     "@onlydoge/api": "workspace:*",
     "@onlydoge/indexer-app": "workspace:*",
     "@onlydoge/platform": "workspace:*",
-    "commander": "15.0.0"
+    "commander": "15.1.0"
   }
 }
