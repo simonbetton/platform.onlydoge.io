@@ -3,7 +3,7 @@
   "private": true,
   "license": "MIT",
   "type": "module",
-  "packageManager": "bun@1.4.0",
+  "packageManager": "bun@1.4.5",
   "workspaces": [
     "apps/*",
     "packages/platform",
@@ -22,7 +22,7 @@
     "metadata:migrations:status": "bun run scripts/metadata-migrations-status.ts",
     "backfill:analytics-transactions": "bun run scripts/backfill-analytics-transaction-facts.ts",
     "test": "vitest run --exclude 'tests/adapters/**'",
-    "test:adapters": "docker build -f tests/adapters/minio.Dockerfile -t onlydoge-adapter-minio:01ce918d8279 . && env ONLYDOGE_RUN_ADAPTER_TESTS=1 ONLYDOGE_RUN_CLICKHOUSE_SMOKE=1 vitest run tests/adapters tests/integration/clickhouse-analytics-smoke.test.ts --testTimeout=180000",
+    "test:adapters": "docker build -f tests/adapters/minio.Dockerfile -t onlydoge-adapter-minio:9e49d5e7a648 . && env ONLYDOGE_RUN_ADAPTER_TESTS=1 ONLYDOGE_RUN_CLICKHOUSE_SMOKE=1 vitest run tests/adapters tests/integration/clickhouse-analytics-smoke.test.ts --testTimeout=180000",
     "test:clickhouse-smoke": "env ONLYDOGE_RUN_CLICKHOUSE_SMOKE=1 vitest run tests/integration/clickhouse-analytics-smoke.test.ts --testTimeout=180000",
     "test:watch": "vitest",
     "lint": "biome check .",
@@ -48,19 +48,19 @@
     "image:push": "sh ./scripts/push-image.sh"
   },
   "dependencies": {
-    "@aws-sdk/client-s3": "3.1125.0",
-    "@clickhouse/client": "1.23.1",
-    "@elysiajs/openapi": "1.4.16",
+    "@aws-sdk/client-s3": "3.1178.0",
+    "@clickhouse/client": "1.25.0",
+    "@elysiajs/openapi": "1.4.17",
     "@libsql/client": "0.18.0",
-    "commander": "15.0.0",
-    "elysia": "1.4.30",
-    "mysql2": "3.24.3",
+    "commander": "15.1.0",
+    "elysia": "1.4.32",
+    "mysql2": "3.24.6",
     "node-sql-parser": "5.4.0",
-    "pg": "8.23.0",
-    "pino": "10.3.1"
+    "pg": "8.23.1",
+    "pino": "10.4.0"
   },
   "devDependencies": {
-    "@biomejs/biome": "2.5.12",
+    "@biomejs/biome": "2.6.9",
     "@onlydoge/access-control": "workspace:*",
     "@onlydoge/analytics-query": "workspace:*",
     "@onlydoge/api": "workspace:*",
@@ -68,15 +68,16 @@
     "@onlydoge/platform": "workspace:*",
     "@onlydoge/shared-kernel": "workspace:*",
     "@types/pg": "8.23.1",
-    "bun-types": "1.4.0",
-    "fallow": "3.22.0",
+    "bun-types": "1.4.5",
+    "fallow": "3.49.0",
     "typescript": "7.0.2",
-    "vitest": "4.1.11"
+    "vitest": "5.1.2"
   },
   "overrides": {
-    "nanoid": "3.3.18",
-    "postcss": "8.5.26",
-    "vite": "8.2.2",
-    "ws": "8.21.3"
+    "nanoid": "3.3.20",
+    "postcss": "8.5.33",
+    "source-map-js": "1.2.4",
+    "vite": "8.4.0",
+    "ws": "8.23.0"
   }
 }

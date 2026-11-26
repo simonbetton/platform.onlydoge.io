@@ -6,7 +6,7 @@
 #
 #   docker build -f docker/dogecoin/Dockerfile -t onlydoge/dogecoin-core:1.14.9 docker/dogecoin
 
-FROM debian:bookworm-slim@sha256:88200866dfff7ea7f5cbcb6ec7c8a701889efe6fe859fe64d6990e4b07ea4171 AS fetch
+FROM debian:bookworm-slim@sha256:e67eeead736ff7bbe258ef088bff683635c561b1fcfefad0806c1df4ab49ce0e AS fetch
 
 ARG DOGECOIN_VERSION=1.14.9
 ARG TARGETARCH
@@ -32,7 +32,7 @@ RUN set -eux; \
       "dogecoin-${DOGECOIN_VERSION}/bin/dogecoin-cli"; \
     rm -f "/tmp/${TARBALL}"
 
-FROM debian:bookworm-slim@sha256:88200866dfff7ea7f5cbcb6ec7c8a701889efe6fe859fe64d6990e4b07ea4171
+FROM debian:bookworm-slim@sha256:e67eeead736ff7bbe258ef088bff683635c561b1fcfefad0806c1df4ab49ce0e
 
 ARG DOGECOIN_VERSION=1.14.9
 ENV DOGECOIN_VERSION=${DOGECOIN_VERSION}

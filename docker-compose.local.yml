@@ -11,21 +11,21 @@ x-onlydoge-dev-build: &onlydoge-dev-build
 services:
   postgres:
     ports:
-      - '${POSTGRES_PORT:-5432}:5432'
+      - "${POSTGRES_PORT:-5432}:5432"
 
   minio:
     ports:
-      - '${MINIO_API_PORT:-9000}:9000'
-      - '${MINIO_CONSOLE_PORT:-9001}:9001'
+      - "${MINIO_API_PORT:-9000}:9000"
+      - "${MINIO_CONSOLE_PORT:-9001}:9001"
 
   clickhouse:
     ports:
-      - '${CLICKHOUSE_HTTP_PORT:-8123}:8123'
+      - "${CLICKHOUSE_HTTP_PORT:-8123}:8123"
 
   dogecoin:
     ports:
-      - '${DOGECOIN_RPC_PORT:-22555}:22555'
-      - '${DOGECOIN_ZMQ_PORT:-28332}:28332'
+      - "${DOGECOIN_RPC_PORT:-22555}:22555"
+      - "${DOGECOIN_ZMQ_PORT:-28332}:28332"
 
   onlydoge-api:
     build: *onlydoge-dev-build

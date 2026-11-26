@@ -61,7 +61,7 @@ services:
       POSTGRES_USER: ${POSTGRES_USER:-onlydoge}
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-onlydoge}
     healthcheck:
-      test: ['CMD-SHELL', 'pg_isready -U $$POSTGRES_USER -d $$POSTGRES_DB']
+      test: ["CMD-SHELL", "pg_isready -U $$POSTGRES_USER -d $$POSTGRES_DB"]
       interval: 5s
       timeout: 5s
       retries: 12
@@ -72,7 +72,7 @@ services:
   minio:
     image: quay.io/minio/minio:RELEASE.2025-09-07T16-13-09Z@sha256:14cea493d9a34af32f524e538b8346cf79f3321eff8e708c1e2960462bd8936e
     restart: unless-stopped
-    command: ['server', '/data', '--console-address', ':9001']
+    command: ["server", "/data", "--console-address", ":9001"]
     environment:
       MINIO_ROOT_USER: ${MINIO_ROOT_USER:-onlydoge}
       MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:-onlydoge123}
@@ -101,10 +101,10 @@ services:
       MINIO_ROOT_USER: ${MINIO_ROOT_USER:-onlydoge}
       MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:-onlydoge123}
       MINIO_BUCKET: ${MINIO_BUCKET:-onlydoge-raw}
-    restart: 'no'
+    restart: "no"
 
   clickhouse:
-    image: clickhouse/clickhouse-server:26.6.1.1193@sha256:1d1f6508eba2dccce2cee9913907c5f7766327debc57a6b1991f2c9e3176c163
+    image: clickhouse/clickhouse-server:26.9.40.9@sha256:3d17ab9f9a7edb63dae589aeb6228336005af2495a8bda1f55602d66157555a2
     restart: unless-stopped
     stop_grace_period: 2m
     # Hard cgroup ceiling. ClickHouse derives max_server_memory_usage from this
@@ -121,7 +121,7 @@ services:
     healthcheck:
       test:
         [
-          'CMD-SHELL',
+          "CMD-SHELL",
           'clickhouse-client --user "$$CLICKHOUSE_USER" --password "$$CLICKHOUSE_PASSWORD" --query "SELECT 1" >/dev/null 2>&1',
         ]
       interval: 5s
@@ -158,7 +158,7 @@ services:
       DOGECOIN_ZMQ_PORT: 28332
       DOGECOIN_EXTRA_ARGS: ${DOGECOIN_EXTRA_ARGS:-}
     ports:
-      - '${DOGECOIN_P2P_PORT:-22556}:22556'
+      - "${DOGECOIN_P2P_PORT:-22556}:22556"
     volumes:
       # Docker-managed volume by default, or an absolute host path (SSD strongly
       # preferred) for the ~250 GB chain: ONLYDOGE_DATA_DOGECOIN=/path/on/ssd
@@ -166,7 +166,7 @@ services:
     healthcheck:
       test:
         [
-          'CMD-SHELL',
+          "CMD-SHELL",
           'dogecoin-cli -datadir=/data -rpcuser="$$DOGECOIN_RPC_USER" -rpcpassword="$$DOGECOIN_RPC_PASSWORD" -rpcport="$$DOGECOIN_RPC_PORT" getblockchaininfo >/dev/null 2>&1',
         ]
       interval: 15s
@@ -180,7 +180,7 @@ services:
       target: production
     image: onlydoge/onlydoge:local
     restart: unless-stopped
-    command: ['--mode=http', '--ip=0.0.0.0', '--port=2277']
+    command: ["--mode=http", "--ip=0.0.0.0", "--port=2277"]
     # Do not wait for postgres/clickhouse health: the API stays up and returns
     # infrastructure errors for endpoints that need those services.
     depends_on:
@@ -193,13 +193,13 @@ services:
     environment:
       <<: *onlydoge-env
     ports:
-      - '${ONLYDOGE_HTTP_PORT:-2277}:2277'
+      - "${ONLYDOGE_HTTP_PORT:-2277}:2277"
     healthcheck:
       test:
         [
-          'CMD',
-          'bun',
-          '-e',
+          "CMD",
+          "bun",
+          "-e",
           "const response = await fetch('http://127.0.0.1:2277/v1/heartbeat'); if (response.status !== 204) process.exit(1);",
         ]
       interval: 10s
@@ -213,7 +213,7 @@ services:
       target: production
     image: onlydoge/onlydoge:local
     restart: unless-stopped
-    command: ['--mode=indexer']
+    command: ["--mode=indexer"]
     # No dependency on the dogecoin service: the indexer retries with backoff
     # while the node starts or catches up, and reports it via /v1/status.
     depends_on:
@@ -226,7 +226,7 @@ services:
     environment:
       <<: *onlydoge-indexer-env
     healthcheck:
-      test: ['CMD', 'bun', 'run', 'scripts/indexer-health.ts']
+      test: ["CMD", "bun", "run", "scripts/indexer-health.ts"]
       interval: 30s
       timeout: 15s
       retries: 3

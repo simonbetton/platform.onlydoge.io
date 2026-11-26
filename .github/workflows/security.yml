@@ -6,7 +6,7 @@ on:
     branches:
       - main
   schedule:
-    - cron: '17 3 * * 1'
+    - cron: "17 3 * * 1"
   workflow_dispatch:
 
 permissions:
@@ -17,8 +17,8 @@ concurrency:
   cancel-in-progress: true
 
 env:
-  BUN_VERSION: 1.4.0
-  NODE_VERSION: 22.23.2
+  BUN_VERSION: 1.4.5
+  NODE_VERSION: 24.22.3
 
 jobs:
   zmq-bridge-audit:
@@ -153,7 +153,7 @@ jobs:
           scanners: vuln
           severity: CRITICAL,HIGH
           vuln-type: os,library
-          exit-code: '1'
+          exit-code: "1"
         env:
           TRIVY_DISABLE_VEX_NOTICE: true
 
@@ -169,7 +169,7 @@ jobs:
           scanners: vuln
           severity: CRITICAL,HIGH
           vuln-type: os,library
-          exit-code: '0'
+          exit-code: "0"
         env:
           TRIVY_DISABLE_VEX_NOTICE: true
 

@@ -9,10 +9,10 @@ const realFetch = globalThis.fetch.bind(globalThis);
 
 export const adapterImages = {
   clickhouse:
-    'clickhouse/clickhouse-server:26.6.1.1193@sha256:1d1f6508eba2dccce2cee9913907c5f7766327debc57a6b1991f2c9e3176c163',
-  minio: 'onlydoge-adapter-minio:01ce918d8279',
-  mysql: 'mysql:8.4.5',
-  postgres: 'postgres:17.5-alpine',
+    'clickhouse/clickhouse-server:26.9.40.9@sha256:3d17ab9f9a7edb63dae589aeb6228336005af2495a8bda1f55602d66157555a2',
+  minio: 'onlydoge-adapter-minio:9e49d5e7a648',
+  mysql: 'mysql:8.4.13',
+  postgres: 'postgres:17.12-alpine',
 } as const;
 
 export const adapterCredentials = {
