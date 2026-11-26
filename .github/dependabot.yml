@@ -6,12 +6,12 @@ updates:
     schedule:
       interval: weekly
       day: monday
-      time: '08:00'
+      time: "08:00"
       timezone: Pacific/Auckland
     groups:
       bun-dependencies:
         patterns:
-          - '*'
+          - "*"
     labels:
       - dependencies
 
@@ -20,12 +20,12 @@ updates:
     schedule:
       interval: weekly
       day: monday
-      time: '08:10'
+      time: "08:10"
       timezone: Pacific/Auckland
     groups:
       zmq-bridge-dependencies:
         patterns:
-          - '*'
+          - "*"
     labels:
       - dependencies
 
@@ -34,7 +34,7 @@ updates:
     schedule:
       interval: weekly
       day: monday
-      time: '08:15'
+      time: "08:15"
       timezone: Pacific/Auckland
     labels:
       - dependencies
@@ -45,7 +45,7 @@ updates:
     schedule:
       interval: weekly
       day: monday
-      time: '08:30'
+      time: "08:30"
       timezone: Pacific/Auckland
     labels:
       - dependencies
@@ -56,7 +56,7 @@ updates:
     schedule:
       interval: weekly
       day: monday
-      time: '08:45'
+      time: "08:45"
       timezone: Pacific/Auckland
     labels:
       - dependencies

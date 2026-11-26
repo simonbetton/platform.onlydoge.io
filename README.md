@@ -66,7 +66,7 @@ Production should run split `http` and `indexer` containers.
 
 ## Requirements
 
-- Bun 1.4.0
+- Bun 1.4.5
 - Docker and Docker Compose for the bundled local or self-hosted stacks
 - PostgreSQL, ClickHouse, and S3-compatible object storage for production-style stacks
 - Dogecoin RPC endpoint for real indexing work
@@ -395,10 +395,11 @@ API tokens are authentication credentials returned once by `POST /v1/keys` in th
 Error payload shape:
 
 ```json
-{"error":"..."}
+{ "error": "..." }
 ```
 
 Explorer endpoints are networkless and do not accept `network` query parameters.
+
 - `GET /v1/explorer/search?q=...`
 - `GET /v1/explorer/mempool`
 - `GET /v1/explorer/mempool/watch`

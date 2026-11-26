@@ -8,7 +8,7 @@ const dependabot = new URL('.github/dependabot.yml', root);
 
 const images = {
   clickhouse:
-    'clickhouse/clickhouse-server:26.6.1.1193@sha256:1d1f6508eba2dccce2cee9913907c5f7766327debc57a6b1991f2c9e3176c163',
+    'clickhouse/clickhouse-server:26.9.40.9@sha256:3d17ab9f9a7edb63dae589aeb6228336005af2495a8bda1f55602d66157555a2',
   minio:
     'quay.io/minio/minio:RELEASE.2025-09-07T16-13-09Z@sha256:14cea493d9a34af32f524e538b8346cf79f3321eff8e708c1e2960462bd8936e',
   minioClient:

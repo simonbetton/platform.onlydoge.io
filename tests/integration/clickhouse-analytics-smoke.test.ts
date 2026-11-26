@@ -16,7 +16,7 @@ const runSmoke = process.env.ONLYDOGE_RUN_CLICKHOUSE_SMOKE === '1';
 const describeSmoke = runSmoke ? describe : describe.skip;
 const clickHouseImage =
   process.env.ONLYDOGE_CLICKHOUSE_SMOKE_IMAGE ??
-  'clickhouse/clickhouse-server:26.6.1.1193@sha256:1d1f6508eba2dccce2cee9913907c5f7766327debc57a6b1991f2c9e3176c163';
+  'clickhouse/clickhouse-server:26.9.40.9@sha256:3d17ab9f9a7edb63dae589aeb6228336005af2495a8bda1f55602d66157555a2';
 const clickHouseUser = 'onlydoge';
 const clickHousePassword = 'onlydoge';
 const clickHouseAnalyticsUser = 'onlydoge_analytics';
